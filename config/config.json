@@ -16,7 +16,7 @@
                   "maxRetries":  3,
                   "bufferSize":  65536,
                   "minThreads":  32,
-                  "maxThreads":  256,
+                  "maxThreads":  64,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
                   "healthEndpoint":  true
@@ -156,4 +156,3 @@
                          ],
     "autoStart":  false
 }
-
