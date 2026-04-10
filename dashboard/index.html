@@ -637,36 +637,6 @@ document.querySelectorAll('.mbtn').forEach(b=>{
 drawThroughput();
 drawChart('connChart',[connHist],['#3b82f6']);
 
-<<<<<<< HEAD
-// v6.0 #11: SSE with exponential backoff reconnect (1s → 2s → 4s → ... → 30s max)
-let sseBackoff = 1000;
-const SSE_MAX_BACKOFF = 30000;
-
-function connectSSE() {
-  const src = new EventSource('/api/stream'+API);
-  src.onopen = () => { sseBackoff = 1000; }; // Reset backoff on successful connect
-  src.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      if(data.stats) processStats(data.stats);
-      if(data.decisions?.decisions && data.decisions.decisions.length > 0){
-        renderDecs(data.decisions.decisions);
-      }
-      if(data.events?.events && data.events.events.length > 0){
-        renderEvts(data.events.events);
-      }
-      if(data.learning) renderLearning(data.learning);
-    } catch(err) {}
-  };
-  src.onerror = () => {
-    src.close();
-    console.warn(`[NetFusion] SSE disconnected — reconnecting in ${sseBackoff/1000}s...`);
-    setTimeout(() => { connectSSE(); }, sseBackoff);
-    sseBackoff = Math.min(sseBackoff * 2, SSE_MAX_BACKOFF);
-  };
-}
-connectSSE();
-=======
 // ===== LIVE STREAM =====
 let evtSource=null,reconnectDelayMs=1000,reconnectTimer=null;
 function attachStreamHandlers(source){
@@ -706,7 +676,6 @@ function connectStream(){
 }
 
 connectStream();
->>>>>>> e1e286915d77a17ca93113ddcc9f12e0f6f2f6dd
 
 window.addEventListener('resize',()=>{drawThroughput();drawChart('connChart',[connHist],['#3b82f6'])});
 </script>
