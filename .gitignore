@@ -1,1 +1,31 @@
+# Runtime state and generated telemetry
+config/config.json
+config/health.json
+config/proxy-stats.json
+config/decisions.json
+config/interfaces.json
+config/learning-data.json
+config/throughput.csv
+config/watchdog.pid
+config/*.flag
+config/active-fw-rules.json
+config/routes-applied.flag
+config/safety-state.json
+
+# Logs
+logs/*.json
+logs/*.log
+logs/*.txt
+
+# Local secrets or machine-specific files
 config/dashboard-token.txt
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.tmp
+*.bak
+*.orig

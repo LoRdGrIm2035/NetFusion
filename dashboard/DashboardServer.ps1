@@ -252,17 +252,9 @@ try {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
     $listener.Start()
-    
-    $tokenPath = Join-Path $configDir "dashboard-token.txt"
-    if (-not (Test-Path $tokenPath)) {
-        $global:DashToken = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 14 | ForEach-Object {[char]$_})
-        $global:DashToken | Set-Content $tokenPath -Force
-    } else {
-        $global:DashToken = (Get-Content $tokenPath -Raw).Trim()
-    }
-    
+
     Write-Host "  Dashboard: http://127.0.0.1:${Port}" -ForegroundColor Green
-    Write-Host "  Access token: $global:DashToken" -ForegroundColor Green
+    Write-Host "  Access: local automatic (loopback only)" -ForegroundColor Green
     Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
@@ -304,61 +296,8 @@ try {
                 continue
             }
 
-            # Pre-parse query parameters and headers
+            # Pre-parse query parameters
             $parsedPath = $path.Split('?')[0]
-            $queryString = if ($path.Contains('?')) { $path.Split('?')[1] } else { '' }
-            
-            $headerToken = ''
-            $cookieToken = ''
-            foreach ($line in ($requestText -split "`r`n")) {
-                if ($line -match '^X-NetFusion-Token:\s*(.+)$') { $headerToken = $matches[1].Trim() }
-                if ($line -match '^Authorization:\s*Bearer\s+(.+)$') { $headerToken = $matches[1].Trim() }
-                if ($line -match '^Cookie:\s*(.+)$') {
-                    foreach ($cookiePart in ($matches[1] -split ';')) {
-                        $cookiePart = $cookiePart.Trim()
-                        if ($cookiePart -match '^NetFusionToken=(.+)$') {
-                            $cookieToken = $matches[1].Trim()
-                        }
-                    }
-                }
-            }
-            
-            $providedToken = if ($cookieToken) { $cookieToken } else { $headerToken }
-
-            if ($parsedPath -eq '/api/login' -and $method -eq 'POST') {
-                $bodyStart = $requestText.IndexOf("`r`n`r`n")
-                $bodyText = if ($bodyStart -gt -1) { $requestText.Substring($bodyStart + 4) } else { '' }
-                $loginToken = ''
-                if ($bodyText) {
-                    try {
-                        $loginData = $bodyText | ConvertFrom-Json -ErrorAction Stop
-                        if ($loginData.token) { $loginToken = [string]$loginData.token }
-                    } catch {}
-                }
-
-                if ($loginToken -eq $global:DashToken) {
-                    $resp = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
-                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $resp -ExtraHeaders @('Set-Cookie: NetFusionToken=' + $global:DashToken + '; Path=/; HttpOnly; SameSite=Strict')
-                } else {
-                    $resp = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
-                    Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json' -Body $resp
-                }
-                continue
-            }
-
-            # Auth Check for ALL requests
-            if ($providedToken -ne $global:DashToken) {
-                if ($parsedPath -eq '/' -or $parsedPath -eq '/index.html') {
-                    $loginHtml = "<html><head><title>NetFusion Login</title><style>body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;} .box{background:#161b22;padding:40px;border-radius:8px;border:1px solid #30363d;text-align:center;} input{padding:10px;margin-top:20px;width:300px;background:#0d1117;border:1px solid #30363d;color:white;border-radius:4px;} button{padding:10px 20px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;margin-top:15px;} .err{color:#ff7b72;margin-top:12px;min-height:20px;}</style></head><body><div class='box'><h2>NetFusion Dashboard</h2><p>Please enter your access token (found in the console).</p><input type='password' id='tok' placeholder='Token...'><br><button onclick='login()'>Login</button><div id='err' class='err'></div></div><script>async function login(){ var t=document.getElementById('tok').value; var err=document.getElementById('err'); err.textContent=''; if(!t){ err.textContent='Enter a token.'; return; } var res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})}); if(res.ok){ window.location.href='/'; } else { err.textContent='Invalid token.'; }}</script></body></html>"
-                    $body = [System.Text.Encoding]::UTF8.GetBytes($loginHtml)
-                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'text/html; charset=utf-8' -Body $body
-                    continue
-                } else {
-                    $err = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
-                    Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json' -Body $err
-                    continue
-                }
-            }
 
             switch -Wildcard ($parsedPath) {
                 '/api/stats' {
