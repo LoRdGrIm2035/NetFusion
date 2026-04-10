@@ -58,7 +58,18 @@ while ($true) {
             Clear-Proxy
             # Attempt to kill lingering dead processes
             foreach ($p in $engineProcs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-            exit 1
+
+            # v6.0: Restart the engine instead of just exiting
+            Write-Host "  [Watchdog] Restarting NetFusion Engine..." -ForegroundColor Yellow
+            $engineScript = Join-Path $PSScriptRoot "NetFusionEngine.ps1"
+            try {
+                Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$engineScript`"" -WindowStyle Hidden
+                Write-Host "  [Watchdog] Engine restart triggered. Resuming watch in 15s..." -ForegroundColor Green
+            } catch {
+                Write-Host "  [Watchdog] Engine restart failed: $_" -ForegroundColor Red
+            }
+            $failCount = 0
+            Start-Sleep -Seconds 15  # Grace period for engine to boot
         }
     } else {
         $failCount = 0

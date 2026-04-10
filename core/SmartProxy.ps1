@@ -252,7 +252,12 @@ function Update-ProxyStats {
         sessionMapSize = $s.sessionMap.Count
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
-    } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.statsFile -Force -ErrorAction SilentlyContinue
+    } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+        # v6.0: Atomic write — prevents DashboardServer SSE from reading a half-written file
+        $tmp = [IO.Path]::GetTempFileName()
+        $_ | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $s.statsFile -Force
+    }
 
     try {
         while ($s.decisionQueue.Count -gt $s.maxDecisions) {
@@ -264,7 +269,11 @@ function Update-ProxyStats {
         [array]::Reverse($decisionSnapshot)
         $s.decisions = $decisionSnapshot
 
-        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.decisionsFile -Force -ErrorAction SilentlyContinue
+        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+            $tmp = [IO.Path]::GetTempFileName()
+            $_ | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $s.decisionsFile -Force
+        }
     } catch {}
 }
 
