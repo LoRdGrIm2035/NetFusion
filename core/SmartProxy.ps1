@@ -74,7 +74,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'default'     = 131072   # 128KB default
     }
     # v5.0 Session Affinity
-    sessionMap     = @{}    # { "host:port" -> @{ adapter=Name; time=DateTime } }
+    sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
     # v5.0 Safety
     safeMode       = $false
@@ -272,15 +272,13 @@ function Update-ProxyStats {
 function Clear-ExpiredSessions {
     $s = $global:ProxyState
     $now = Get-Date
-    $expired = @()
-    foreach ($key in @($s.sessionMap.Keys)) {
-        $entry = $s.sessionMap[$key]
+    foreach ($entryKvp in $s.sessionMap.GetEnumerator()) {
+        $key = $entryKvp.Key
+        $entry = $entryKvp.Value
         if ($entry -and $entry.time -and (($now - $entry.time).TotalSeconds -gt $s.sessionTTL)) {
-            $expired += $key
+            $removedEntry = $null
+            $s.sessionMap.TryRemove($key, [ref]$removedEntry) | Out-Null
         }
-    }
-    foreach ($key in $expired) {
-        $s.sessionMap.Remove($key)
     }
 }
 
@@ -407,8 +405,8 @@ $HandlerScript = {
                 $skipAffinity = $true
             } else {
                 $skipAffinity = $false
-                if ($State.sessionMap.ContainsKey($sessionKey)) {
-                    $cached = $State.sessionMap[$sessionKey]
+                $cached = $null
+                if ($State.sessionMap.TryGetValue($sessionKey, [ref]$cached)) {
                     $elapsed = ((Get-Date) - $cached.time).TotalSeconds
                     if ($elapsed -lt $State.sessionTTL) {
                         $found = $avail | Where-Object { $_.Name -eq $cached.adapter } | Select-Object -First 1

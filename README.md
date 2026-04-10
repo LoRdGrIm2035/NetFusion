@@ -75,6 +75,7 @@ No databases are used. The engine breathes via asynchronous JSON file locks.
 * `proxy-stats.json` - Telemetry dumped by proxy threads. Read by `DashboardServer`.
 * `decisions.json` - Connection logs (which URL went to which adapter and why).
 * `interfaces.json` - Detected hardware MACs and physics capabilities.
+* `dashboard-token.txt` - Local dashboard access token. Keep this file out of git and do not share it.
 
 ---
 
@@ -125,6 +126,7 @@ If an identical-subnet mesh node refuses to assign a secondary Wi-Fi adapter an 
 2. Run **`NetFusion-START.bat`** *(as Administrator)*.
 3. The firewall will sync, UDP will be blocked, and the Proxy (`127.0.0.1:8080`) will take over Windows web settings.
 4. The premium UI will spawn at **`http://localhost:9090`**.
+5. The dashboard will prompt for the access token shown in the server console and stores it in an HTTP-only cookie after login. Do not pass the token in the URL.
 
 ### For Segmented Maximum File Downloads
 Because standard Chrome/Edge utilizes multiplexed HTTP/2, a massive single file download will only stream on a single adapter. 

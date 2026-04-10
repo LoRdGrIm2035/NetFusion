@@ -77,6 +77,57 @@ function Get-SafetyState {
     return '{"safeMode":false,"circuitBreakerOpen":false,"proxyHealthy":true,"version":"5.0"}'
 }
 
+function Get-SystemResources {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $totalMb = [math]::Round(([double]$os.TotalVisibleMemorySize / 1KB), 1)
+        $freeMb = [math]::Round(([double]$os.FreePhysicalMemory / 1KB), 1)
+        $usedMb = [math]::Round(($totalMb - $freeMb), 1)
+        $memoryPct = if ($totalMb -gt 0) { [math]::Round(($usedMb / $totalMb) * 100, 1) } else { 0 }
+
+        $procSamples = Get-Process -Name powershell,pwsh -ErrorAction SilentlyContinue
+        $netFusionProcs = @(
+            $procSamples | Where-Object {
+                $_.Path -or $_.ProcessName -match 'powershell|pwsh'
+            }
+        )
+
+        $procStats = foreach ($proc in $netFusionProcs) {
+            @{
+                id = $proc.Id
+                name = $proc.ProcessName
+                cpuSeconds = if ($null -ne $proc.CPU) { [math]::Round([double]$proc.CPU, 2) } else { 0 }
+                workingSetMb = [math]::Round(($proc.WorkingSet64 / 1MB), 1)
+                privateMemoryMb = [math]::Round(($proc.PrivateMemorySize64 / 1MB), 1)
+                startTime = try { $proc.StartTime.ToString('o') } catch { $null }
+            }
+        }
+
+        $result = @{
+            timestamp = (Get-Date).ToString('o')
+            cpu = @{
+                logicalProcessors = [int]$env:NUMBER_OF_PROCESSORS
+                processCpuSeconds = [math]::Round((($procStats | Measure-Object -Property cpuSeconds -Sum).Sum), 2)
+            }
+            memory = @{
+                totalMb = $totalMb
+                usedMb = $usedMb
+                freeMb = $freeMb
+                usedPercent = $memoryPct
+            }
+            powershellProcesses = $procStats
+        }
+
+        return ($result | ConvertTo-Json -Depth 4 -Compress)
+    } catch {
+        return (@{
+            timestamp = (Get-Date).ToString('o')
+            error = 'resource_query_failed'
+            message = $_.Exception.Message
+        } | ConvertTo-Json -Depth 3 -Compress)
+    }
+}
+
 function Get-Telemetry {
     $result = @{ timestamp = (Get-Date).ToString('o') }
     $healthPath = Join-Path $configDir "health.json"
@@ -145,15 +196,19 @@ function Reset-LearningData {
 function Send-TcpResponse {
     param(
         [System.IO.Stream]$Stream, [int]$StatusCode, [string]$StatusText,
-        [string]$ContentType, [byte[]]$Body
+        [string]$ContentType, [byte[]]$Body,
+        [string[]]$ExtraHeaders = @()
     )
     $headers  = "HTTP/1.1 $StatusCode $StatusText`r`n"
     $headers += "Content-Type: $ContentType`r`n"
     $headers += "Content-Length: $($Body.Length)`r`n"
     $headers += "Access-Control-Allow-Origin: *`r`n"
     $headers += "Access-Control-Allow-Methods: GET, POST, OPTIONS`r`n"
-    $headers += "Access-Control-Allow-Headers: Content-Type`r`n"
+    $headers += "Access-Control-Allow-Headers: Content-Type, Authorization, X-NetFusion-Token`r`n"
     $headers += "Cache-Control: no-cache`r`n"
+    foreach ($header in $ExtraHeaders) {
+        $headers += "$header`r`n"
+    }
     $headers += "Connection: close`r`n`r`n"
     $hBytes = [System.Text.Encoding]::UTF8.GetBytes($headers)
     $Stream.Write($hBytes, 0, $hBytes.Length)
@@ -197,7 +252,8 @@ try {
         $global:DashToken = (Get-Content $tokenPath -Raw).Trim()
     }
     
-    Write-Host "  Dashboard: http://127.0.0.1:${Port}?token=$global:DashToken" -ForegroundColor Green
+    Write-Host "  Dashboard: http://127.0.0.1:${Port}" -ForegroundColor Green
+    Write-Host "  Access token: $global:DashToken" -ForegroundColor Green
     Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
@@ -242,19 +298,49 @@ try {
             # Pre-parse query parameters and headers
             $parsedPath = $path.Split('?')[0]
             $queryString = if ($path.Contains('?')) { $path.Split('?')[1] } else { '' }
-            $tokenParam = if ($queryString -match 'token=([^&]+)') { $matches[1] } else { '' }
             
             $headerToken = ''
+            $cookieToken = ''
             foreach ($line in ($requestText -split "`r`n")) {
                 if ($line -match '^X-NetFusion-Token:\s*(.+)$') { $headerToken = $matches[1].Trim() }
+                if ($line -match '^Authorization:\s*Bearer\s+(.+)$') { $headerToken = $matches[1].Trim() }
+                if ($line -match '^Cookie:\s*(.+)$') {
+                    foreach ($cookiePart in ($matches[1] -split ';')) {
+                        $cookiePart = $cookiePart.Trim()
+                        if ($cookiePart -match '^NetFusionToken=(.+)$') {
+                            $cookieToken = $matches[1].Trim()
+                        }
+                    }
+                }
             }
             
-            $providedToken = if ($tokenParam) { $tokenParam } else { $headerToken }
+            $providedToken = if ($cookieToken) { $cookieToken } else { $headerToken }
+
+            if ($parsedPath -eq '/api/login' -and $method -eq 'POST') {
+                $bodyStart = $requestText.IndexOf("`r`n`r`n")
+                $bodyText = if ($bodyStart -gt -1) { $requestText.Substring($bodyStart + 4) } else { '' }
+                $loginToken = ''
+                if ($bodyText) {
+                    try {
+                        $loginData = $bodyText | ConvertFrom-Json -ErrorAction Stop
+                        if ($loginData.token) { $loginToken = [string]$loginData.token }
+                    } catch {}
+                }
+
+                if ($loginToken -eq $global:DashToken) {
+                    $resp = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
+                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $resp -ExtraHeaders @('Set-Cookie: NetFusionToken=' + $global:DashToken + '; Path=/; HttpOnly; SameSite=Strict')
+                } else {
+                    $resp = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
+                    Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json' -Body $resp
+                }
+                continue
+            }
 
             # Auth Check for ALL requests
             if ($providedToken -ne $global:DashToken) {
                 if ($parsedPath -eq '/' -or $parsedPath -eq '/index.html') {
-                    $loginHtml = "<html><head><title>NetFusion Login</title><style>body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;} .box{background:#161b22;padding:40px;border-radius:8px;border:1px solid #30363d;text-align:center;} input{padding:10px;margin-top:20px;width:300px;background:#0d1117;border:1px solid #30363d;color:white;border-radius:4px;} button{padding:10px 20px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;margin-top:15px;}</style></head><body><div class='box'><h2>NetFusion Dashboard</h2><p>Please enter your access token (found in the console).</p><input type='password' id='tok' placeholder='Token...'><br><button onclick='login()'>Login</button></div><script>function login(){ var t=document.getElementById('tok').value; if(t) window.location.href='/?token='+encodeURIComponent(t); }</script></body></html>"
+                    $loginHtml = "<html><head><title>NetFusion Login</title><style>body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;} .box{background:#161b22;padding:40px;border-radius:8px;border:1px solid #30363d;text-align:center;} input{padding:10px;margin-top:20px;width:300px;background:#0d1117;border:1px solid #30363d;color:white;border-radius:4px;} button{padding:10px 20px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;margin-top:15px;} .err{color:#ff7b72;margin-top:12px;min-height:20px;}</style></head><body><div class='box'><h2>NetFusion Dashboard</h2><p>Please enter your access token (found in the console).</p><input type='password' id='tok' placeholder='Token...'><br><button onclick='login()'>Login</button><div id='err' class='err'></div></div><script>async function login(){ var t=document.getElementById('tok').value; var err=document.getElementById('err'); err.textContent=''; if(!t){ err.textContent='Enter a token.'; return; } var res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})}); if(res.ok){ window.location.href='/'; } else { err.textContent='Invalid token.'; }}</script></body></html>"
                     $body = [System.Text.Encoding]::UTF8.GetBytes($loginHtml)
                     Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'text/html; charset=utf-8' -Body $body
                     continue
@@ -429,7 +515,7 @@ try {
                     }
                 }
                 '/api/resources' {
-                    $json = Get-SafetyState
+                    $json = Get-SystemResources
                     $body = [System.Text.Encoding]::UTF8.GetBytes($json)
                     Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                 }

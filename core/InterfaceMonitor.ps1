@@ -37,7 +37,27 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 
 # Load config
 $configPath = Join-Path $projectDir "config\config.json"
-$config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
+$script:cachedConfig = $null
+$script:lastConfigTime = [DateTime]::MinValue
+$script:configCacheTtl = [TimeSpan]::FromSeconds(15)
+
+function Get-CachedConfig {
+    $now = Get-Date
+    if ($script:cachedConfig -and (($now - $script:lastConfigTime) -le $script:configCacheTtl)) {
+        return $script:cachedConfig
+    }
+
+    if (Test-Path $configPath) {
+        try {
+            $script:cachedConfig = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+            $script:lastConfigTime = $now
+        } catch {}
+    }
+
+    return $script:cachedConfig
+}
+
+$config = Get-CachedConfig
 $pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
 $pingTarget2 = '1.1.1.1'
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
@@ -504,7 +524,7 @@ if (-not (Test-Path $LogFile)) {
 function Update-HealthState {
     try {
         try {
-            $liveCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+            $liveCfg = Get-CachedConfig
             $activeMode = if ($liveCfg -and $liveCfg.mode) { $liveCfg.mode } else { 'maxspeed' }
             
             $alphaMap = @{ gaming = 0.65; streaming = 0.25; balanced = 0.45; download = 0.15; maxspeed = 0.15 }
