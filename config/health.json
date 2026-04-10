@@ -1,0 +1,56 @@
+﻿{
+    "adapters":  [
+                     {
+                         "InternetLatency":  33,
+                         "IPAddress":  "192.168.1.67",
+                         "Jitter":  2.56,
+                         "StabilityScore":  98,
+                         "SuccessRate":  100,
+                         "HealthScore":  87,
+                         "IsDegrading":  false,
+                         "Status":  "healthy",
+                         "Gateway":  "192.168.1.254",
+                         "LinkSpeedMbps":  866.7,
+                         "PacketLoss":  0,
+                         "InternetLatencyEWMA":  26.9,
+                         "Name":  "Wi-Fi 3",
+                         "HealthTrend":  0.114,
+                         "GatewayLatency":  11,
+                         "InterfaceIndex":  12,
+                         "DownloadMbps":  0,
+                         "SSID":  "secondfloor21_5",
+                         "UploadMbps":  0,
+                         "Type":  "WiFi",
+                         "GatewayLatencyEWMA":  33.1
+                     },
+                     {
+                         "InternetLatency":  21,
+                         "IPAddress":  "192.168.1.76",
+                         "Jitter":  3.05,
+                         "StabilityScore":  91,
+                         "SuccessRate":  100,
+                         "HealthScore":  85,
+                         "IsDegrading":  false,
+                         "Status":  "healthy",
+                         "Gateway":  "192.168.1.254",
+                         "LinkSpeedMbps":  260,
+                         "PacketLoss":  0,
+                         "InternetLatencyEWMA":  21.9,
+                         "Name":  "Wi-Fi 4",
+                         "HealthTrend":  0.406,
+                         "GatewayLatency":  12,
+                         "InterfaceIndex":  10,
+                         "DownloadMbps":  0.01,
+                         "SSID":  "thirdfloor42_5",
+                         "UploadMbps":  0.02,
+                         "Type":  "USB-WiFi",
+                         "GatewayLatencyEWMA":  4.2
+                     }
+                 ],
+    "uptime":  67.9,
+    "timestamp":  "2026-04-10T22:32:35.0900791+05:45",
+    "version":  "4.0",
+    "degradation":  {
+
+                    }
+}
