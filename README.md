@@ -258,6 +258,13 @@ NetFusion should be thought of as **compatible with many well-behaved Windows ad
 * **Port Evacuation:** Completely migrated off Hyper-V reserved block `8888/8877` onto standard `8080/9090` ensuring WSL/Docker port collision zero-points.
 * **Dashboard Overhaul:** Completely rewrote `/dashboard/index.html` from raw grid tables into pure CSS Glassmorphism logic, generating dynamic telemetry mapping natively without external Javascript libraries.
 
+---
+
+## Contributors
+
+* [LoRdGrIm2035](https://github.com/LoRdGrIm2035)
+* [Arman-techiee](https://github.com/Arman-techiee)
+
 <br>
 <div align="center">
 <i>Built for Zero-Trace Redundant Networking.</i>
