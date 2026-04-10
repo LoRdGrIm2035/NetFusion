@@ -62,6 +62,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     degradationFlags = @{}
     connectionTypes  = @{}
     decisions        = @()
+    decisionQueue    = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     maxDecisions     = 100
     bandwidthEstimates = @{}
     activeConns      = @{}
@@ -254,7 +255,16 @@ function Update-ProxyStats {
     } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.statsFile -Force -ErrorAction SilentlyContinue
 
     try {
-        @{ decisions = $s.decisions } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.decisionsFile -Force -ErrorAction SilentlyContinue
+        while ($s.decisionQueue.Count -gt $s.maxDecisions) {
+            $discardedDecision = $null
+            $s.decisionQueue.TryDequeue([ref]$discardedDecision) | Out-Null
+        }
+
+        $decisionSnapshot = @($s.decisionQueue.ToArray())
+        [array]::Reverse($decisionSnapshot)
+        $s.decisions = $decisionSnapshot
+
+        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.decisionsFile -Force -ErrorAction SilentlyContinue
     } catch {}
 }
 
@@ -505,7 +515,7 @@ $HandlerScript = {
             reason = $selectionReason
             affinity_mode = $affinityMode
         }
-        $State.decisions = @($decision) + @($State.decisions | Select-Object -First ($State.maxDecisions - 1))
+        $State.decisionQueue.Enqueue($decision)
 
         # ===== Connect to remote via chosen adapter (with failover) =====
         $remoteClient = $null

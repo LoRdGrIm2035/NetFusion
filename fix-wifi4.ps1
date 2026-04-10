@@ -1,3 +1,12 @@
+<#
+.SYNOPSIS
+    Legacy emergency Wi-Fi 4 repair helper.
+.DESCRIPTION
+    Superseded by the NetFusion engine's built-in Repair-AdapterDHCP loop.
+    Keep this script for manual emergency recovery only. It applies a hardcoded
+    static IP and can conflict with the engine's normal repair logic.
+#>
+
 ﻿Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  NetFusion v6.1 Network Repair Utility     " -ForegroundColor Cyan  
 Write-Host "============================================" -ForegroundColor Cyan
