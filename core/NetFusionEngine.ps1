@@ -126,8 +126,9 @@ function Repair-AdapterDHCP {
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
                         
                         # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
-                        $lastOctet = 147 + ($allAdapters | ForEach-Object { $_.ifIndex } | Sort-Object | 
-                            ForEach-Object -Begin { $i = 0 } -Process { if ($_ -eq $adapter.ifIndex) { return $i }; $i++ })
+                        $adapterList = @($allAdapters)
+                        $adapterIdx  = [array]::IndexOf($adapterList.ifIndex, $adapter.ifIndex)
+                        $lastOctet   = 147 + $adapterIdx
                         $staticIP = "192.168.1.$lastOctet"
                         
                         # Apply static IP with same gateway as working adapter

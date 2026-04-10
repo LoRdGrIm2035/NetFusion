@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SmartProxy v5.0 -- Production-grade intelligent connection orchestration engine.
+    SmartProxy v6.0 -- Production-grade intelligent connection orchestration engine.
 .DESCRIPTION
     Local HTTP/HTTPS proxy with safety-first design:
       - Session affinity: same host maps to same adapter within TTL window
@@ -277,6 +277,11 @@ function Clear-ExpiredSessions {
 # ===== Connection Handler ScriptBlock (runs in separate runspace) =====
 $HandlerScript = {
     param($ClientSocket, $State)
+
+    # v6.0: Port classification tables (must be defined inside scriptblock for runspace isolation)
+    $gamingPorts = @(3074, 3478, 3479, 25565, 27015, 27016)
+    $voicePorts  = @(3478, 3479, 5004, 5060, 50000)
+    $bulkPorts   = @(20, 21, 22, 989, 990)
 
     $connAdapter = $null  # track which adapter this connection uses
     try {
@@ -645,7 +650,7 @@ $jobs = [System.Collections.Generic.List[object]]::new()
 # ===== Main =====
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION SMART PROXY v5.0                       " -ForegroundColor Cyan
+Write-Host "    NETFUSION SMART PROXY v6.0                       " -ForegroundColor Cyan
 Write-Host "    Production Connection Orchestration Engine        " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -676,7 +681,7 @@ Write-Host ""
 Write-Host "  Configure apps: proxy 127.0.0.1 port ${Port}" -ForegroundColor Yellow
 Write-Host ""
 
-Write-ProxyEvent "Proxy v5.0 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
+Write-ProxyEvent "Proxy v6.0 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
