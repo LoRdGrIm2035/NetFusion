@@ -160,7 +160,10 @@ function Set-Mode {
     if (Test-Path $cfgFile) {
         $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
         $cfg.mode = $Mode
-        $cfg | ConvertTo-Json -Depth 4 | Set-Content $cfgFile -Force -Encoding UTF8
+        # v6.0: Atomic write to prevent truncation on disk contention
+        $tmp = [IO.Path]::GetTempFileName()
+        $cfg | ConvertTo-Json -Depth 4 | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $cfgFile -Force
     }
 }
 
@@ -177,7 +180,10 @@ function Set-SafeMode {
         } catch {}
     }
     $state.safeMode = $Enabled
-    $state | ConvertTo-Json -Depth 3 -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+    # v6.0: Atomic write to prevent truncation
+    $tmp = [IO.Path]::GetTempFileName()
+    $state | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+    Move-Item $tmp $safetyFile -Force
 }
 
 function Reset-LearningData {
@@ -190,7 +196,10 @@ function Reset-LearningData {
         recommendations = @{}
         patterns = @()
     }
-    $empty | ConvertTo-Json -Depth 3 -Compress | Set-Content $learningFile -Force -Encoding UTF8
+    # v6.0: Atomic write
+    $tmp = [IO.Path]::GetTempFileName()
+    $empty | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+    Move-Item $tmp $learningFile -Force
 }
 
 function Send-TcpResponse {

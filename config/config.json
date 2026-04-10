@@ -1,4 +1,4 @@
-﻿{
+{
     "proxyPort":  8080,
     "dashboardPort":  9090,
     "dashboardAllowLAN":  false,
@@ -15,8 +15,8 @@
                   "connectTimeout":  5000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
-                  "minThreads":  16,
-                  "maxThreads":  64,
+                  "minThreads":  32,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
                   "healthEndpoint":  true

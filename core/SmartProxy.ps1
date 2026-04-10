@@ -43,9 +43,9 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     failCounts       = @{}
     totalConnections = 0
     totalFails       = 0
-    activeConnections = 0        # v5.1: live active connection count
-    activePerAdapter  = [hashtable]::Synchronized(@{})      # v5.1: per-adapter active counts
-    activePerHost     = [hashtable]::Synchronized(@{})      # v5.1: per-host active counts for dynamic bulk detection
+    activeConnections = 0        # v6.0: live active connection count
+    activePerAdapter  = [hashtable]::Synchronized(@{})      # v6.0: per-adapter active counts
+    activePerHost     = [hashtable]::Synchronized(@{})      # v6.0: per-host active counts for dynamic bulk detection
     currentMode      = 'maxspeed'
     rrIndex          = 0
     connectTimeout   = 5000
@@ -57,7 +57,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     decisionsFile    = $decisionsFile
     safetyFile       = $safetyFile
     port             = $Port
-    # v5.0 Intelligence State
+    # v6.0 Intelligence State
     adapterHealth    = @{}
     degradationFlags = @{}
     connectionTypes  = @{}
@@ -73,10 +73,10 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'gaming'      = 8192     # 8KB for gaming (low latency)
         'default'     = 131072   # 128KB default
     }
-    # v5.0 Session Affinity
+    # v6.0 Session Affinity
     sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
-    # v5.0 Safety
+    # v6.0 Safety
     safeMode       = $false
 })
 
@@ -125,7 +125,7 @@ function Update-AdaptersAndWeights {
     $s = $global:ProxyState
     $s.adapters = @(Get-ProxyAdapters)
 
-    # v5.0: Check safe mode
+    # v6.0: Check safe mode
     if (Test-Path $s.safetyFile) {
         try {
             $safety = Get-Content $s.safetyFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -300,7 +300,7 @@ function Update-ProxyStats {
     } catch {}
 }
 
-# v5.0: Clean expired session affinity entries
+# v6.0: Clean expired session affinity entries
 function Clear-ExpiredSessions {
     $s = $global:ProxyState
     $now = Get-Date
@@ -325,7 +325,7 @@ $HandlerScript = {
 
     $connAdapter = $null  # track which adapter this connection uses
     try {
-        # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
+        # v6.0: Safe mode check -- if active, act as simple pass-through on default adapter
         $isSafeMode = $State.safeMode
 
         $clientStream = $ClientSocket.GetStream()
@@ -340,7 +340,7 @@ $HandlerScript = {
         $parts = $lines[0] -split ' '
         $method = $parts[0].ToUpper()
 
-        # ===== v5.0: Health check endpoint for SafetyController =====
+        # ===== v6.0: Health check endpoint for SafetyController =====
         if ($method -eq 'GET' -and $parts.Count -ge 2 -and $parts[1] -eq '/health') {
             $resp = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 2`r`nConnection: close`r`n`r`nOK")
             $clientStream.Write($resp, 0, $resp.Length)
@@ -379,9 +379,9 @@ $HandlerScript = {
             $rPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port } else { 80 }
         }
 
-        # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v5.1
+        # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v6.0
 
-        # v5.1: Track host concurrency for dynamic download manager detection
+        # v6.0: Track host concurrency for dynamic download manager detection
         $hostKey = $targetHost
         if (-not $State.activePerHost.ContainsKey($hostKey)) { $State.activePerHost[$hostKey] = 0 }
         $State.activePerHost[$hostKey]++
@@ -531,7 +531,7 @@ $HandlerScript = {
             }
         }
 
-        # v5.1: Track active connection per adapter
+        # v6.0: Track active connection per adapter
         $connAdapter = $adapter.Name
         if (-not $State.activePerAdapter.ContainsKey($connAdapter)) { $State.activePerAdapter[$connAdapter] = 0 }
         $State.activePerAdapter[$connAdapter]++
@@ -663,7 +663,7 @@ $HandlerScript = {
         }
 
     } catch {} finally {
-        # v5.1: Decrement active connection counters
+        # v6.0: Decrement active connection counters
         if ($State.activeConnections -gt 0) { $State.activeConnections-- }
         if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
             $State.activePerAdapter[$connAdapter] = [math]::Max(0, $State.activePerAdapter[$connAdapter] - 1)
@@ -797,7 +797,7 @@ try {
             $lastCleanup = $now
         }
 
-        # v5.0: Clean expired session affinity entries every 60s
+        # v6.0: Clean expired session affinity entries every 60s
         if (($now - $lastSessionClean).TotalSeconds -gt 60) {
             Clear-ExpiredSessions
             $lastSessionClean = $now

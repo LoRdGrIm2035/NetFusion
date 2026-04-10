@@ -170,10 +170,43 @@ function Enforce-ECMP {
 
 while ($true) {
     try {
-        # Check if proxy process crashed
+        # Check if proxy process crashed — respawn it in-place instead of exiting
         if ($proxyProc.HasExited) {
-            Write-Host "  [Engine] FATAL: SmartProxy process crashed (Exit: $($proxyProc.ExitCode))!" -ForegroundColor Red
-            exit 1
+            $proxyRestarts = if ($proxyRestarts) { $proxyRestarts + 1 } else { 1 }
+            Write-Host "  [Engine] SmartProxy crashed (Exit: $($proxyProc.ExitCode)). Respawn attempt $proxyRestarts/3..." -ForegroundColor Yellow
+            
+            if ($proxyRestarts -gt 3) {
+                Write-Host "  [Engine] FATAL: SmartProxy failed 3 respawns. Giving up." -ForegroundColor Red
+                exit 1
+            }
+            
+            # Respawn proxy only (no full engine cold-boot)
+            try {
+                $proxyScript = Join-Path $scriptDir "SmartProxy.ps1"
+                $proxyProc = Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$proxyScript`"" -WindowStyle Hidden -PassThru
+                Write-Host "  [Engine] SmartProxy respawned (PID: $($proxyProc.Id)). Waiting for port bind..." -ForegroundColor Yellow
+                
+                $portOpen = $false
+                $deadline = (Get-Date).AddSeconds(10)
+                while ((Get-Date) -lt $deadline) {
+                    Start-Sleep -Milliseconds 500
+                    try {
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $ar = $tcp.BeginConnect('127.0.0.1', 8080, $null, $null)
+                        if ($ar.AsyncWaitHandle.WaitOne(500, $false)) { $portOpen = $true; $tcp.Close(); break }
+                        $tcp.Close()
+                    } catch {}
+                }
+                
+                if ($portOpen) {
+                    Write-Host "  [Engine] SmartProxy respawn successful." -ForegroundColor Green
+                    $proxyRestarts = 0  # Reset counter on success
+                } else {
+                    Write-Host "  [Engine] SmartProxy respawn failed to bind port." -ForegroundColor Red
+                }
+            } catch {
+                Write-Host "  [Engine] SmartProxy respawn error: $_" -ForegroundColor Red
+            }
         }
         
         # 1. Update Hardware Mapping (Every ~6s)

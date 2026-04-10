@@ -64,12 +64,17 @@ while ($true) {
             $engineScript = Join-Path $PSScriptRoot "NetFusionEngine.ps1"
             try {
                 Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$engineScript`"" -WindowStyle Hidden
-                Write-Host "  [Watchdog] Engine restart triggered. Resuming watch in 15s..." -ForegroundColor Green
+                Write-Host "  [Watchdog] Engine restart triggered. Grace period 20s..." -ForegroundColor Green
             } catch {
                 Write-Host "  [Watchdog] Engine restart failed: $_" -ForegroundColor Red
             }
+
+            # v6.0 Fix: Grace period BEFORE resetting failCount and BEFORE re-entering the poll loop.
+            # The new engine process needs time to appear in WMI with 'NetFusionEngine' in its CommandLine.
+            # Without this, the next poll fires immediately and triggers a second restart.
+            Start-Sleep -Seconds 20
             $failCount = 0
-            Start-Sleep -Seconds 15  # Grace period for engine to boot
+            continue  # Skip directly to next iteration without the 3s sleep at top
         }
     } else {
         $failCount = 0
