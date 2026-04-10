@@ -141,6 +141,34 @@ Run **`NetFusion-SAFE.bat`** *(as Administrator)* if the OS freezes, BSODs, or i
 
 ---
 
+## Adapter Compatibility
+
+NetFusion is designed to work with many Windows Wi-Fi and Ethernet adapters, but it is **not guaranteed to work with every adapter model or driver stack**.
+
+### Works Best With
+* Adapters that appear cleanly in `Get-NetAdapter`, `Get-NetIPAddress`, and Windows route tables.
+* Modern adapters with stable vendor drivers on Windows 10/11.
+* Mixed topologies such as **Ethernet + Wi-Fi**, which are usually more predictable than dual identical Wi-Fi links.
+* Adapters that support reliable outbound socket binding and normal DHCP/gateway behavior.
+
+### May Be Unreliable With
+* Very old USB Wi-Fi dongles.
+* Adapters using weak, generic, or badly maintained drivers.
+* Vendor utility suites that override or interfere with native Windows networking behavior.
+* Virtual adapters, VPN adapters, mobile hotspot adapters, or tethering-only devices.
+* Enterprise-auth, captive-portal, or policy-heavy networks that block or rewrite expected routing behavior.
+
+### Practical Limits
+* **Driver quality matters more than Wi-Fi generation.** Wi-Fi 4/5/6/7 can all work if the Windows driver behaves correctly.
+* **Dual Wi-Fi on the same subnet is the hardest scenario.** Windows naturally resists balancing multiple adapters on one router/subnet, so this setup is more fragile.
+* **Ethernet + Wi-Fi is usually easier than Wi-Fi + Wi-Fi.**
+* DHCP/APIPA issues, gateway instability, or chipset-specific quirks can reduce reliability even when the adapter itself is detected correctly.
+
+### Bottom Line
+NetFusion should be thought of as **compatible with many well-behaved Windows adapters**, not as a universal solution for every Wi-Fi adapter ever made. If an adapter exposes stable routing, IP, and driver behavior in Windows, it is much more likely to work well.
+
+---
+
 ## Version 6.0 Change Log
 
 * **Massive 256 Thread Sockets:** Rewrote the runspace boundary limit. It no longer waits to "scale up" during 10s tests; 64 connection handlers idle natively preventing timeout drops.
