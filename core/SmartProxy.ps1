@@ -795,6 +795,10 @@ try {
             $activeThreads = $activeCount
             $queueDepth = if ($listener.Pending()) { 5 } else { 0 } # Estimate pending requests
             
+            # v6.0 #15 NOTE: SetMaxRunspaces only affects *future* allocation, not active runspaces.
+            # If $currentMaxThreads drops during scale-down, existing runspaces beyond the new cap
+            # will continue running until their connections complete naturally.
+            # This is expected PowerShell RunspacePool behavior — the pool drains gracefully.
             if ($queueDepth -gt 0 -and $activeThreads -ge ($currentMaxThreads - 2) -and $currentMaxThreads -lt $maxThreads) {
                 $currentMaxThreads = [math]::Min($maxThreads, $currentMaxThreads + 8)
                 $rsPool.SetMaxRunspaces($currentMaxThreads)

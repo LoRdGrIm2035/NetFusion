@@ -104,7 +104,7 @@ function Show-MetricGuidance {
 
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION FIRST-RUN SETUP                        " -ForegroundColor Cyan
+Write-Host "    NETFUSION v6.0 — FIRST-RUN SETUP                 " -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 
 Write-Step "Checking prerequisites"
@@ -154,9 +154,22 @@ try {
 
 Write-Host ("  Mode           : {0}" -f $config.mode) -ForegroundColor White
 Write-Host ("  Proxy          : 127.0.0.1:{0}" -f $config.proxyPort) -ForegroundColor White
-Write-Host ("  Dashboard      : http://127.0.0.1:{0}" -f $config.dashboardPort) -ForegroundColor White
+$dashProto = if ($config.dashboardTLS) { 'https' } else { 'http' }
+Write-Host ("  Dashboard      : {0}://127.0.0.1:{1}" -f $dashProto, $config.dashboardPort) -ForegroundColor White
 Write-Host ("  Thread pool    : {0}-{1}" -f $config.proxy.minThreads, $config.proxy.maxThreads) -ForegroundColor White
+$capPerAdapter = if ($config.proxy.maxConcurrentPerAdapter) { $config.proxy.maxConcurrentPerAdapter } else { 48 }
+Write-Host ("  Max conns/adapt: {0}" -f $capPerAdapter) -ForegroundColor White
 Write-Host "  Main behavior file: config\\config.json" -ForegroundColor Gray
+
+# v6.0 #14: Generate dashboard token if not present
+$tokenFile = Join-Path $configDir "dashboard-token.txt"
+if (-not (Test-Path $tokenFile)) {
+    $newToken = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+    Set-Content $tokenFile -Value $newToken -NoNewline -Force
+    Write-Ok "Dashboard token generated."
+} else {
+    Write-Ok "Dashboard token exists."
+}
 
 $adapters = Get-UsableAdapters
 

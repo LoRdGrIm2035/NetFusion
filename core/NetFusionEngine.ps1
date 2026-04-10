@@ -125,9 +125,13 @@ function Repair-AdapterDHCP {
                             Where-Object { $_.IPAddress -match '^169\.254\.' } | 
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
                         
-                        # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
-                        $adapterList = @($allAdapters)
-                        $adapterIdx  = [array]::IndexOf($adapterList.ifIndex, $adapter.ifIndex)
+                        # Determine a safe static IP (use .147, .148, .149 sequentially)
+                        # v6.0 #13: Use sequential counter, not IndexOf on non-contiguous ifIndex
+                        $adapterIdx = 0
+                        foreach ($a in $allAdapters) {
+                            if ($a.ifIndex -eq $adapter.ifIndex) { break }
+                            $adapterIdx++
+                        }
                         $lastOctet   = 147 + $adapterIdx
                         $staticIP = "192.168.1.$lastOctet"
                         
@@ -151,8 +155,12 @@ function Repair-AdapterDHCP {
 # v6.1: ECMP Enforcement - keep both adapters' metrics equal
 function Enforce-ECMP {
     $targetMetric = 15
+    # v6.0 #12: Use InterfaceDescription (matching NetworkManager.ps1) instead of Name -match 'Wi-Fi'
+    # This catches USB-WiFi adapters named 'WLAN', 'Wireless Network Connection', etc.
     $wifiAdapters = Get-NetAdapter | Where-Object { 
-        $_.Status -eq 'Up' -and $_.Name -match 'Wi-Fi' 
+        $_.Status -eq 'Up' -and 
+        $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
+        ($_.InterfaceDescription -match 'Wi-Fi|Wireless|WLAN|802\.11|WiFi' -or $_.Name -match 'Wi-Fi|WLAN|Wireless')
     }
     
     if ($wifiAdapters.Count -ge 2) {

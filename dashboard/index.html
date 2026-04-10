@@ -637,32 +637,34 @@ document.querySelectorAll('.mbtn').forEach(b=>{
 drawThroughput();
 drawChart('connChart',[connHist],['#3b82f6']);
 
-// [V5-FIX-5] SSE Stream initialization
-const evtSource = new EventSource('/api/stream'+API);
-evtSource.onmessage = (e) => {
-  try {
-    const data = JSON.parse(e.data);
-    if(data.stats) processStats(data.stats);
-    // Route Decisions
-    if(data.decisions?.decisions && data.decisions.decisions.length > 0){
-      renderDecs(data.decisions.decisions);
-    }
-    // Sys Events
-    if(data.events?.events && data.events.events.length > 0){
-      renderEvts(data.events.events);
-    }
-    if(data.learning) renderLearning(data.learning);
-  } catch(err) {}
-};
+// v6.0 #11: SSE with exponential backoff reconnect (1s → 2s → 4s → ... → 30s max)
+let sseBackoff = 1000;
+const SSE_MAX_BACKOFF = 30000;
 
-evtSource.onerror = () => {
-  console.warn('[NetFusion] SSE disconnected — auto-reconnecting...');
-  setTimeout(() => {
-    const newSource = new EventSource('/api/stream'+API);
-    newSource.onmessage = evtSource.onmessage;
-    newSource.onerror = evtSource.onerror;
-  }, 3000);
-};
+function connectSSE() {
+  const src = new EventSource('/api/stream'+API);
+  src.onopen = () => { sseBackoff = 1000; }; // Reset backoff on successful connect
+  src.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if(data.stats) processStats(data.stats);
+      if(data.decisions?.decisions && data.decisions.decisions.length > 0){
+        renderDecs(data.decisions.decisions);
+      }
+      if(data.events?.events && data.events.events.length > 0){
+        renderEvts(data.events.events);
+      }
+      if(data.learning) renderLearning(data.learning);
+    } catch(err) {}
+  };
+  src.onerror = () => {
+    src.close();
+    console.warn(`[NetFusion] SSE disconnected — reconnecting in ${sseBackoff/1000}s...`);
+    setTimeout(() => { connectSSE(); }, sseBackoff);
+    sseBackoff = Math.min(sseBackoff * 2, SSE_MAX_BACKOFF);
+  };
+}
+connectSSE();
 
 window.addEventListener('resize',()=>{drawThroughput();drawChart('connChart',[connHist],['#3b82f6'])});
 </script>
