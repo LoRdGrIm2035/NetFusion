@@ -16,16 +16,19 @@
 
 ## 📋 Table of Contents
 - [Executive Technical Summary](#executive-technical-summary)
+- [Quick Start](#quick-start)
 - [Directory & Architecture Structure](#directory--architecture-structure)
   - [Root Control Scripts](#1-root-control-scripts)
   - [Core Engine Modules (`/core`)](#2-core-engine-modules-core)
   - [Dashboard & UI (`/dashboard`)](#3-dashboard--ui-dashboard)
   - [State & Configuration (`/config`)](#4-state--configuration-config)
+- [Git Hygiene](#git-hygiene)
 - [Core Performance Specifications](#core-performance-specifications)
 - [How NetFusion Bypasses Windows Limitations](#how-netfusion-bypasses-windows-limitations)
   - [The E.C.M.P Route Override](#the-ecmp-route-override)
   - [APIPA DHCP Fallback](#apipa-dhcp-fallback)
 - [Installation & Operation](#installation--operation)
+- [Troubleshooting](#troubleshooting)
 - [Deep-Dive Subsystem Technicals](#deep-dive-subsystem-technicals)
 - [Version 6.0 Change Log](#version-60-change-log)
 
@@ -36,6 +39,19 @@
 NetFusion does not use bonding VPNs or cloud servers. It operates exclusively as a **Layer 7 HTTP/HTTPS Transparent Pipeline** (`127.0.0.1:8080`). Modern Windows fundamentally restricts identical-subnet network adapters, causing active collisions and throttling when multiple Wi-Fis are connected. 
 
 NetFusion acts directly upon the Windows TCP/IP Stack and native Routing Tables to physically force Equal-Cost Multi-Path (E.C.M.P) rules, and then pipelines connection sockets independently over your adapters based on a live health-matrix (Latency, Jitter, Loss).
+
+---
+
+## Quick Start
+
+1. Open **PowerShell as Administrator** in the project folder.
+2. Run **`.\Setup-NetFusion.ps1`** on first use.
+3. Review **`config\config.json`** only if you want local changes for your machine.
+4. Run **`NetFusion-START.bat`** as Administrator.
+5. Open the dashboard at **`http://127.0.0.1:9090/`**.
+6. When finished, stop it with **`NetFusion-STOP.bat`**.
+
+NetFusion applies the Windows system proxy automatically during startup. In most cases, browsers that follow Windows proxy settings do not need manual proxy setup.
 
 ---
 
@@ -71,11 +87,38 @@ This array of scripts runs simultaneously as background `Runspace` threads, exch
 
 ### 4. State & Configuration (`/config`)
 No databases are used. The engine breathes via asynchronous JSON file locks.
-* `config.json` - Global engine behavior limits (Ports, File paths, Wait-Times).
-* `health.json` - Updated every 2000ms by `InterfaceMonitor`. Read by `SmartProxy`.
-* `proxy-stats.json` - Telemetry dumped by proxy threads. Read by `DashboardServer`.
-* `decisions.json` - Connection logs (which URL went to which adapter and why).
-* `interfaces.json` - Detected hardware MACs and physics capabilities.
+* `config.default.json` - The shared default configuration that should stay in Git.
+* `config.json` - Local runtime configuration created from `config.default.json` by `Setup-NetFusion.ps1`.
+* `health.json` - Generated health telemetry updated by `InterfaceMonitor`.
+* `proxy-stats.json` - Generated proxy telemetry for the dashboard.
+* `decisions.json` - Generated recent routing decisions.
+* `interfaces.json` - Generated detected adapter metadata for the current machine.
+* `learning-data.json` - Generated learning and recommendation state.
+* `throughput.csv` - Generated historical throughput log.
+
+These generated files are runtime state and should generally **not** be committed to GitHub.
+
+---
+
+## Git Hygiene
+
+### Commit These
+* PowerShell scripts, batch files, dashboard source, and documentation.
+* `config/config.default.json` when you intentionally change the shared defaults.
+* `.vscode/settings.json` if you want the repo to carry workspace-level editor behavior such as Git auto-fetch.
+
+### Do Not Commit These
+* `config/config.json`
+* `config/health.json`
+* `config/proxy-stats.json`
+* `config/decisions.json`
+* `config/interfaces.json`
+* `config/learning-data.json`
+* `config/throughput.csv`
+* `logs/events.json`
+* PID files, flags, and other generated runtime state
+
+The repository `.gitignore` is set up so those generated files stay local and stop showing up in normal pushes once they are removed from Git tracking.
 
 ---
 
@@ -149,6 +192,33 @@ Because standard Chrome/Edge utilizes multiplexed HTTP/2, a massive single file 
 
 ### Emergency Restores
 Run **`NetFusion-SAFE.bat`** *(as Administrator)* if the OS freezes, BSODs, or if you ever see "No Internet" in your browser post-shutdown. This sweeps the registry cleanly.
+
+---
+
+## Troubleshooting
+
+### NetFusion-START.bat opens and closes quickly
+This usually means one of the startup steps failed before the proxy finished binding to port `8080`.
+
+To keep the failure visible, run the engine directly:
+
+```powershell
+Set-Location .\core
+powershell -ExecutionPolicy Bypass -File .\NetFusionEngine.ps1
+```
+
+Also check:
+* Run the launcher as **Administrator**.
+* Make sure no other app is already using ports `8080` or `9090`.
+* If startup was interrupted earlier, run **`NetFusion-SAFE.bat`** before trying again.
+
+### Dashboard opens but looks empty
+* Make sure `DashboardServer.ps1` is running.
+* Make sure `SmartProxy.ps1` successfully bound to `127.0.0.1:8080`.
+* Refresh the page after the engine has had a few seconds to generate runtime JSON files.
+
+### Browser loses internet after a crash
+Run **`NetFusion-STOP.bat`** first. If Windows proxy settings still look stuck, run **`NetFusion-SAFE.bat`**.
 
 ---
 

@@ -17,7 +17,7 @@
                   "maxRetries":  3,
                   "bufferSize":  65536,
                   "minThreads":  32,
-                  "maxThreads":  256,
+                  "maxThreads":  64,
                   "maxConcurrentPerAdapter":  48,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
@@ -73,7 +73,7 @@
                      "sessionInterval":  60,
                      "minSamplesForRecommendation":  20
                  },
-    "_trafficRules_NOTE": "Per-app routing (IDMan.exe, chrome.exe etc.) was removed in v6.0. The proxy operates at TCP socket level and cannot distinguish processes without a kernel driver. Connection-type detection via L4 port classification is used instead.",
+    "_trafficRules_NOTE":  "Per-app routing (IDMan.exe, chrome.exe etc.) was removed in v6.0. The proxy operates at TCP socket level and cannot distinguish processes without a kernel driver. Connection-type detection via L4 port classification is used instead.",
     "telemetry":  {
                       "enabled":  true,
                       "decisionLogSize":  100,

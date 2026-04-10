@@ -125,18 +125,8 @@ function Repair-AdapterDHCP {
                         Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
                             Where-Object { $_.IPAddress -match '^169\.254\.' } | 
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-                        
-<<<<<<< HEAD
-                        # Determine a safe static IP (use .147, .148, .149 sequentially)
-                        # v6.0 #13: Use sequential counter, not IndexOf on non-contiguous ifIndex
-                        $adapterIdx = 0
-                        foreach ($a in $allAdapters) {
-                            if ($a.ifIndex -eq $adapter.ifIndex) { break }
-                            $adapterIdx++
-                        }
-=======
+
                         # Use a simple loop counter so fallback IPs stay sequential (.147, .148, .149).
->>>>>>> e1e286915d77a17ca93113ddcc9f12e0f6f2f6dd
                         $lastOctet   = 147 + $adapterIdx
                         $staticIP = "192.168.1.$lastOctet"
                         
@@ -161,18 +151,10 @@ function Repair-AdapterDHCP {
 # v6.1: ECMP Enforcement - keep both adapters' metrics equal
 function Enforce-ECMP {
     $targetMetric = 15
-    # v6.0 #12: Use InterfaceDescription (matching NetworkManager.ps1) instead of Name -match 'Wi-Fi'
-    # This catches USB-WiFi adapters named 'WLAN', 'Wireless Network Connection', etc.
     $wifiAdapters = Get-NetAdapter | Where-Object { 
-<<<<<<< HEAD
-        $_.Status -eq 'Up' -and 
-        $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
-        ($_.InterfaceDescription -match 'Wi-Fi|Wireless|WLAN|802\.11|WiFi' -or $_.Name -match 'Wi-Fi|WLAN|Wireless')
-=======
         $_.Status -eq 'Up' -and
         $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
         ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN' -or $_.Name -match 'Wi-Fi|Wireless')
->>>>>>> e1e286915d77a17ca93113ddcc9f12e0f6f2f6dd
     }
     
     if ($wifiAdapters.Count -ge 2) {
