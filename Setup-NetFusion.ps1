@@ -192,7 +192,7 @@ Show-ProxyGuidance -Config $config
 Write-Step "Next steps"
 Write-Host "1. Review config\\config.json if you want to change ports, mode, or proxy thread settings." -ForegroundColor White
 Write-Host "2. Start NetFusion with NetFusion-START.bat as Administrator." -ForegroundColor White
-Write-Host "3. Open the dashboard at http://127.0.0.1:$($config.dashboardPort) and enter the token shown in the dashboard server console." -ForegroundColor White
+Write-Host "3. Open the dashboard at http://127.0.0.1:$($config.dashboardPort). It should open directly on the local machine." -ForegroundColor White
 Write-Host "4. If you see same-subnet routing issues, review adapter metrics or run the routing helpers noted above." -ForegroundColor White
 
 Write-Host ""
