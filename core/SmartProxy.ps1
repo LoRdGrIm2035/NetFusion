@@ -166,6 +166,16 @@ function Update-AdaptersAndWeights {
         try { $s.currentMode = (Get-Content $s.configFile -Raw | ConvertFrom-Json).mode } catch {}
     }
 
+    # v6.0: Load learning engine recommendations to bias weights
+    $learningRec = $null
+    $learningPath = Join-Path $projectDir "config\learning-data.json"
+    if (Test-Path $learningPath) {
+        try {
+            $lData = Get-Content $learningPath -Raw | ConvertFrom-Json
+            if ($lData -and $lData.recommendations) { $learningRec = $lData.recommendations }
+        } catch {}
+    }
+
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
@@ -210,6 +220,19 @@ function Update-AdaptersAndWeights {
             elseif ($h.Trend -gt 1) { $w *= 1.15 }
         }
 
+        # v6.0: Apply learning engine recommendation boost
+        if ($learningRec) {
+            # Map mode -> recommendation field; check if this adapter is the recommended one
+            $recName = switch ($s.currentMode) {
+                'maxspeed'  { $learningRec.bulk }
+                'download'  { $learningRec.bulk }
+                'streaming' { $learningRec.streaming }
+                'gaming'    { $learningRec.gaming }
+                default     { $learningRec.bulk }
+            }
+            if ($recName -and $recName -eq $a.Name) { $w *= 1.2 }  # 20% boost to learned-best adapter
+        }
+
         $weights += [math]::Max(0.1, $w)
         if (-not $s.connectionCounts.ContainsKey($a.Name)) {
             $s.connectionCounts[$a.Name] = 0
@@ -252,7 +275,12 @@ function Update-ProxyStats {
         sessionMapSize = $s.sessionMap.Count
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
-    } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.statsFile -Force -ErrorAction SilentlyContinue
+    } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+        # v6.0: Atomic write — prevents DashboardServer SSE from reading a half-written file
+        $tmp = [IO.Path]::GetTempFileName()
+        $_ | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $s.statsFile -Force
+    }
 
     try {
         while ($s.decisionQueue.Count -gt $s.maxDecisions) {
@@ -264,7 +292,11 @@ function Update-ProxyStats {
         [array]::Reverse($decisionSnapshot)
         $s.decisions = $decisionSnapshot
 
-        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.decisionsFile -Force -ErrorAction SilentlyContinue
+        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+            $tmp = [IO.Path]::GetTempFileName()
+            $_ | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $s.decisionsFile -Force
+        }
     } catch {}
 }
 
@@ -645,10 +677,14 @@ $HandlerScript = {
 }
 
 # ===== Dynamic Adaptive Runspace Pool =====
-# v6.0: Speedtest Burst Optimized Pool
-$minThreads = 32
-$maxThreads = 256
-$currentMaxThreads = 64
+# v6.0: Read thread pool bounds from config.json, with sane defaults
+$cfgProxy = $null
+if (Test-Path $configFile) {
+    try { $cfgProxy = (Get-Content $configFile -Raw | ConvertFrom-Json).proxy } catch {}
+}
+$minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 32 }
+$maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
+$currentMaxThreads = [math]::Min($maxThreads, [math]::Max($minThreads, 64))
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
 
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
