@@ -46,6 +46,7 @@ The project is segmented strictly into decoupled modules to ensure if one crashe
 ### 1. Root Control Scripts
 These are the user-facing entry points used to interact completely safely with the OS.
 * `NetFusion-START.bat` - Requests Administrator privileges, cleans stale ports, and boots the Watchdog.
+* `Setup-NetFusion.ps1` - First-run setup helper. Checks prerequisites, creates `config.json` from `config.default.json`, and explains proxy/config basics.
 * `NetFusion-STOP.bat` - Safely un-registers the proxy from the OS registry, drops all subsystem jobs, and flushes IP metrics back to Windows Defaults.
 * `NetFusion-SAFE.bat` - The scorched-earth Panic Button. Erases registry keys, resets firewall state, and drops frozen locked memory paths.
 * `test-speed.ps1` - Diagnostic loopback module calculating exact adapter physical limits.
@@ -122,11 +123,22 @@ If an identical-subnet mesh node refuses to assign a secondary Wi-Fi adapter an 
 ## Installation & Operation
 
 ### Standard Startup
-1. Ensure both Wi-Fi / Ethernet adapters are connected to the network.
-2. Run **`NetFusion-START.bat`** *(as Administrator)*.
-3. The firewall will sync, UDP will be blocked, and the Proxy (`127.0.0.1:8080`) will take over Windows web settings.
-4. The premium UI will spawn at **`http://localhost:9090`**.
-5. The dashboard will prompt for the access token shown in the server console and stores it in an HTTP-only cookie after login. Do not pass the token in the URL.
+1. Run **`Setup-NetFusion.ps1`** *(preferably as Administrator)* on first use.
+2. Ensure both Wi-Fi / Ethernet adapters are connected to the network.
+3. Review **`config\config.json`** if you want to change ports, startup behavior, or optimization defaults.
+4. Run **`NetFusion-START.bat`** *(as Administrator)*.
+5. The firewall will sync, UDP will be blocked, and the Proxy (`127.0.0.1:8080` by default) will take over Windows web settings.
+6. The premium UI will spawn at **`http://localhost:9090`**.
+7. The dashboard will prompt for the access token shown in the dashboard server console and stores it in an HTTP-only cookie after login. Do not pass the token in the URL.
+
+### What Setup-NetFusion.ps1 Does
+* Checks PowerShell version compatibility.
+* Warns if you are not running as Administrator.
+* Detects usable adapters and warns if fewer than two are available.
+* Creates `config\config.json` from `config\config.default.json` when needed.
+* Shows which file controls behavior: `config\config.json`.
+* Explains how proxy configuration works for browsers and apps.
+* Prints adapter metric guidance for difficult same-subnet dual-adapter setups.
 
 ### For Segmented Maximum File Downloads
 Because standard Chrome/Edge utilizes multiplexed HTTP/2, a massive single file download will only stream on a single adapter. 
