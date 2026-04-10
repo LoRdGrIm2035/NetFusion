@@ -78,21 +78,32 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
     # v6.0 Safety
     safeMode       = $false
+    # v6.0 #5: Per-adapter connection cap
+    maxConcurrentPerAdapter = 48
 })
 
 function Write-ProxyEvent {
     param([string]$Message)
     try {
-        $ef = $global:ProxyState.eventsFile
-        $events = @()
-        if (Test-Path $ef) {
-            $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($data -and $data.events) { $events = @($data.events) }
+        # v6.0 Fix #9: Use mutex for cross-process coordination (matching LearningEngine/InterfaceMonitor)
+        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+        try {
+            $mutex.WaitOne(3000) | Out-Null
+            $ef = $global:ProxyState.eventsFile
+            $events = @()
+            if (Test-Path $ef) {
+                $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($data -and $data.events) { $events = @($data.events) }
+            }
+            $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
+            $events = @($evt) + $events
+            if ($events.Count -gt 200) { $events = $events[0..199] }
+            $tmp = [IO.Path]::GetTempFileName()
+            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $ef -Force
+        } finally {
+            $mutex.ReleaseMutex()
         }
-        $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
-        $events = @($evt) + $events
-        if ($events.Count -gt 200) { $events = $events[0..199] }
-        @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $ef -Force -Encoding UTF8 -ErrorAction SilentlyContinue
     } catch {}
 }
 
@@ -412,6 +423,16 @@ $HandlerScript = {
             $avail += $State.adapters[$i]
             $aw += $State.weights[$i]
         }
+        # v6.0 #5: Filter out adapters that hit maxConcurrentPerAdapter cap
+        $maxPerAdapter = if ($State.maxConcurrentPerAdapter -gt 0) { $State.maxConcurrentPerAdapter } else { 48 }
+        $avail = @($avail | Where-Object {
+            $active = if ($State.activePerAdapter.ContainsKey($_.Name)) { [int]$State.activePerAdapter[$_.Name] } else { 0 }
+            $active -lt $maxPerAdapter
+        })
+        if ($avail.Count -eq 0) {
+            # All saturated — fall back to full list so connection isn't dropped
+            $avail = @($State.adapters | Where-Object { $_.IP })
+        }
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
         $State.totalConnections++
         $State.activeConnections++
@@ -686,6 +707,8 @@ $minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.mi
 $maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
 $currentMaxThreads = [math]::Min($maxThreads, [math]::Max($minThreads, 64))
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
+# v6.0 #5: Per-adapter concurrent connection cap from config
+$global:ProxyState.maxConcurrentPerAdapter = if ($cfgProxy -and $cfgProxy.maxConcurrentPerAdapter -gt 0) { [int]$cfgProxy.maxConcurrentPerAdapter } else { 48 }
 
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
 $rsPool.Open()

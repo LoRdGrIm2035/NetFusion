@@ -29,3 +29,5 @@ Desktop.ini
 *.tmp
 *.bak
 *.orig
+config/dashboard-cert.pfx
+config/watchdog-heartbeat.json

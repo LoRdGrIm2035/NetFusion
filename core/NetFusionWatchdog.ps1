@@ -14,6 +14,12 @@ $failCount = 0
 
 Write-Host "  [Watchdog] Active. Guarding proxy on port $proxyPort..." -ForegroundColor Cyan
 
+# v6.0 #10: Heartbeat file so the dashboard can monitor if the watchdog itself is alive
+$watchdogDir = Join-Path (Split-Path $PSScriptRoot -Parent) "config"
+$heartbeatFile = Join-Path $watchdogDir "watchdog-heartbeat.json"
+$watchdogStart = Get-Date
+$restartCount = 0
+
 function Clear-Proxy {
     Write-Host "  [Watchdog] Critical Failure Detected! Clearing proxy..." -ForegroundColor Red
     try {
@@ -36,6 +42,20 @@ function Clear-Proxy {
 
 while ($true) {
     Start-Sleep -Seconds 3
+    
+    # v6.0 #10: Write heartbeat so dashboard knows we're alive
+    try {
+        $hb = @{
+            alive = $true; pid = $PID
+            uptime = [math]::Round(((Get-Date) - $watchdogStart).TotalSeconds)
+            lastCheck = (Get-Date).ToString('o')
+            failCount = $failCount
+            restartCount = $restartCount
+        } | ConvertTo-Json -Compress
+        $tmp = [IO.Path]::GetTempFileName()
+        $hb | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $heartbeatFile -Force
+    } catch {}
     
     # Check if NetFusionEngine is running
     $engineProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue | 
@@ -65,6 +85,7 @@ while ($true) {
             try {
                 Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$engineScript`"" -WindowStyle Hidden
                 Write-Host "  [Watchdog] Engine restart triggered. Grace period 20s..." -ForegroundColor Green
+                $restartCount++
             } catch {
                 Write-Host "  [Watchdog] Engine restart failed: $_" -ForegroundColor Red
             }
