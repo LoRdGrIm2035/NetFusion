@@ -769,6 +769,8 @@ try {
             }
             
             # [V5-FIX-8] Dynamic Thread Pool Scaling Policy
+            # SetMaxRunspaces affects future scheduling only; existing runspaces are allowed
+            # to finish, so thread count can temporarily remain above the new cap after scale-down.
             $activeThreads = $activeCount
             $queueDepth = if ($listener.Pending()) { 5 } else { 0 } # Estimate pending requests
             

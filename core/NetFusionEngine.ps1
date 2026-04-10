@@ -106,6 +106,7 @@ function Repair-AdapterDHCP {
         $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' 
     }
     
+    $adapterIdx = 0
     foreach ($adapter in $allAdapters) {
         $ip = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
         $hasRoute = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
@@ -125,9 +126,7 @@ function Repair-AdapterDHCP {
                             Where-Object { $_.IPAddress -match '^169\.254\.' } | 
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
                         
-                        # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
-                        $adapterList = @($allAdapters)
-                        $adapterIdx  = [array]::IndexOf($adapterList.ifIndex, $adapter.ifIndex)
+                        # Use a simple loop counter so fallback IPs stay sequential (.147, .148, .149).
                         $lastOctet   = 147 + $adapterIdx
                         $staticIP = "192.168.1.$lastOctet"
                         
@@ -145,6 +144,7 @@ function Repair-AdapterDHCP {
                 }
             }
         }
+        $adapterIdx++
     }
 }
 
@@ -152,7 +152,9 @@ function Repair-AdapterDHCP {
 function Enforce-ECMP {
     $targetMetric = 15
     $wifiAdapters = Get-NetAdapter | Where-Object { 
-        $_.Status -eq 'Up' -and $_.Name -match 'Wi-Fi' 
+        $_.Status -eq 'Up' -and
+        $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
+        ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN' -or $_.Name -match 'Wi-Fi|Wireless')
     }
     
     if ($wifiAdapters.Count -ge 2) {

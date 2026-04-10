@@ -637,32 +637,45 @@ document.querySelectorAll('.mbtn').forEach(b=>{
 drawThroughput();
 drawChart('connChart',[connHist],['#3b82f6']);
 
-// [V5-FIX-5] SSE Stream initialization
-const evtSource = new EventSource('/api/stream'+API);
-evtSource.onmessage = (e) => {
-  try {
-    const data = JSON.parse(e.data);
-    if(data.stats) processStats(data.stats);
-    // Route Decisions
-    if(data.decisions?.decisions && data.decisions.decisions.length > 0){
-      renderDecs(data.decisions.decisions);
-    }
-    // Sys Events
-    if(data.events?.events && data.events.events.length > 0){
-      renderEvts(data.events.events);
-    }
-    if(data.learning) renderLearning(data.learning);
-  } catch(err) {}
-};
+// ===== LIVE STREAM =====
+let evtSource=null,reconnectDelayMs=1000,reconnectTimer=null;
+function attachStreamHandlers(source){
+  source.onmessage = (e) => {
+    reconnectDelayMs = 1000;
+    if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
+    try {
+      const data = JSON.parse(e.data);
+      if(data.stats) processStats(data.stats);
+      if(data.decisions?.decisions && data.decisions.decisions.length > 0) renderDecs(data.decisions.decisions);
+      if(data.events?.events && data.events.events.length > 0) renderEvts(data.events.events);
+      if(data.learning) renderLearning(data.learning);
+    } catch(err) {}
+  };
 
-evtSource.onerror = () => {
-  console.warn('[NetFusion] SSE disconnected — auto-reconnecting...');
-  setTimeout(() => {
-    const newSource = new EventSource('/api/stream'+API);
-    newSource.onmessage = evtSource.onmessage;
-    newSource.onerror = evtSource.onerror;
-  }, 3000);
-};
+  source.onerror = () => {
+    if(source.readyState === EventSource.CLOSED){
+      try{source.close()}catch{}
+    }
+    if(reconnectTimer) return;
+    const waitMs = reconnectDelayMs;
+    console.warn(`[NetFusion] SSE disconnected - retrying in ${Math.round(waitMs/1000)}s`);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectStream();
+    }, waitMs);
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+  };
+}
+
+function connectStream(){
+  if(evtSource){
+    try{evtSource.close()}catch{}
+  }
+  evtSource = new EventSource('/api/stream'+API);
+  attachStreamHandlers(evtSource);
+}
+
+connectStream();
 
 window.addEventListener('resize',()=>{drawThroughput();drawChart('connChart',[connHist],['#3b82f6'])});
 </script>
