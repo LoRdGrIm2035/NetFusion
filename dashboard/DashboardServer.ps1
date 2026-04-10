@@ -28,19 +28,28 @@ $configDir = Join-Path $projectDir "config"
 $logsDir = Join-Path $projectDir "logs"
 
 function Get-UnifiedStats {
-    $result = @{ timestamp = (Get-Date).ToString('o'); version = '5.0' }
+    $result = @{ timestamp = (Get-Date).ToString('o'); version = '6.0' }
     $files = @{
         interfaces = "interfaces.json"
         health     = "health.json"
         proxy      = "proxy-stats.json"
         config     = "config.json"
         safety     = "safety-state.json"
+        watchdog   = "watchdog-heartbeat.json"
     }
     foreach ($key in $files.Keys) {
         $path = Join-Path $configDir $files[$key]
         if (Test-Path $path) {
             try { $result[$key] = Get-Content $path -Raw | ConvertFrom-Json } catch {}
         }
+    }
+    # v6.0 #10: Flag watchdog as stale if heartbeat is older than 15 seconds
+    if ($result.watchdog -and $result.watchdog.lastCheck) {
+        try {
+            $lastBeat = [DateTime]::Parse($result.watchdog.lastCheck)
+            $age = ((Get-Date) - $lastBeat).TotalSeconds
+            $result.watchdog | Add-Member -NotePropertyName 'stale' -NotePropertyValue ($age -gt 15) -Force
+        } catch {}
     }
     return ($result | ConvertTo-Json -Depth 6 -Compress)
 }
@@ -242,10 +251,56 @@ function Get-MimeType {
 # --- Main ---
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION DASHBOARD SERVER v5.0                  " -ForegroundColor Cyan
+Write-Host "    NETFUSION DASHBOARD SERVER v6.0                  " -ForegroundColor Cyan
 Write-Host "    Production Observability + Safety Controls        " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
+
+# v6.0 #7: Optional TLS support
+$dashConfig = $null
+$dashTLS = $false
+$tlsCert = $null
+$cfgPath = Join-Path $configDir "config.json"
+if (Test-Path $cfgPath) {
+    try { $dashConfig = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch {}
+}
+if ($dashConfig -and $dashConfig.dashboardTLS -eq $true) {
+    $certPath = Join-Path $configDir "dashboard-cert.pfx"
+    $certPass = "NetFusionDash"
+    
+    if (-not (Test-Path $certPath)) {
+        Write-Host "  [TLS] Generating self-signed certificate..." -ForegroundColor Yellow
+        try {
+            $cert = New-SelfSignedCertificate `
+                -DnsName "localhost","127.0.0.1" `
+                -CertStoreLocation "Cert:\CurrentUser\My" `
+                -FriendlyName "NetFusion Dashboard" `
+                -NotAfter (Get-Date).AddYears(5) `
+                -KeyExportPolicy Exportable `
+                -KeySpec Signature `
+                -KeyAlgorithm RSA -KeyLength 2048
+            
+            $secPass = ConvertTo-SecureString -String $certPass -Force -AsPlainText
+            Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $certPath -Password $secPass | Out-Null
+            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+            Write-Host "  [TLS] Certificate saved to $certPath" -ForegroundColor Green
+        } catch {
+            Write-Host "  [TLS] Certificate generation failed: $_" -ForegroundColor Red
+            Write-Host "  [TLS] Falling back to plain HTTP" -ForegroundColor Yellow
+        }
+    }
+    
+    if (Test-Path $certPath) {
+        try {
+            $secPass = ConvertTo-SecureString -String $certPass -Force -AsPlainText
+            $tlsCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath, $secPass)
+            $dashTLS = $true
+            Write-Host "  [TLS] Certificate loaded (expires $($tlsCert.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Green
+        } catch {
+            Write-Host "  [TLS] Failed to load certificate: $_" -ForegroundColor Red
+        }
+    }
+}
 
 $listener = $null
 try {
@@ -253,7 +308,10 @@ try {
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
     $listener.Start()
 
-    Write-Host "  Dashboard: http://127.0.0.1:${Port}" -ForegroundColor Green
+    $proto = if ($dashTLS) { "https" } else { "http" }
+    Write-Host "  Dashboard: ${proto}://127.0.0.1:${Port}" -ForegroundColor Green
+    if ($dashTLS) { Write-Host "  TLS: ENABLED (self-signed)" -ForegroundColor Green }
+    else          { Write-Host "  TLS: disabled (set dashboardTLS=true in config to enable)" -ForegroundColor DarkGray }
     Write-Host "  Access: local automatic (loopback only)" -ForegroundColor Green
     Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
     Write-Host ""
@@ -276,7 +334,21 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
-        $stream = $client.GetStream()
+        $rawStream = $client.GetStream()
+        $stream = $rawStream
+        
+        # v6.0 #7: Wrap in SslStream if TLS is enabled
+        if ($dashTLS -and $tlsCert) {
+            try {
+                $sslStream = New-Object System.Net.Security.SslStream($rawStream, $false)
+                $sslStream.AuthenticateAsServer($tlsCert, $false, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+                $stream = $sslStream
+            } catch {
+                try { $rawStream.Close(); $client.Close() } catch {}
+                continue
+            }
+        }
+        
         $stream.ReadTimeout = 5000
         $suppressClose = $false
 
