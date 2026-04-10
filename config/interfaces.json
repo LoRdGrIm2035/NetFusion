@@ -1,0 +1,57 @@
+﻿{
+    "interfaces":  [
+                       {
+                           "AutomaticMetric":  "Disabled",
+                           "SSID":  "secondfloor21_5",
+                           "Type":  "WiFi",
+                           "WiFiGeneration":  6,
+                           "SentBytes":  426937822,
+                           "Description":  "MediaTek Wi-Fi 6 MT7921 Wireless LAN Card",
+                           "Gateway":  "192.168.1.254",
+                           "WiFiGenerationLabel":  "Wi-Fi 6 (802.11ax)",
+                           "DNSServers":  [
+                                              "8.8.8.8",
+                                              "8.8.4.4"
+                                          ],
+                           "LinkSpeed":  "866.7 Mbps",
+                           "MacAddress":  "E8-AE-1D-01-FA-16",
+                           "CapabilityScore":  91,
+                           "Fingerprint":  "e0a6437e3145038f",
+                           "IPAddress":  "192.168.1.67",
+                           "Metric":  25,
+                           "InterfaceIndex":  12,
+                           "Name":  "Wi-Fi 3",
+                           "ReceivedBytes":  3350019588,
+                           "Status":  "Up",
+                           "LinkSpeedMbps":  866.7
+                       },
+                       {
+                           "AutomaticMetric":  "Disabled",
+                           "SSID":  "thirdfloor42_5",
+                           "Type":  "USB-WiFi",
+                           "WiFiGeneration":  4,
+                           "SentBytes":  9118722,
+                           "Description":  "TP-Link Wireless USB Adapter",
+                           "Gateway":  "192.168.1.254",
+                           "WiFiGenerationLabel":  "Wi-Fi 4 (speed-detected)",
+                           "DNSServers":  [
+                                              "100.127.255.165",
+                                              "100.127.255.73"
+                                          ],
+                           "LinkSpeed":  "195 Mbps",
+                           "MacAddress":  "14-EB-B6-A8-CF-4D",
+                           "CapabilityScore":  53,
+                           "Fingerprint":  "f5b46cc63d1776d7",
+                           "IPAddress":  "192.168.1.76",
+                           "Metric":  30,
+                           "InterfaceIndex":  10,
+                           "Name":  "Wi-Fi 4",
+                           "ReceivedBytes":  1759701487,
+                           "Status":  "Up",
+                           "LinkSpeedMbps":  195
+                       }
+                   ],
+    "timestamp":  "2026-04-10T22:29:38.7488602+05:45",
+    "version":  "4.0",
+    "count":  2
+}
