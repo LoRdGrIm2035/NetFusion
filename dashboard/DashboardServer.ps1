@@ -397,8 +397,8 @@ try {
             # Pre-parse query parameters
             $parsedPath = $path.Split('?')[0]
 
-            # v6.0 #7: Token auth for LAN access -- enforce on API endpoints
-            if ($dashAllowLAN -and $dashToken -and $parsedPath -match '^/api/') {
+            # v6.0 #7: Token auth for LAN access -- enforce on API and dashboard pages
+            if ($dashAllowLAN -and $dashToken -and ($parsedPath -match '^/api/' -or $parsedPath -eq '/' -or $parsedPath -eq '/index.html')) {
                 $tokenHeader = $null
                 foreach ($hline in ($requestText -split "`r`n")) {
                     if ($hline -match '^X-NetFusion-Token:\s*(.+)$') { $tokenHeader = $Matches[1].Trim(); break }

@@ -87,7 +87,9 @@ $initSafety = @{
     lastEvent = 'Engine started'; circuitBreakerOpen = $false
     startTime = $engineStartTime.ToString('o')
 }
-$initSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+$tmp = [IO.Path]::GetTempFileName()
+$initSafety | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
+Move-Item $tmp $safetyFile -Force
 Write-Host "  [+] Safety state initialized." -ForegroundColor Green
 
 $loopCount = 0
