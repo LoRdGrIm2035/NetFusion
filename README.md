@@ -363,7 +363,7 @@ Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 
 ## Contributor
 
-**Arman Khan**
+**[Arman Khan](https://github.com/Arman-techiee)**
 
 ## License
 
