@@ -22,6 +22,43 @@ if ($wifi4IP -match '^169\.254\.' -or -not $wifi4IP) {
     exit 1
 }
 
+function Invoke-BoundCurlDownload {
+    param(
+        [string]$LocalIP,
+        [string]$Url
+    )
+
+    $curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curlCmd) {
+        throw "curl.exe is required for adapter-bound testing but was not found."
+    }
+
+    $format = "SIZE=%{size_download};TIME=%{time_total};SPEED=%{speed_download};IP=%{local_ip}"
+    $output = & $curlCmd.Source --interface $LocalIP --noproxy "*" -L -o NUL -sS -w $format $Url 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw (($output | Out-String).Trim())
+    }
+
+    $text = ($output | Out-String).Trim()
+    $result = @{}
+    foreach ($part in ($text -split ';')) {
+        if ($part -match '^(SIZE|TIME|SPEED|IP)=(.*)$') {
+            $result[$Matches[1]] = $Matches[2]
+        }
+    }
+
+    if (-not $result.ContainsKey('SIZE') -or -not $result.ContainsKey('TIME')) {
+        throw "curl.exe returned unexpected output: $text"
+    }
+
+    return @{
+        Bytes = [double]$result['SIZE']
+        Seconds = [double]$result['TIME']
+        SpeedBytesPerSec = if ($result.ContainsKey('SPEED')) { [double]$result['SPEED'] } else { 0.0 }
+        LocalIP = if ($result.ContainsKey('IP')) { $result['IP'] } else { $LocalIP }
+    }
+}
+
 # Step 2: Check routes
 Write-Host "`n--- STEP 2: Route Check ---" -ForegroundColor Yellow
 $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.InterfaceAlias -match 'Wi-Fi' }
@@ -32,8 +69,9 @@ if ($routes.Count -lt 2) {
     Write-Host "  [WARN] Only $($routes.Count) route(s). Both adapters need a default route for ECMP." -ForegroundColor Red
 }
 
-# Step 3: Test per-adapter internet speed (1 connection each)
-Write-Host "`n--- STEP 3: Per-Adapter Download Test ---" -ForegroundColor Yellow
+# Step 3: Real adapter-bound direct test.
+Write-Host "`n--- STEP 3: Adapter-Bound Direct Download Test ---" -ForegroundColor Yellow
+Write-Host "  Using curl.exe --interface <local-ip> so each request is pinned to the selected adapter." -ForegroundColor DarkYellow
 $testURL = "http://speed.cloudflare.com/__down?bytes=10000000"  # 10MB
 
 foreach ($adapterInfo in @(@{Name="Wi-Fi 3";IP=$wifi3IP}, @{Name="Wi-Fi 4";IP=$wifi4IP})) {
@@ -41,17 +79,11 @@ foreach ($adapterInfo in @(@{Name="Wi-Fi 3";IP=$wifi3IP}, @{Name="Wi-Fi 4";IP=$w
     $ip = $adapterInfo.IP
     Write-Host "  Testing $name ($ip)..." -NoNewline
     
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $wc = New-Object System.Net.WebClient
-        # Bind to specific adapter IP
-        $wc.Headers.Add("Host", "speed.cloudflare.com")
-        $data = $wc.DownloadData($testURL)
-        $sw.Stop()
-        $mbps = [math]::Round(($data.Length * 8 / 1MB) / $sw.Elapsed.TotalSeconds, 2)
-        Write-Host " $mbps Mbps ($([math]::Round($data.Length/1MB, 1)) MB in $([math]::Round($sw.Elapsed.TotalSeconds, 2))s)" -ForegroundColor Green
+        $result = Invoke-BoundCurlDownload -LocalIP $ip -Url $testURL
+        $mbps = if ($result.Seconds -gt 0) { [math]::Round(($result.Bytes * 8 / 1MB) / $result.Seconds, 2) } else { 0 }
+        Write-Host " $mbps Mbps ($([math]::Round($result.Bytes/1MB, 1)) MB in $([math]::Round($result.Seconds, 2))s, source $($result.LocalIP))" -ForegroundColor Green
     } catch {
-        $sw.Stop()
         Write-Host " FAILED: $($_.Exception.Message)" -ForegroundColor Red
     }
 }

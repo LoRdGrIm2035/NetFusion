@@ -38,9 +38,9 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
     weights          = @()
-    connectionCounts = @{}
-    successCounts    = @{}
-    failCounts       = @{}
+    connectionCounts = [hashtable]::Synchronized(@{})
+    successCounts    = [hashtable]::Synchronized(@{})
+    failCounts       = [hashtable]::Synchronized(@{})
     totalConnections = 0
     totalFails       = 0
     activeConnections = 0        # v5.1: live active connection count
@@ -60,7 +60,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     # v5.0 Intelligence State
     adapterHealth    = @{}
     degradationFlags = @{}
-    connectionTypes  = @{}
+    connectionTypes  = [hashtable]::Synchronized(@{})
     decisions        = @()
     maxDecisions     = 100
     bandwidthEstimates = @{}
@@ -73,10 +73,15 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'default'     = 131072   # 128KB default
     }
     # v5.0 Session Affinity
-    sessionMap     = @{}    # { "host:port" -> @{ adapter=Name; time=DateTime } }
+    sessionMap     = [hashtable]::Synchronized(@{})    # { "host:port" -> @{ adapter=Name; time=DateTime } }
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
     # v5.0 Safety
     safeMode       = $false
+    portClasses    = @{
+        gaming = @(3074, 3478, 3479, 3480, 3659, 25565, 27015, 27036, 19132)
+        voice  = @(3478, 3479, 3480, 5004, 5005, 5060, 5061)
+        bulk   = @(20, 21, 22, 8080, 8443, 9000, 9090)
+    }
 })
 
 function Write-ProxyEvent {
@@ -342,6 +347,11 @@ $HandlerScript = {
         $State.activePerHost[$hostKey]++
         $activeHostCount = $State.activePerHost[$hostKey]
 
+        $portClasses = $State.portClasses
+        $gamingPorts = if ($portClasses -and $portClasses.gaming) { @($portClasses.gaming) } else { @() }
+        $voicePorts = if ($portClasses -and $portClasses.voice) { @($portClasses.voice) } else { @() }
+        $bulkPorts = if ($portClasses -and $portClasses.bulk) { @($portClasses.bulk) } else { @() }
+
         if ($rPort -in $gamingPorts) { 
             $connType = 'gaming' 
         } elseif ($rPort -in $voicePorts) { 
@@ -381,7 +391,6 @@ $HandlerScript = {
             # Safe mode: use first adapter only (most reliable, default Windows behavior)
             $selectionReason = 'safe-mode(single-adapter)'
         } elseif ($avail.Count -eq 1) {
-            $State.connectionCounts[$avail[0].Name]++
             $selectionReason = 'only-adapter'
         } else {
             # [V5-FIX-4] Resolve Round-Robin vs Session Affinity
@@ -486,11 +495,6 @@ $HandlerScript = {
             }
         }
 
-        # v5.1: Track active connection per adapter
-        $connAdapter = $adapter.Name
-        if (-not $State.activePerAdapter.ContainsKey($connAdapter)) { $State.activePerAdapter[$connAdapter] = 0 }
-        $State.activePerAdapter[$connAdapter]++
-
         # Log decision
         $decision = @{
             time = (Get-Date).ToString('HH:mm:ss')
@@ -531,6 +535,15 @@ $HandlerScript = {
             }
 
             try {
+                if ($connAdapter -ne $adapter.Name) {
+                    if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
+                        $State.activePerAdapter[$connAdapter] = [math]::Max(0, [int]$State.activePerAdapter[$connAdapter] - 1)
+                    }
+                    if (-not $State.activePerAdapter.ContainsKey($adapter.Name)) { $State.activePerAdapter[$adapter.Name] = 0 }
+                    $State.activePerAdapter[$adapter.Name] = [int]$State.activePerAdapter[$adapter.Name] + 1
+                    $connAdapter = $adapter.Name
+                }
+
                 $remoteClient = New-Object System.Net.Sockets.TcpClient
                 $remoteClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Linger, (New-Object System.Net.Sockets.LingerOption($true, 1)))
                 $remoteClient.SendBufferSize = $bufSize
