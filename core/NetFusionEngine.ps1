@@ -268,7 +268,9 @@ while ($true) {
             if (Test-Path $safetyFile) {
                 try {
                     $ex = Get-Content $safetyFile -Raw | ConvertFrom-Json
-                    $curSafety.safeMode = [bool]$ex.safeMode
+                    if ($ex -and $ex.lastEvent -and $ex.lastEvent -ne 'Engine running normally') {
+                        $curSafety.lastEvent = [string]$ex.lastEvent
+                    }
                 } catch {}
             }
             $curSafety.uptime = $uptimeMin

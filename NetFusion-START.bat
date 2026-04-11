@@ -31,6 +31,7 @@ if exist "%~dp0config\active-fw-rules.json" (
 )
 if exist "%~dp0config\safety-state.json" del /q "%~dp0config\safety-state.json"
 if exist "%~dp0config\routes-applied.flag" del /q "%~dp0config\routes-applied.flag"
+powershell -ExecutionPolicy Bypass -Command "& { $f = '%~dp0config\safety-state.json'; @{ safeMode = $false; circuitBreakerOpen = $false; proxyHealthy = $false; version = '6.1'; lastEvent = 'Normal startup requested'; startTime = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8 }"
 
 :: Stale proxy guard: if ProxyEnable=1 from a crash, clear it immediately
 powershell -ExecutionPolicy Bypass -Command "$k='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $pe=(Get-ItemProperty $k -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable; if($pe -eq 1){Write-Host '  [!] Stale proxy detected from previous crash -- clearing...' -ForegroundColor Yellow; Set-ItemProperty $k 'ProxyEnable' 0 -Type DWord -Force; Remove-ItemProperty $k 'ProxyServer' -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $k 'ProxyOverride' -Force -ErrorAction SilentlyContinue; Write-Host '      Proxy cleared. Fresh init starting.' -ForegroundColor Green}"
