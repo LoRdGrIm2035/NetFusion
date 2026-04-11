@@ -448,6 +448,20 @@ function Measure-InterfaceHealth {
         # Packet loss penalty
         if ($packetLoss -gt 0) { $score -= [math]::Min(15, [int]($packetLoss / 5)) }
 
+        # Strong latency/jitter penalties so unusable links are not mislabeled as healthy.
+        if ($inetLatencySmoothed -ge 400) { $score -= 25 }
+        elseif ($inetLatencySmoothed -ge 250) { $score -= 18 }
+        elseif ($inetLatencySmoothed -ge 150) { $score -= 12 }
+        elseif ($inetLatencySmoothed -ge 100) { $score -= 6 }
+
+        if ($gwLatencySmoothed -ge 250) { $score -= 15 }
+        elseif ($gwLatencySmoothed -ge 120) { $score -= 10 }
+        elseif ($gwLatencySmoothed -ge 60) { $score -= 5 }
+
+        if ($jitter -ge 150) { $score -= 20 }
+        elseif ($jitter -ge 80) { $score -= 12 }
+        elseif ($jitter -ge 40) { $score -= 6 }
+
         $score = [math]::Max(0, [math]::Min(100, [math]::Round($score)))
 
         # --- Predictive degradation check ---
@@ -461,8 +475,8 @@ function Measure-InterfaceHealth {
 
     # --- Status ---
     $status = 'offline'
-    if ($score -ge 70) { $status = 'healthy' }
-    elseif ($score -ge 40) { $status = 'degraded' }
+    if ($score -ge 80) { $status = 'healthy' }
+    elseif ($score -ge 50) { $status = 'degraded' }
     elseif ($score -gt 0) { $status = 'critical' }
 
     # --- State change events ---

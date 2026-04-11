@@ -13,7 +13,7 @@ echo  [1/7] Killing all NetFusion services...
 taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
-powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter ""Name='powershell.exe' OR Name='pwsh.exe'"" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+powershell -ExecutionPolicy Bypass -Command "& { Get-CimInstance Win32_Process -Filter 'Name=''powershell.exe'' OR Name=''pwsh.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } }"
 timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----
@@ -39,16 +39,11 @@ powershell -ExecutionPolicy Bypass -Command "$inetKey = 'HKCU:\Software\Microsof
 
 :: ---- Restore routes ----
 echo  [5/7] Restoring default routing...
-net session >nul 2>&1
-if errorlevel 1 (
-    powershell -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-ExecutionPolicy Bypass -Command \"Remove-NetRoute -DestinationPrefix 0.0.0.0/1 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 128.0.0.0/1 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 0.0.0.0/2 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 64.0.0.0/2 -Confirm:$false -ErrorAction SilentlyContinue; Get-NetAdapter | Where-Object { $_.Status -eq ''Up'' -and $_.InterfaceDescription -notmatch ''Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel'' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue }\"'"
-) else (
-    powershell -ExecutionPolicy Bypass -Command "Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '0.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '64.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue }"
-)
+powershell -ExecutionPolicy Bypass -Command "& { Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '0.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '64.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue } }"
 
 :: ---- Set safe mode flag ----
 echo  [6/7] Setting safe mode flag...
-powershell -ExecutionPolicy Bypass -Command "$f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='6.0'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8"
+powershell -ExecutionPolicy Bypass -Command "& { $f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='6.0'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8 }"
 
 :: ---- Done ----
 echo  [7/7] Verifying internet connectivity...

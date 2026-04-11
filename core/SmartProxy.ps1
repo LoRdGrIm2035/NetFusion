@@ -198,10 +198,14 @@ function Update-AdaptersAndWeights {
 
             switch ($s.currentMode) {
                 'maxspeed' {
-                    $w = [math]::Max(1.0, ($sc / 100) * 5.0)
-                    if ($a.Type -eq 'Ethernet') { $w *= 2.0 }
-                    if ($h.Jitter -gt 30) { $w *= 0.7 }
-                    elseif ($h.Jitter -gt 15) { $w *= 0.85 }
+                    $speedMbps = if ($a.Speed -gt 0) { [double]$a.Speed } else { 100.0 }
+                    $speedNorm = [math]::Min(1.0, $speedMbps / 1000.0)
+                    $healthNorm = $sc / 100.0
+                    $w = [math]::Max(0.8, (($healthNorm * 0.65) + ($speedNorm * 0.35)) * 6.0)
+                    if ($a.Type -eq 'Ethernet') { $w *= 1.75 }
+                    if ($h.Jitter -gt 60) { $w *= 0.7 }
+                    elseif ($h.Jitter -gt 30) { $w *= 0.85 }
+                    elseif ($h.Jitter -gt 15) { $w *= 0.93 }
                 }
                 'download' {
                     $w = [math]::Max(0.5, ($a.Speed / 100) * ($sc / 100))
@@ -275,13 +279,17 @@ function Update-ProxyStats {
     foreach ($a in $s.adapters) {
         $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
     }
+    $activeConnectionTotal = 0
+    foreach ($value in $activePerAdapterSnap.Values) {
+        $activeConnectionTotal += [int]$value
+    }
     # Snapshot connectionTypes to prevent ConvertTo-Json crash from concurrent mutation
     $connTypeSnap = @{}
     foreach ($k in @($s.connectionTypes.Keys)) { $connTypeSnap[$k] = $s.connectionTypes[$k] }
     @{
         running = $true; port = $s.port; mode = $s.currentMode
         totalConnections = $s.totalConnections; totalFailures = $s.totalFails
-        activeConnections = $s.activeConnections
+        activeConnections = $activeConnectionTotal
         activePerAdapter = $activePerAdapterSnap
         adapterCount = $s.adapters.Count; adapters = $aStats
         connectionTypes = $connTypeSnap
@@ -422,21 +430,49 @@ $HandlerScript = {
         $State.connectionTypes[$connType]++
 
         # ===== Adapter Selection =====
-        $avail = @(); $aw = @()
+        $availableEntries = @()
         for ($i = 0; $i -lt $State.adapters.Count; $i++) {
-            $avail += $State.adapters[$i]
-            $aw += $State.weights[$i]
+            $availableEntries += [pscustomobject]@{
+                Adapter = $State.adapters[$i]
+                Weight  = if ($i -lt $State.weights.Count) { [double]$State.weights[$i] } else { 1.0 }
+            }
         }
         # v6.0 #5: Filter out adapters that hit maxConcurrentPerAdapter cap
         $maxPerAdapter = if ($State.maxConcurrentPerAdapter -gt 0) { $State.maxConcurrentPerAdapter } else { 48 }
-        $avail = @($avail | Where-Object {
-            $active = if ($State.activePerAdapter.ContainsKey($_.Name)) { [int]$State.activePerAdapter[$_.Name] } else { 0 }
+        $availableEntries = @($availableEntries | Where-Object {
+            $active = if ($State.activePerAdapter.ContainsKey($_.Adapter.Name)) { [int]$State.activePerAdapter[$_.Adapter.Name] } else { 0 }
             $active -lt $maxPerAdapter
         })
-        if ($avail.Count -eq 0) {
-            # All saturated — fall back to full list so connection isn't dropped
-            $avail = @($State.adapters | Where-Object { $_.IP })
+        if ($connType -eq 'bulk' -and $availableEntries.Count -gt 1) {
+            $bulkHealthyEntries = @($availableEntries | Where-Object {
+                $h = $State.adapterHealth[$_.Adapter.Name]
+                if (-not $h) { return $true }
+
+                $scoreOk = (-not $h.Score) -or ([double]$h.Score -ge 55)
+                $latOk = (-not $h.LatencyEWMA) -or ([double]$h.LatencyEWMA -lt 250)
+                $jitterOk = (-not $h.Jitter) -or ([double]$h.Jitter -lt 100)
+                $stableEnough = $h.IsDegrading -ne $true
+                return ($scoreOk -and $latOk -and $jitterOk -and $stableEnough)
+            })
+            if ($bulkHealthyEntries.Count -ge 1 -and $bulkHealthyEntries.Count -lt $availableEntries.Count) {
+                $availableEntries = $bulkHealthyEntries
+            }
         }
+        if ($availableEntries.Count -eq 0) {
+            # All saturated — fall back to full list so connection isn't dropped
+            $availableEntries = @(
+                for ($i = 0; $i -lt $State.adapters.Count; $i++) {
+                    if ($State.adapters[$i].IP) {
+                        [pscustomobject]@{
+                            Adapter = $State.adapters[$i]
+                            Weight  = if ($i -lt $State.weights.Count) { [double]$State.weights[$i] } else { 1.0 }
+                        }
+                    }
+                }
+            )
+        }
+        $avail = @($availableEntries | ForEach-Object { $_.Adapter })
+        $aw = @($availableEntries | ForEach-Object { $_.Weight })
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
         $State.totalConnections++
         $State.activeConnections++
@@ -546,25 +582,45 @@ $HandlerScript = {
                 $selectionReason = "round-robin(new-host)"
                 $affinityMode = "new-sticky"
             } else {
-                # Bulk Traffic: Active-load-aware round-robin
-                # v6.1: Uses actual health score to weight distribution, NOT theoretical link speed.
-                # Link speed (866 vs 130 Mbps) reflects radio capability, not ISP throughput.
-                # When adapters share the same gateway, their real internet speed is similar,
-                # so we balance by active connection count weighted by health score.
-                $bestBulkIdx = 0
+                # Bulk Traffic: active-load-aware weighted balancing.
+                # Prefer the stronger link, but do not let "better" collapse into "exclusive"
+                # or we lose the aggregate-speed benefit of multiple concurrent transfers.
+                $candidateScores = @()
                 $bestBulkScore = [double]::MaxValue
                 for ($bi = 0; $bi -lt $avail.Count; $bi++) {
-                    $aName  = $avail[$bi].Name
+                    $candidate = $avail[$bi]
+                    $aName  = $candidate.Name
                     $active = if ($State.activePerAdapter.ContainsKey($aName)) { [int]($State.activePerAdapter[$aName]) } else { 0 }
-                    # Use health score as capacity proxy (0-100). Higher health = more capacity.
                     $aHealth = $State.adapterHealth[$aName]
-                    $capacity = if ($aHealth -and $aHealth.Score -gt 0) { [double]$aHealth.Score } else { 50.0 }
-                    # Score = active connections / capacity. Lower = better candidate.
-                    $score = [double]$active / [math]::Max(1.0, $capacity)
-                    if ($score -lt $bestBulkScore) { $bestBulkScore = $score; $bestBulkIdx = $bi }
+                    $baseWeight = if ($bi -lt $aw.Count) { [double]$aw[$bi] } else { 1.0 }
+                    $speedMbps = if ($candidate.Speed -gt 0) { [double]$candidate.Speed } else { 100.0 }
+                    $speedFactor = [math]::Max(0.45, [math]::Min(1.75, $speedMbps / 600.0))
+                    $healthFactor = if ($aHealth -and $aHealth.Score -gt 0) { [math]::Max(0.45, [double]$aHealth.Score / 100.0) } else { 0.6 }
+                    $successFactor = if ($aHealth -and $aHealth.SuccessRate -gt 0) { [math]::Max(0.5, [double]$aHealth.SuccessRate / 100.0) } else { 0.9 }
+                    $jitterPenalty = 1.0
+                    if ($aHealth) {
+                        if ($aHealth.Jitter -gt 80) { $jitterPenalty = 0.6 }
+                        elseif ($aHealth.Jitter -gt 40) { $jitterPenalty = 0.8 }
+                        elseif ($aHealth.Jitter -gt 20) { $jitterPenalty = 0.9 }
+                        if ($aHealth.IsDegrading) { $jitterPenalty *= 0.75 }
+                    }
+                    $capacity = [math]::Max(0.2, $baseWeight * $speedFactor * $healthFactor * $successFactor * $jitterPenalty)
+                    $score = [double]$active / $capacity
+                    $candidateScores += [pscustomobject]@{
+                        Index = $bi
+                        Score = $score
+                        Capacity = $capacity
+                    }
+                    if ($score -lt $bestBulkScore) { $bestBulkScore = $score }
                 }
-                $adapter = $avail[$bestBulkIdx]
-                $selectionReason = "active-load-balanced-bulk"
+                $bulkChoices = @($candidateScores | Where-Object { $_.Score -le ($bestBulkScore + 0.12) })
+                if ($bulkChoices.Count -eq 0) {
+                    $bulkChoices = @($candidateScores | Sort-Object Score | Select-Object -First 1)
+                }
+                $choiceOrdinal = ([System.Threading.Interlocked]::Increment([ref]$State.rrIndex) - 1) % $bulkChoices.Count
+                $chosen = $bulkChoices[$choiceOrdinal]
+                $adapter = $avail[$chosen.Index]
+                $selectionReason = "weighted-capacity-bulk"
             }
 
             if (-not $skipAffinity) {
