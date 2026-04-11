@@ -87,13 +87,7 @@ $initSafety = @{
     lastEvent = 'Engine started'; circuitBreakerOpen = $false
     startTime = $engineStartTime.ToString('o')
 }
-<<<<<<< HEAD
 $initSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
-=======
-$tmp = [IO.Path]::GetTempFileName()
-$initSafety | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
-Move-Item $tmp $safetyFile -Force
->>>>>>> origin/main
 Write-Host "  [+] Safety state initialized." -ForegroundColor Green
 
 $loopCount = 0
@@ -112,10 +106,6 @@ function Repair-AdapterDHCP {
         $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' 
     }
     
-<<<<<<< HEAD
-=======
-    $adapterIdx = 0
->>>>>>> origin/main
     foreach ($adapter in $allAdapters) {
         $ip = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
         $hasRoute = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
@@ -134,16 +124,10 @@ function Repair-AdapterDHCP {
                         Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
                             Where-Object { $_.IPAddress -match '^169\.254\.' } | 
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-<<<<<<< HEAD
                         
                         # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
                         $lastOctet = 147 + ($allAdapters | ForEach-Object { $_.ifIndex } | Sort-Object | 
                             ForEach-Object -Begin { $i = 0 } -Process { if ($_ -eq $adapter.ifIndex) { return $i }; $i++ })
-=======
-
-                        # Use a simple loop counter so fallback IPs stay sequential (.147, .148, .149).
-                        $lastOctet   = 147 + $adapterIdx
->>>>>>> origin/main
                         $staticIP = "192.168.1.$lastOctet"
                         
                         # Apply static IP with same gateway as working adapter
@@ -154,10 +138,6 @@ function Repair-AdapterDHCP {
                         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @("8.8.8.8","1.1.1.1") -ErrorAction SilentlyContinue
                         
                         Write-Host "  [REPAIR] Applied static IP $subnet.$lastOctet to $($adapter.Name)" -ForegroundColor Green
-<<<<<<< HEAD
-=======
-                        $adapterIdx++  # Only increment for adapters that actually got repaired
->>>>>>> origin/main
                     } catch {
                         Write-Host "  [REPAIR] Failed: $_" -ForegroundColor Red
                     }
@@ -167,7 +147,6 @@ function Repair-AdapterDHCP {
     }
 }
 
-<<<<<<< HEAD
 # v6.1: ECMP Enforcement - keep both adapters' metrics equal
 function Enforce-ECMP {
     $targetMetric = 15
@@ -182,38 +161,6 @@ function Enforce-ECMP {
                 try {
                     Set-NetIPInterface -InterfaceIndex $wa.ifIndex -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
                     Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
-=======
-# v6.1: ECMP Enforcement - keep all managed adapters' metrics equal
-function Enforce-ECMP {
-    $targetMetric = 15
-    # v6.0 #10: Read from interfaces.json so we use the same adapter set as NetworkManager,
-    # catching USB-WiFi adapters with generic names like "Realtek USB GbE" that regex misses.
-    $ifFile = Join-Path $projectDir "config\interfaces.json"
-    $managedAdapters = @()
-    if (Test-Path $ifFile) {
-        try {
-            $ifData = Get-Content $ifFile -Raw | ConvertFrom-Json
-            $managedAdapters = @($ifData.interfaces | Where-Object { $_.Status -eq 'Up' -and $_.Type -match 'WiFi|USB-WiFi' })
-        } catch {}
-    }
-    # Fallback to direct query if interfaces.json is missing or empty
-    if ($managedAdapters.Count -lt 2) {
-        $managedAdapters = @(Get-NetAdapter | Where-Object { 
-            $_.Status -eq 'Up' -and
-            $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
-            ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN|WiFi' -or $_.Name -match 'Wi-Fi|WLAN|Wireless')
-        })
-    }
-    
-    if ($managedAdapters.Count -ge 2) {
-        foreach ($wa in $managedAdapters) {
-            $ifIdx = if ($wa.ifIndex) { $wa.ifIndex } elseif ($wa.InterfaceIndex) { $wa.InterfaceIndex } else { continue }
-            $currentMetric = (Get-NetIPInterface -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric
-            if ($currentMetric -ne $targetMetric) {
-                try {
-                    Set-NetIPInterface -InterfaceIndex $ifIdx -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
-                    Set-NetRoute -InterfaceIndex $ifIdx -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
->>>>>>> origin/main
                 } catch {}
             }
         }
@@ -222,53 +169,10 @@ function Enforce-ECMP {
 
 while ($true) {
     try {
-<<<<<<< HEAD
         # Check if proxy process crashed
         if ($proxyProc.HasExited) {
             Write-Host "  [Engine] FATAL: SmartProxy process crashed (Exit: $($proxyProc.ExitCode))!" -ForegroundColor Red
             exit 1
-=======
-        # Check if proxy process crashed — respawn it in-place instead of exiting
-        # NOTE #6: $proxyRestarts resets when the Watchdog restarts the entire engine (new process).
-        # This means SmartProxy can crash 3 times per Watchdog restart cycle indefinitely.
-        # This is acceptable: each Watchdog restart is itself logged and rate-limited by the 20s grace period.
-        if ($proxyProc.HasExited) {
-            $proxyRestarts = if ($proxyRestarts) { $proxyRestarts + 1 } else { 1 }
-            Write-Host "  [Engine] SmartProxy crashed (Exit: $($proxyProc.ExitCode)). Respawn attempt $proxyRestarts/3..." -ForegroundColor Yellow
-            
-            if ($proxyRestarts -gt 3) {
-                Write-Host "  [Engine] FATAL: SmartProxy failed 3 respawns. Giving up." -ForegroundColor Red
-                exit 1
-            }
-            
-            # Respawn proxy only (no full engine cold-boot)
-            try {
-                $proxyScript = Join-Path $scriptDir "SmartProxy.ps1"
-                $proxyProc = Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$proxyScript`"" -WindowStyle Hidden -PassThru
-                Write-Host "  [Engine] SmartProxy respawned (PID: $($proxyProc.Id)). Waiting for port bind..." -ForegroundColor Yellow
-                
-                $portOpen = $false
-                $deadline = (Get-Date).AddSeconds(10)
-                while ((Get-Date) -lt $deadline) {
-                    Start-Sleep -Milliseconds 500
-                    try {
-                        $tcp = New-Object System.Net.Sockets.TcpClient
-                        $ar = $tcp.BeginConnect('127.0.0.1', 8080, $null, $null)
-                        if ($ar.AsyncWaitHandle.WaitOne(500, $false)) { $portOpen = $true; $tcp.Close(); break }
-                        $tcp.Close()
-                    } catch {}
-                }
-                
-                if ($portOpen) {
-                    Write-Host "  [Engine] SmartProxy respawn successful." -ForegroundColor Green
-                    $proxyRestarts = 0  # Reset counter on success
-                } else {
-                    Write-Host "  [Engine] SmartProxy respawn failed to bind port." -ForegroundColor Red
-                }
-            } catch {
-                Write-Host "  [Engine] SmartProxy respawn error: $_" -ForegroundColor Red
-            }
->>>>>>> origin/main
         }
         
         # 1. Update Hardware Mapping (Every ~6s)
@@ -314,14 +218,7 @@ while ($true) {
             }
             $curSafety.uptime = $uptimeMin
             $curSafety.lastEvent = 'Engine running normally'
-<<<<<<< HEAD
             $curSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
-=======
-            # v6.0 #5: Atomic write to prevent race with DashboardServer SSE reads
-            $tmp = [IO.Path]::GetTempFileName()
-            $curSafety | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
-            Move-Item $tmp $safetyFile -Force
->>>>>>> origin/main
         } catch {}
         
     } catch {

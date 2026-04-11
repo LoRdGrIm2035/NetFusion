@@ -1,15 +1,7 @@
-<<<<<<< HEAD
 ﻿{
     "proxyPort":  8080,
     "dashboardPort":  9090,
     "dashboardAllowLAN":  false,
-=======
-{
-    "proxyPort":  8080,
-    "dashboardPort":  9090,
-    "dashboardAllowLAN":  false,
-    "dashboardTLS":  false,
->>>>>>> origin/main
     "blockQUICOnSecondaryAdapters":  true,
     "mode":  "maxspeed",
     "monitorInterval":  2000,
@@ -23,14 +15,8 @@
                   "connectTimeout":  5000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
-<<<<<<< HEAD
-                  "minThreads":  16,
-                  "maxThreads":  64,
-=======
-                  "minThreads":  32,
-                  "maxThreads":  64,
-                  "maxConcurrentPerAdapter":  48,
->>>>>>> origin/main
+                  "minThreads":  64,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
                   "healthEndpoint":  true
@@ -85,7 +71,6 @@
                      "sessionInterval":  60,
                      "minSamplesForRecommendation":  20
                  },
-<<<<<<< HEAD
     "trafficRules":  {
                          "downloadManagers":  {
                                                   "mode":  "maxspeed",
@@ -129,9 +114,6 @@
                                                    ]
                                       }
                      },
-=======
-    "_trafficRules_NOTE":  "Per-app routing (IDMan.exe, chrome.exe etc.) was removed in v6.0. The proxy operates at TCP socket level and cannot distinguish processes without a kernel driver. Connection-type detection via L4 port classification is used instead.",
->>>>>>> origin/main
     "telemetry":  {
                       "enabled":  true,
                       "decisionLogSize":  100,
@@ -174,7 +156,4 @@
                          ],
     "autoStart":  false
 }
-<<<<<<< HEAD
 
-=======
->>>>>>> origin/main

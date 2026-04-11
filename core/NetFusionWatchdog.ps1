@@ -14,15 +14,6 @@ $failCount = 0
 
 Write-Host "  [Watchdog] Active. Guarding proxy on port $proxyPort..." -ForegroundColor Cyan
 
-<<<<<<< HEAD
-=======
-# v6.0 #10: Heartbeat file so the dashboard can monitor if the watchdog itself is alive
-$watchdogDir = Join-Path (Split-Path $PSScriptRoot -Parent) "config"
-$heartbeatFile = Join-Path $watchdogDir "watchdog-heartbeat.json"
-$watchdogStart = Get-Date
-$restartCount = 0
-
->>>>>>> origin/main
 function Clear-Proxy {
     Write-Host "  [Watchdog] Critical Failure Detected! Clearing proxy..." -ForegroundColor Red
     try {
@@ -46,27 +37,8 @@ function Clear-Proxy {
 while ($true) {
     Start-Sleep -Seconds 3
     
-<<<<<<< HEAD
     # Check if NetFusionEngine is running
     $engineProcs = @(Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | 
-=======
-    # v6.0 #10: Write heartbeat so dashboard knows we're alive
-    try {
-        $hb = @{
-            alive = $true; pid = $PID
-            uptime = [math]::Round(((Get-Date) - $watchdogStart).TotalSeconds)
-            lastCheck = (Get-Date).ToString('o')
-            failCount = $failCount
-            restartCount = $restartCount
-        } | ConvertTo-Json -Compress
-        $tmp = [IO.Path]::GetTempFileName()
-        $hb | Set-Content $tmp -Force -Encoding UTF8
-        Move-Item $tmp $heartbeatFile -Force
-    } catch {}
-    
-    # Check if NetFusionEngine is running
-    $engineProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue | 
->>>>>>> origin/main
         Where-Object { $_.CommandLine -and $_.CommandLine -match 'NetFusionEngine' })
     
     # Check if proxy port is listening
@@ -86,28 +58,7 @@ while ($true) {
             Clear-Proxy
             # Attempt to kill lingering dead processes
             foreach ($p in $engineProcs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-<<<<<<< HEAD
             exit 1
-=======
-
-            # v6.0: Restart the engine instead of just exiting
-            Write-Host "  [Watchdog] Restarting NetFusion Engine..." -ForegroundColor Yellow
-            $engineScript = Join-Path $PSScriptRoot "NetFusionEngine.ps1"
-            try {
-                Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$engineScript`"" -WindowStyle Hidden
-                Write-Host "  [Watchdog] Engine restart triggered. Grace period 20s..." -ForegroundColor Green
-                $restartCount++
-            } catch {
-                Write-Host "  [Watchdog] Engine restart failed: $_" -ForegroundColor Red
-            }
-
-            # v6.0 Fix: Grace period BEFORE resetting failCount and BEFORE re-entering the poll loop.
-            # The new engine process needs time to appear in WMI with 'NetFusionEngine' in its CommandLine.
-            # Without this, the next poll fires immediately and triggers a second restart.
-            Start-Sleep -Seconds 20
-            $failCount = 0
-            continue  # Skip directly to next iteration without the 3s sleep at top
->>>>>>> origin/main
         }
     } else {
         $failCount = 0

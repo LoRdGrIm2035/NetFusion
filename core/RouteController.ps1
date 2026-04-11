@@ -82,18 +82,6 @@ function Write-RouteEvent {
     } catch {}
 }
 
-<<<<<<< HEAD
-=======
-function Get-RoutableNetworkAdapters {
-    if (-not (Get-Command Get-NetworkAdapters -ErrorAction SilentlyContinue)) {
-        Write-Host "[ERROR] RouteAdapter.ps1 failed to load - cannot enumerate adapters" -ForegroundColor Red
-        return @()
-    }
-
-    return @(Get-NetworkAdapters)
-}
-
->>>>>>> origin/main
 function Get-ActiveInterfaces {
     if (Test-Path $InterfacesFile) {
         try {
@@ -103,12 +91,7 @@ function Get-ActiveInterfaces {
     }
 
     # Fallback: direct detection
-<<<<<<< HEAD
     $adapters = Get-NetworkAdapters
-=======
-    $adapters = Get-RoutableNetworkAdapters
-    if ($adapters.Count -eq 0) { return @() }
->>>>>>> origin/main
     $results = @()
     foreach ($a in $adapters) {
         $ip = (Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
@@ -150,12 +133,6 @@ function Set-DynamicMetrics {
     <# v4.0: Set metrics based on adapter type and real-time health. Lower metric = higher priority. #>
     param([array]$Interfaces, [int]$BaseMetric)
 
-<<<<<<< HEAD
-=======
-    $liveAdapters = Get-RoutableNetworkAdapters
-    if ($liveAdapters.Count -eq 0) { return }
-
->>>>>>> origin/main
     foreach ($iface in $Interfaces) {
         $idx = $iface.InterfaceIndex
         $name = $iface.Name
@@ -183,11 +160,7 @@ function Set-DynamicMetrics {
 
         try {
             # Always fetch the extreme live OS index in case the caching is desynced
-<<<<<<< HEAD
             $liveAdapter = Get-NetworkAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-=======
-            $liveAdapter = $liveAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
->>>>>>> origin/main
             if (-not $liveAdapter) {
                 Write-Host "    - $name -> waiting for adapter to initialize..." -ForegroundColor DarkGray
                 continue

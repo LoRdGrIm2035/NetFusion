@@ -1,10 +1,6 @@
 <#
 .SYNOPSIS
-<<<<<<< HEAD
     QuicBlocker v5.0 -- UDP 443 Firewall Manager
-=======
-    QuicBlocker v6.0 -- UDP 443 Firewall Manager
->>>>>>> origin/main
 .DESCRIPTION
     Modern browsers attempt to use QUIC (UDP 443) for Google/YouTube/Cloudflare.
     NetFusion TCP proxies CANNOT route UDP. This script explicitly creates an
@@ -46,13 +42,8 @@ $ruleName = "NetFusion_Block_QUIC"
 try {
     $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
     
-<<<<<<< HEAD
-    # If the config specifies blockQUICOnSecondaryAdapters, we block it globally to guarantee TCP fallback
-    $shouldBlock = if ($config -and $config.routing -and $config.routing.blockQUICOnSecondaryAdapters) { $true } else { $false }
-=======
-    # v6.0 #12: Fix — key is at root level, not nested under routing
+    # The QUIC toggle lives at the config root. If this is false, browsers can bypass the TCP proxy.
     $shouldBlock = if ($config -and $config.blockQUICOnSecondaryAdapters -eq $true) { $true } else { $false }
->>>>>>> origin/main
     
     $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
     
@@ -73,28 +64,18 @@ try {
         } else {
             Write-Host "  [+] QUIC firewall rule already enforcing." -ForegroundColor DarkGray
         }
-<<<<<<< HEAD
-        # [FIX-B] Write active firewall rules to sentinel
-        @{ rules = @($ruleName); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $sentinelFile -Force
-=======
-        # Atomic sentinel write
-        $tmp = [IO.Path]::GetTempFileName()
+        $tmp = [System.IO.Path]::GetTempFileName()
         @{ rules = @($ruleName); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
         Move-Item $tmp $sentinelFile -Force
->>>>>>> origin/main
     } else {
         if ($existingRule) {
             Write-QuicEvent "Removing QUIC Firewall Rule (Disabled in config)"
             Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
             Write-Host "  [-] QUIC block removed." -ForegroundColor DarkGray
         }
-<<<<<<< HEAD
-        @{ rules = @(); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $sentinelFile -Force
-=======
-        $tmp = [IO.Path]::GetTempFileName()
+        $tmp = [System.IO.Path]::GetTempFileName()
         @{ rules = @(); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
         Move-Item $tmp $sentinelFile -Force
->>>>>>> origin/main
     }
 } catch {
     Write-Host "  [QUIC] Failed to manage firewall bounds: $_" -ForegroundColor Red
