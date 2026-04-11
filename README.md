@@ -1,9 +1,14 @@
 <div align="center">
 
+<img src="./assets/netfusion-banner.svg" alt="NetFusion banner" width="100%" />
+
 <h1>NetFusion</h1>
 
-**Windows multi-interface traffic orchestration for real-world multi-connection workloads**
+<p><strong>Windows multi-interface traffic orchestration for high-concurrency workloads</strong></p>
 
+<p>PowerShell-native connection steering with health-aware adapter selection, route-aware safety controls, and local dashboard telemetry.</p>
+
+[![Author](https://img.shields.io/badge/Author-LoRdGrIm2035-181717?style=for-the-badge&logo=github)](https://github.com/LoRdGrIm2035)
 [![License](https://img.shields.io/github/license/LoRdGrIm2035/NetFusion?style=for-the-badge)](./LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/LoRdGrIm2035/NetFusion?style=for-the-badge)](https://github.com/LoRdGrIm2035/NetFusion/commits)
 [![Top Language](https://img.shields.io/github/languages/top/LoRdGrIm2035/NetFusion?style=for-the-badge)](https://github.com/LoRdGrIm2035/NetFusion)
@@ -13,42 +18,108 @@
 [![Proxy 8080](https://img.shields.io/badge/Proxy-127.0.0.1%3A8080-111827?style=for-the-badge)](#quick-start)
 [![Dashboard 9090](https://img.shields.io/badge/Dashboard-localhost%3A9090-F97316?style=for-the-badge)](#quick-start)
 
+[![Overview](https://img.shields.io/badge/Overview-111827?style=flat-square)](#overview)
+[![Requirements](https://img.shields.io/badge/Requirements-172554?style=flat-square)](#requirements--safety)
+[![Architecture](https://img.shields.io/badge/Architecture-1f2937?style=flat-square)](#architecture)
+[![Quick Start](https://img.shields.io/badge/Quick_Start-374151?style=flat-square)](#quick-start)
+[![Command Center](https://img.shields.io/badge/Command_Center-475569?style=flat-square)](#command-center)
+[![Profiles](https://img.shields.io/badge/Profiles-0f766e?style=flat-square)](#traffic-profiles)
+[![Validation](https://img.shields.io/badge/Validation-4b5563?style=flat-square)](#validation)
+[![Troubleshooting](https://img.shields.io/badge/Troubleshooting-6b7280?style=flat-square)](#troubleshooting)
+[![Author](https://img.shields.io/badge/Author-7c3aed?style=flat-square)](#author)
+[![License](https://img.shields.io/badge/License-9ca3af?style=flat-square&logoColor=white)](#license)
+
 </div>
 
 ---
 
-## Why NetFusion Exists
+## Overview
 
-NetFusion is a local Windows traffic orchestrator written in PowerShell. It runs a local proxy, watches multiple network adapters, scores their health, and binds each new outbound connection to the interface that makes the most sense at that moment.
+NetFusion is a local Windows traffic orchestrator written in PowerShell. It runs a local HTTP/HTTPS proxy, monitors multiple adapters, scores their health, and binds each new outbound connection to the interface that currently offers the best path.
 
-The result is practical multi-adapter utilization for workloads that already use many parallel TCP connections, such as segmented download managers, torrent clients, and bursty web-heavy applications.
+This project is designed for real aggregate throughput on workloads that already use many parallel TCP connections. It helps spread those connections across multiple adapters without pretending to be true packet-level bonding.
 
 > [!IMPORTANT]
-> NetFusion is connection-based, not packet-bonded. It improves aggregate throughput across many connections. It does not split one TCP flow across multiple adapters.
+> NetFusion is connection-based, not packet-bonded. It can improve aggregate throughput across many flows, but it does not split one TCP stream across multiple adapters.
 
-## At A Glance
+> [!TIP]
+> The best proof of value is a segmented downloader, torrent client, or any workload that opens many concurrent TCP sessions. A single browser download is usually the wrong benchmark.
 
-| Item | Value |
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <img src="https://img.shields.io/badge/Connection_Steering-Proxy_Decisions-111827?style=for-the-badge" alt="Connection steering badge" />
+      <p>Each outbound connection is classified and assigned to an adapter using live health and load signals.</p>
+    </td>
+    <td width="33%" valign="top">
+      <img src="https://img.shields.io/badge/Health_Aware-Latency_Jitter_Failures-1d4ed8?style=for-the-badge" alt="Health aware badge" />
+      <p>Adapter selection is influenced by latency, jitter, degradation trends, retry behavior, and observed activity.</p>
+    </td>
+    <td width="33%" valign="top">
+      <img src="https://img.shields.io/badge/Local_Visibility-Dashboard_%26_Telemetry-f97316?style=for-the-badge" alt="Telemetry badge" />
+      <p>Runtime behavior is exposed through dashboard views and generated state files for validation and troubleshooting.</p>
+    </td>
+  </tr>
+</table>
+
+## Platform Snapshot
+
+| Capability | Value |
 | --- | --- |
 | Platform | Windows 10 or Windows 11 |
 | Runtime | PowerShell 5.1 or newer |
 | Local proxy | `127.0.0.1:8080` |
 | Dashboard | `http://localhost:9090` |
-| Best workloads | IDM, aria2, torrents, multi-request downloaders |
-| Requires admin | Yes, for route, firewall, proxy, and metric changes |
-| Not designed for | MPTCP, MLPPP, Layer 2 bonding, packet striping |
+| Privileges | Administrator required for route, firewall, proxy, and interface metric changes |
+| Best workloads | IDM, `aria2`, torrent clients, multi-request downloaders, parallel API fetchers |
+| Runtime config | [`config/config.default.json`](./config/config.default.json) |
 
-## What It Does And Does Not Do
+## Requirements & Safety
 
-| NetFusion does | NetFusion does not |
-| --- | --- |
-| Run a local HTTP/HTTPS proxy on `127.0.0.1:8080` | Perform true link bonding or packet striping |
-| Bind new outbound sockets to a selected adapter IP | Turn every single browser download into summed bandwidth |
-| Monitor adapter health using latency, jitter, and failure signals | Replace remote aggregation servers or bonding hardware |
-| Keep session affinity where stability matters | Split one long-lived HTTPS tunnel live across adapters |
-| Expose live telemetry on `http://localhost:9090` | Guarantee doubled internet speed when both adapters share one WAN bottleneck |
+Before expecting useful results, make sure the environment actually supports multi-adapter distribution:
 
-If both adapters ultimately reach the internet through the same router or same constrained WAN path, that upstream bottleneck still wins.
+- Windows 10 or Windows 11
+- PowerShell 5.1 or newer
+- Administrator privileges
+- At least two active adapters with valid IPv4 addresses
+- A working gateway on each adapter if you expect both to carry traffic
+- `curl.exe` available for adapter-bound diagnostics
+
+Recommended:
+
+- Separate upstream paths when possible
+- A downloader that supports many parallel connections
+- Verify real adapter traffic counters instead of trusting app-level speed numbers
+
+> [!WARNING]
+> If both adapters ultimately feed the same router and the same constrained WAN uplink, NetFusion cannot manufacture more internet bandwidth than that upstream bottleneck allows.
+
+## Fit Matrix
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Strong Fit</h3>
+      <ul>
+        <li>Segmented download managers</li>
+        <li>Torrent traffic</li>
+        <li>Applications with many parallel HTTP requests</li>
+        <li>Mixed browsing and downloading with concurrent sessions</li>
+        <li>Multi-adapter testing and telemetry-heavy experimentation</li>
+      </ul>
+    </td>
+    <td width="50%" valign="top">
+      <h3>Not The Goal</h3>
+      <ul>
+        <li>Layer 2 bonding</li>
+        <li>MPTCP or MLPPP replacement</li>
+        <li>Packet striping for one TCP flow</li>
+        <li>Guaranteed doubled speed behind one shared WAN bottleneck</li>
+        <li>Making every browser download sum both links automatically</li>
+      </ul>
+    </td>
+  </tr>
+</table>
 
 ## Architecture
 
@@ -68,25 +139,35 @@ flowchart LR
     I --> D
 ```
 
-### Core runtime path
+### Runtime flow
 
-1. A local app sends traffic to the NetFusion proxy.
-2. The proxy classifies the connection and chooses an adapter.
-3. NetFusion binds the outbound socket to that adapter's local IPv4 address.
-4. Health data, retries, and session affinity influence later decisions.
-5. The dashboard exposes the resulting state for live inspection.
+1. A client application sends traffic to the local NetFusion proxy.
+2. The proxy classifies the new connection and chooses a traffic strategy.
+3. NetFusion selects an adapter using health, load, and session-affinity rules.
+4. The outbound socket is bound to the chosen adapter's local IPv4 address.
+5. Metrics, decisions, failures, and state are surfaced to the dashboard and runtime JSON files.
+
+### Decision signals
+
+- adapter availability
+- latency and jitter
+- degradation flags
+- active connection counts
+- session affinity TTL
+- retry behavior and recent failures
+- routing safety and interface state
 
 ## Quick Start
 
-### 1. Verify both adapters are usable
+### Step 1: Verify both adapters are healthy
 
-Make sure each adapter has:
+Each adapter should have:
 
-- an IPv4 address
+- a valid IPv4 address
 - a working gateway
 - actual internet reachability
 
-Useful checks:
+Use:
 
 ```powershell
 Get-NetAdapter | Where-Object Status -eq 'Up'
@@ -94,104 +175,116 @@ Get-NetIPAddress -AddressFamily IPv4
 Get-NetRoute -DestinationPrefix '0.0.0.0/0'
 ```
 
-### 2. Start NetFusion as Administrator
+### Step 2: Launch the engine as Administrator
 
 ```powershell
 .\NetFusion-START.bat
 ```
 
-### 3. Open the dashboard
+### Step 3: Open the local dashboard
 
 ```text
 http://localhost:9090
 ```
 
-### 4. Point supported apps to the local proxy
+### Step 4: Point supported apps to the proxy
 
-Use:
+Configure:
 
 - host: `127.0.0.1`
 - port: `8080`
 
-This matters most for apps that can open many parallel connections.
+## Command Center
 
-## Best-Case Use Cases
+| Action | Command | Purpose |
+| --- | --- | --- |
+| Start engine | `.\NetFusion-START.bat` | Launches the proxy, monitoring, and dashboard stack |
+| Stop engine | `.\NetFusion-STOP.bat` | Stops NetFusion and restores normal local state where possible |
+| Emergency cleanup | `.\NetFusion-SAFE.bat` | Resets proxy, route, and firewall leftovers after abnormal shutdowns |
+| Install helper | `powershell -ExecutionPolicy Bypass -File .\Install-Service.ps1` | Helps with service-style setup and startup integration |
+| Combined validation | `powershell -ExecutionPolicy Bypass -File .\test-combined-speed.ps1` | Verifies direct interface performance and proxy aggregation behavior |
 
-NetFusion shines when the application already behaves like a multi-stream client:
+## Runtime Components
 
-- segmented download managers such as IDM or `aria2`
-- torrent clients
-- multi-request API fetchers
-- mixed browsing and downloading where many concurrent TCP sessions exist
-
-It is a poor benchmark target for a single browser download over one long-lived connection.
-
-## Repository Map
-
-| Area | Purpose |
+| Component | Role |
 | --- | --- |
-| `NetFusion-START.bat`, `NetFusion-STOP.bat`, `NetFusion-SAFE.bat` | Start, stop, and emergency cleanup entry points |
-| `core/` | Engine, proxy, routing, health monitoring, learning, watchdog, cleanup |
-| `dashboard/` | Local telemetry UI and dashboard server |
-| `config/config.default.json` | Default runtime configuration shipped with the repo |
-| `test-*.ps1` and `fix-*.ps1` | Diagnostics, throughput validation, and recovery helpers |
+| `core/NetFusionEngine.ps1` | Main orchestrator for proxy, monitoring, safety, and coordination loops |
+| `core/SmartProxy.ps1` | Local HTTP/HTTPS proxy that binds outbound connections to selected adapter IPs |
+| `core/NetworkManager.ps1` | Discovers active adapters and writes interface inventory data |
+| `core/InterfaceMonitor.ps1` | Produces health scores using connectivity and performance signals |
+| `core/RouteController.ps1` | Applies route and metric adjustments where needed |
+| `core/QuicBlocker.ps1` | Helps browsers fall back to TCP by blocking UDP 443 on configured paths |
+| `core/LearningEngine.ps1` | Learns from previous behavior and feeds adaptive decisions |
+| `dashboard/DashboardServer.ps1` | Serves dashboard telemetry on `localhost:9090` |
 
 <details>
-<summary><strong>Expanded module overview</strong></summary>
+<summary><strong>Repository map</strong></summary>
 
-| File | Role |
+| Path | Purpose |
 | --- | --- |
-| `core/NetFusionEngine.ps1` | Main orchestrator that coordinates proxy, monitoring, and maintenance loops |
-| `core/SmartProxy.ps1` | Local HTTP/HTTPS proxy that binds outbound sockets to selected adapter IPs |
-| `core/NetworkManager.ps1` | Adapter discovery, capability inspection, and interface inventory generation |
-| `core/InterfaceMonitor.ps1` | Health scoring using latency, jitter, failures, and live activity signals |
-| `core/RouteController.ps1` | Interface metric management and optional split-route behavior |
-| `core/QuicBlocker.ps1` | Forces browser traffic toward TCP by blocking UDP 443 where configured |
-| `core/LearningEngine.ps1` | Learns from prior decisions and supports recommendation logic |
-| `dashboard/DashboardServer.ps1` | Serves dashboard data on `localhost:9090` |
+| `NetFusion-START.bat`, `NetFusion-STOP.bat`, `NetFusion-SAFE.bat` | Start, stop, and emergency cleanup entry points |
+| `core/` | Engine, proxy, routing, telemetry, learning, watchdog, and cleanup modules |
+| `dashboard/` | Dashboard UI and server logic |
+| `config/config.default.json` | Default configuration shipped with the repository |
+| `test-*.ps1` and `fix-*.ps1` | Throughput validation, adapter repair, and debugging helpers |
 
 </details>
 
-## Configuration Highlights
+## Configuration
 
-`config/config.default.json` ships the default behavior. Runtime-generated state such as `config/health.json`, `config/interfaces.json`, and `config/proxy-stats.json` is intentionally ignored by Git.
+[`config/config.default.json`](./config/config.default.json) defines the shipped defaults. Runtime-generated state such as `config/health.json`, `config/interfaces.json`, and `config/proxy-stats.json` is intentionally excluded from version control.
 
-| Key | Default | Why it matters |
+| Key | Default | Purpose |
 | --- | --- | --- |
-| `mode` | `maxspeed` | Sets the high-level strategy profile |
+| `mode` | `maxspeed` | Primary strategy profile |
 | `proxyPort` | `8080` | Local proxy listen port |
 | `dashboardPort` | `9090` | Dashboard server port |
-| `blockQUICOnSecondaryAdapters` | `true` | Helps browsers fall back to TCP paths the proxy can manage |
-| `routing.splitRoutesEnabled` | `false` | Route splitting is optional and secondary to proxy distribution |
-| `proxy.sessionAffinityTTL` | `300` | Keeps related requests sticky long enough for stability |
-| `telemetry.enabled` | `true` | Enables decision and health visibility |
+| `blockQUICOnSecondaryAdapters` | `true` | Pushes browser traffic toward TCP paths the proxy can observe |
+| `routing.splitRoutesEnabled` | `false` | Split routes are optional and secondary to proxy-based steering |
+| `proxy.maxRetries` | `3` | Connection establishment retry count |
+| `proxy.sessionAffinityTTL` | `300` | Keeps related traffic stable for a short window |
+| `telemetry.enabled` | `true` | Enables local decision and health visibility |
 
-## Validation Workflow
+## Traffic Profiles
 
-### Check actual adapter use
+NetFusion ships multiple operating profiles in `config/config.default.json`:
 
-Do not trust application-level speed numbers alone. Check whether multiple adapters are truly moving traffic:
+| Profile | Strategy | Description |
+| --- | --- | --- |
+| `maxspeed` | `max-bandwidth` | Pushes all healthy adapters toward maximum aggregate throughput |
+| `download` | `bandwidth-weighted` | Optimizes for download-heavy workloads with success-rate weighting |
+| `streaming` | `lowest-latency` | Prefers lower-latency paths for smoother streaming behavior |
+| `gaming` | `lowest-latency` | Aggressively prioritizes latency and jitter stability |
+| `balanced` | `round-robin` | Distributes traffic more evenly across healthy interfaces |
+
+The default profile is `maxspeed`.
+
+## Validation
+
+### Validate actual adapter usage
+
+Do not rely on application-level speed displays alone. Confirm that both adapters are moving traffic:
 
 ```powershell
 Get-NetAdapterStatistics -Name 'Wi-Fi 3'
 Get-NetAdapterStatistics -Name 'Wi-Fi 4'
 ```
 
-### Run the combined-speed validator
+### Run the combined-speed test
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\test-combined-speed.ps1
 ```
 
-Interpret the results carefully:
+### Interpret results correctly
 
-- strong direct adapter-bound tests plus weak proxy aggregation means the distribution path needs investigation
-- weak direct adapter-bound results on one interface means that link itself is the problem
-- strong multi-connection proxy results plus weak single browser downloads is expected for this architecture
+- If direct adapter-bound tests are weak on one interface, that link is the bottleneck.
+- If direct tests are strong but proxy aggregation is weak, the distribution path needs attention.
+- If the multi-connection proxy test is strong but one browser download is not, that matches the current architecture.
 
-### Compare runtime state files
+### Compare runtime telemetry
 
-Use generated telemetry for ground truth:
+Use these files as ground truth:
 
 - `config/interfaces.json`
 - `config/health.json`
@@ -215,9 +308,9 @@ Check that:
 </details>
 
 <details>
-<summary><strong>You expected summed bandwidth from one browser download</strong></summary>
+<summary><strong>You expected one browser download to equal both links combined</strong></summary>
 
-That expectation does not match the current design. Browsers often reuse a small number of HTTPS connections, and NetFusion distributes per connection, not per packet.
+That expectation does not match the current design. Modern browsers often reuse a small number of HTTPS connections, and NetFusion distributes per connection, not per packet.
 
 </details>
 
@@ -228,7 +321,7 @@ Check whether:
 
 - QUIC blocking is enabled where needed
 - the browser is actually using the configured proxy
-- the traffic pattern contains enough parallel TCP connections to distribute
+- the traffic pattern contains enough parallel TCP sessions to distribute
 
 </details>
 
@@ -260,11 +353,17 @@ Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 
 ## Author
 
-LoRdGrIm2035 (https://github.com/LoRdGrIm2035)
+<div align="center">
 
-## Contibuters
+[![GitHub](https://img.shields.io/badge/GitHub-LoRdGrIm2035-181717?style=for-the-badge&logo=github)](https://github.com/LoRdGrIm2035)
 
-Arman Khan
+</div>
+
+**[LoRdGrIm2035](https://github.com/LoRdGrIm2035)**
+
+## Contributor
+
+**Arman Khan**
 
 ## License
 
