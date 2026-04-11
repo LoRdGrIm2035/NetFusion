@@ -31,3 +31,4 @@ Desktop.ini
 *.orig
 config/dashboard-cert.pfx
 config/watchdog-heartbeat.json
+config/dashboard-cert-pass.txt

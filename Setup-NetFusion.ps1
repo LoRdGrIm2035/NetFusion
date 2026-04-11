@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$ResetConfig
 )
@@ -104,7 +104,7 @@ function Show-MetricGuidance {
 
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION v6.0 — FIRST-RUN SETUP                 " -ForegroundColor Cyan
+Write-Host "    NETFUSION v6.0 -- FIRST-RUN SETUP                 " -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 
 Write-Step "Checking prerequisites"

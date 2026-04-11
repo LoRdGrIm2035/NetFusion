@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    RouteAdapter v5.0 -- OS-level networking abstraction layer
+    RouteAdapter v6.0 -- OS-level networking abstraction layer
 .DESCRIPTION
     Abstracts all `route add/delete`, `Set-NetIPInterface`, and `Get-NetAdapter` calls.
     Provides robust logging and a dry-run mode for testing.
@@ -23,11 +23,20 @@ function Write-AdapterLog {
     
     try {
         if (-not (Test-Path $adapterEventsFile)) { return }
-        $data = Get-Content $adapterEventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-        $events = if ($data -and $data.events) { @($data.events) } else { @() }
-        $events = @(@{ timestamp = $ts; type = 'adapter'; message = "$prefix $Message"; level = $Level }) + $events
-        if ($events.Count -gt 200) { $events = $events[0..199] }
-        @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $adapterEventsFile -Force -ErrorAction SilentlyContinue
+        # v6.0 #17: Use mutex + atomic write pattern matching all other loggers
+        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+        try {
+            $mutex.WaitOne(3000) | Out-Null
+            $data = Get-Content $adapterEventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+            $events = if ($data -and $data.events) { @($data.events) } else { @() }
+            $events = @(@{ timestamp = $ts; type = 'adapter'; message = "$prefix $Message"; level = $Level }) + $events
+            if ($events.Count -gt 200) { $events = $events[0..199] }
+            $tmp = [IO.Path]::GetTempFileName()
+            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $adapterEventsFile -Force
+        } finally {
+            $mutex.ReleaseMutex()
+        }
     } catch {}
 }
 

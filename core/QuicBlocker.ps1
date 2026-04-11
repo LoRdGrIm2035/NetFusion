@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    QuicBlocker v5.0 -- UDP 443 Firewall Manager
+    QuicBlocker v6.0 -- UDP 443 Firewall Manager
 .DESCRIPTION
     Modern browsers attempt to use QUIC (UDP 443) for Google/YouTube/Cloudflare.
     NetFusion TCP proxies CANNOT route UDP. This script explicitly creates an
@@ -42,8 +42,8 @@ $ruleName = "NetFusion_Block_QUIC"
 try {
     $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
     
-    # If the config specifies blockQUICOnSecondaryAdapters, we block it globally to guarantee TCP fallback
-    $shouldBlock = if ($config -and $config.routing -and $config.routing.blockQUICOnSecondaryAdapters) { $true } else { $false }
+    # v6.0 #12: Fix — key is at root level, not nested under routing
+    $shouldBlock = if ($config -and $config.blockQUICOnSecondaryAdapters -eq $true) { $true } else { $false }
     
     $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
     

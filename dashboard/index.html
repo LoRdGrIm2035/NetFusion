@@ -186,6 +186,8 @@ canvas{display:block;width:100%!important;height:100%!important}
     <div id="pillMode" class="pill pill-info"><span class="dot"></span>Max Speed</div>
     <div class="ss-divider"></div>
     <div id="pillAdapters" class="pill pill-info"><span class="dot"></span>0 Adapters</div>
+    <div class="ss-divider"></div>
+    <div id="pillWatchdog" class="pill pill-ok"><span class="dot"></span>Watchdog</div>
     <span class="ss-spacer"></span>
     <span class="ss-uptime" id="ssUptime">Uptime: --</span>
   </div>
@@ -413,7 +415,7 @@ function updateProxy(proxy){
   // connection types
   const ct=proxy?.connectionTypes||{};
   const typesEl=document.getElementById('ppTypes');
-  const typeColors={bulk:'var(--accent)',interactive:'var(--text3)',streaming:'var(--accent2)',gaming:'var(--green)'};
+  const typeColors={bulk:'var(--accent)',interactive:'var(--text3)',streaming:'var(--accent2)',gaming:'var(--green)',voice:'#a855f7'};
   typesEl.innerHTML=Object.entries(ct).filter(([k,v])=>v>0).map(([k,v])=>`<div class="pp-type"><span class="pp-dot" style="background:${typeColors[k]||'var(--text3)'}"></span>${k}: ${v}</div>`).join('');
   // mini chart
   drawChart('connChart',[connHist],['#3b82f6']);
@@ -540,6 +542,20 @@ function processStats(stats){
       }
     }else{
       pillSys.className='pill pill-err';pillSys.innerHTML='<span class="dot"></span>No Data';
+    }
+
+    // Watchdog heartbeat
+    const wd=stats.watchdog;
+    const pillWD=document.getElementById('pillWatchdog');
+    if(wd&&wd.alive){
+      if(wd.stale){pillWD.className='pill pill-err';pillWD.innerHTML='<span class="dot"></span>Watchdog Stale';}
+      else{
+        const rc=wd.restartCount||0;
+        const lbl=rc>0?'Watchdog ('+rc+' restarts)':'Watchdog';
+        pillWD.className='pill pill-ok';pillWD.innerHTML='<span class="dot"></span>'+lbl;
+      }
+    }else{
+      pillWD.className='pill pill-err';pillWD.innerHTML='<span class="dot"></span>Watchdog Down';
     }
   }
 }

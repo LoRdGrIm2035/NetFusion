@@ -275,13 +275,16 @@ function Update-ProxyStats {
     foreach ($a in $s.adapters) {
         $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
     }
+    # Snapshot connectionTypes to prevent ConvertTo-Json crash from concurrent mutation
+    $connTypeSnap = @{}
+    foreach ($k in @($s.connectionTypes.Keys)) { $connTypeSnap[$k] = $s.connectionTypes[$k] }
     @{
         running = $true; port = $s.port; mode = $s.currentMode
         totalConnections = $s.totalConnections; totalFailures = $s.totalFails
         activeConnections = $s.activeConnections
         activePerAdapter = $activePerAdapterSnap
         adapterCount = $s.adapters.Count; adapters = $aStats
-        connectionTypes = $s.connectionTypes
+        connectionTypes = $connTypeSnap
         safeMode = $s.safeMode
         sessionMapSize = $s.sessionMap.Count
         currentMaxThreads = $s.currentMaxThreads
@@ -414,6 +417,7 @@ $HandlerScript = {
             $connType = 'bulk' 
         }
 
+        # Telemetry counters — approximate under high concurrency, not used for routing correctness
         if (-not $State.connectionTypes.ContainsKey($connType)) { $State.connectionTypes[$connType] = 0 }
         $State.connectionTypes[$connType]++
 
@@ -518,11 +522,27 @@ $HandlerScript = {
                 } else { $adapter = $avail[0] }
                 $selectionReason = "weighted-latency(streaming)"
                 $affinityMode = "new-sticky"
+            } elseif ($connType -eq 'voice') {
+                # Voice (SIP/RTP): identical to gaming — lowest latency, single adapter, sticky
+                $bestIdx = 0; $bestScore = -1
+                for ($i = 0; $i -lt $avail.Count; $i++) {
+                    $aHealth = $State.adapterHealth[$avail[$i].Name]
+                    $latScore = 0
+                    if ($aHealth) {
+                        $lat = if ($aHealth.LatencyEWMA -lt 998) { $aHealth.LatencyEWMA } else { 200 }
+                        $latScore = 1000 / [math]::Max(1, $lat)
+                        if ($avail[$i].Type -eq 'Ethernet') { $latScore *= 2 }
+                        if ($aHealth.IsDegrading) { $latScore *= 0.3 }
+                    }
+                    if ($latScore -gt $bestScore) { $bestScore = $latScore; $bestIdx = $i }
+                }
+                $adapter = $avail[$bestIdx]
+                $selectionReason = "lowest-latency(voice)"
+                $affinityMode = "new-sticky"
             } elseif ($connType -eq 'interactive') {
-                # Strict round-robin per NEW HOST
-                $idx = $State.rrIndex % $avail.Count
+                # Strict round-robin per NEW HOST — atomic increment for thread safety
+                $idx = ([System.Threading.Interlocked]::Increment([ref]$State.rrIndex) - 1) % $avail.Count
                 $adapter = $avail[$idx]
-                $State.rrIndex++
                 $selectionReason = "round-robin(new-host)"
                 $affinityMode = "new-sticky"
             } else {
@@ -852,7 +872,7 @@ try {
             $connParts = @()
             foreach ($a in $s.adapters) { $connParts += "$($a.Name):$($s.connectionCounts[$a.Name])" }
             $typeStr = @()
-            foreach ($k in @('bulk','interactive','streaming','gaming')) {
+            foreach ($k in @('bulk','interactive','streaming','gaming','voice')) {
                 if ($s.connectionTypes.ContainsKey($k)) { $typeStr += "$k=$($s.connectionTypes[$k])" }
             }
             $safeFlag = if ($s.safeMode) { ' [SAFE]' } else { '' }

@@ -260,13 +260,35 @@ Write-Host ""
 $dashConfig = $null
 $dashTLS = $false
 $tlsCert = $null
+$dashAllowLAN = $false
+$dashToken = $null
 $cfgPath = Join-Path $configDir "config.json"
 if (Test-Path $cfgPath) {
     try { $dashConfig = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch {}
 }
+
+# v6.0 #7: LAN access with token auth
+if ($dashConfig -and $dashConfig.dashboardAllowLAN -eq $true) {
+    $dashAllowLAN = $true
+    $tokenFile = Join-Path $configDir "dashboard-token.txt"
+    if (Test-Path $tokenFile) {
+        $dashToken = (Get-Content $tokenFile -Raw).Trim()
+        Write-Host "  [Auth] LAN access ENABLED -- token required (X-NetFusion-Token header)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [Auth] WARNING: LAN access enabled but no token file found! Generate one with Setup-NetFusion.ps1" -ForegroundColor Red
+    }
+}
+
 if ($dashConfig -and $dashConfig.dashboardTLS -eq $true) {
     $certPath = Join-Path $configDir "dashboard-cert.pfx"
-    $certPass = "NetFusionDash"
+    # v6.0 #8: Random cert password stored in file, not hardcoded in source
+    $certPassFile = Join-Path $configDir "dashboard-cert-pass.txt"
+    if (-not (Test-Path $certPassFile)) {
+        $certPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+        $certPass | Set-Content $certPassFile -Force
+    } else {
+        $certPass = (Get-Content $certPassFile -Raw).Trim()
+    }
     
     if (-not (Test-Path $certPath)) {
         Write-Host "  [TLS] Generating self-signed certificate..." -ForegroundColor Yellow
@@ -304,15 +326,19 @@ if ($dashConfig -and $dashConfig.dashboardTLS -eq $true) {
 
 $listener = $null
 try {
-    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
+    # v6.0 #7: Bind to Any for LAN access, Loopback for local-only
+    $bindAddr = if ($dashAllowLAN) { [System.Net.IPAddress]::Any } else { [System.Net.IPAddress]::Loopback }
+    $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Port)
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
     $listener.Start()
 
     $proto = if ($dashTLS) { "https" } else { "http" }
-    Write-Host "  Dashboard: ${proto}://127.0.0.1:${Port}" -ForegroundColor Green
+    $bindLabel = if ($dashAllowLAN) { "0.0.0.0" } else { "127.0.0.1" }
+    Write-Host "  Dashboard: ${proto}://${bindLabel}:${Port}" -ForegroundColor Green
     if ($dashTLS) { Write-Host "  TLS: ENABLED (self-signed)" -ForegroundColor Green }
     else          { Write-Host "  TLS: disabled (set dashboardTLS=true in config to enable)" -ForegroundColor DarkGray }
-    Write-Host "  Access: local automatic (loopback only)" -ForegroundColor Green
+    if ($dashAllowLAN) { Write-Host "  Access: LAN (token-protected)" -ForegroundColor Yellow }
+    else               { Write-Host "  Access: loopback only" -ForegroundColor Green }
     Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
@@ -370,6 +396,19 @@ try {
 
             # Pre-parse query parameters
             $parsedPath = $path.Split('?')[0]
+
+            # v6.0 #7: Token auth for LAN access -- enforce on API endpoints
+            if ($dashAllowLAN -and $dashToken -and $parsedPath -match '^/api/') {
+                $tokenHeader = $null
+                foreach ($hline in ($requestText -split "`r`n")) {
+                    if ($hline -match '^X-NetFusion-Token:\s*(.+)$') { $tokenHeader = $Matches[1].Trim(); break }
+                }
+                if ($tokenHeader -ne $dashToken) {
+                    $errBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized","message":"Valid X-NetFusion-Token header required"}')
+                    Send-TcpResponse -Stream $stream -StatusCode 401 -StatusText 'Unauthorized' -ContentType 'application/json' -Body $errBody
+                    continue
+                }
+            }
 
             switch -Wildcard ($parsedPath) {
                 '/api/stats' {

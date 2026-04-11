@@ -138,32 +138,46 @@ function Repair-AdapterDHCP {
                         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @("8.8.8.8","1.1.1.1") -ErrorAction SilentlyContinue
                         
                         Write-Host "  [REPAIR] Applied static IP $subnet.$lastOctet to $($adapter.Name)" -ForegroundColor Green
+                        $adapterIdx++  # Only increment for adapters that actually got repaired
                     } catch {
                         Write-Host "  [REPAIR] Failed: $_" -ForegroundColor Red
                     }
                 }
             }
         }
-        $adapterIdx++
     }
 }
 
-# v6.1: ECMP Enforcement - keep both adapters' metrics equal
+# v6.1: ECMP Enforcement - keep all managed adapters' metrics equal
 function Enforce-ECMP {
     $targetMetric = 15
-    $wifiAdapters = Get-NetAdapter | Where-Object { 
-        $_.Status -eq 'Up' -and
-        $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
-        ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN' -or $_.Name -match 'Wi-Fi|Wireless')
+    # v6.0 #10: Read from interfaces.json so we use the same adapter set as NetworkManager,
+    # catching USB-WiFi adapters with generic names like "Realtek USB GbE" that regex misses.
+    $ifFile = Join-Path $projectDir "config\interfaces.json"
+    $managedAdapters = @()
+    if (Test-Path $ifFile) {
+        try {
+            $ifData = Get-Content $ifFile -Raw | ConvertFrom-Json
+            $managedAdapters = @($ifData.interfaces | Where-Object { $_.Status -eq 'Up' -and $_.Type -match 'WiFi|USB-WiFi' })
+        } catch {}
+    }
+    # Fallback to direct query if interfaces.json is missing or empty
+    if ($managedAdapters.Count -lt 2) {
+        $managedAdapters = @(Get-NetAdapter | Where-Object { 
+            $_.Status -eq 'Up' -and
+            $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' -and
+            ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN|WiFi' -or $_.Name -match 'Wi-Fi|WLAN|Wireless')
+        })
     }
     
-    if ($wifiAdapters.Count -ge 2) {
-        foreach ($wa in $wifiAdapters) {
-            $currentMetric = (Get-NetIPInterface -InterfaceIndex $wa.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric
+    if ($managedAdapters.Count -ge 2) {
+        foreach ($wa in $managedAdapters) {
+            $ifIdx = if ($wa.ifIndex) { $wa.ifIndex } elseif ($wa.InterfaceIndex) { $wa.InterfaceIndex } else { continue }
+            $currentMetric = (Get-NetIPInterface -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric
             if ($currentMetric -ne $targetMetric) {
                 try {
-                    Set-NetIPInterface -InterfaceIndex $wa.ifIndex -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
-                    Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
+                    Set-NetIPInterface -InterfaceIndex $ifIdx -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
+                    Set-NetRoute -InterfaceIndex $ifIdx -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
                 } catch {}
             }
         }
@@ -173,6 +187,9 @@ function Enforce-ECMP {
 while ($true) {
     try {
         # Check if proxy process crashed — respawn it in-place instead of exiting
+        # NOTE #6: $proxyRestarts resets when the Watchdog restarts the entire engine (new process).
+        # This means SmartProxy can crash 3 times per Watchdog restart cycle indefinitely.
+        # This is acceptable: each Watchdog restart is itself logged and rate-limited by the 20s grace period.
         if ($proxyProc.HasExited) {
             $proxyRestarts = if ($proxyRestarts) { $proxyRestarts + 1 } else { 1 }
             Write-Host "  [Engine] SmartProxy crashed (Exit: $($proxyProc.ExitCode)). Respawn attempt $proxyRestarts/3..." -ForegroundColor Yellow
@@ -254,7 +271,10 @@ while ($true) {
             }
             $curSafety.uptime = $uptimeMin
             $curSafety.lastEvent = 'Engine running normally'
-            $curSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+            # v6.0 #5: Atomic write to prevent race with DashboardServer SSE reads
+            $tmp = [IO.Path]::GetTempFileName()
+            $curSafety | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $safetyFile -Force
         } catch {}
         
     } catch {
