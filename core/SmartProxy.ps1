@@ -65,6 +65,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     maxDecisions     = 100
     bandwidthEstimates = @{}
     activeConns      = @{}
+    weightRefreshInterval = 2.0
     bufferSizes      = @{
         'bulk'        = 524288   # 512KB for downloads (maximum throughput pipes)
         'interactive' = 32768    # 32KB for browsing
@@ -147,6 +148,21 @@ function Update-AdaptersAndWeights {
         try {
             $hData = Get-Content $s.healthFile -Raw | ConvertFrom-Json
             $hData.adapters | ForEach-Object {
+                $currentDown = if ($_.DownloadMbps) { [double]$_.DownloadMbps } else { 0.0 }
+                $prevEstimate = if ($s.bandwidthEstimates.ContainsKey($_.Name)) { [double]$s.bandwidthEstimates[$_.Name] } else { 0.0 }
+                if ($currentDown -gt 1.0) {
+                    $estimate = if ($prevEstimate -gt 0) {
+                        [math]::Round(($prevEstimate * 0.65) + ($currentDown * 0.35), 2)
+                    } else {
+                        [math]::Round($currentDown, 2)
+                    }
+                } elseif ($prevEstimate -gt 0) {
+                    $estimate = [math]::Round($prevEstimate * 0.9, 2)
+                } else {
+                    $estimate = 0.0
+                }
+                $s.bandwidthEstimates[$_.Name] = $estimate
+
                 $health[$_.Name] = @{
                     Score       = $_.HealthScore
                     Latency     = $_.InternetLatency
@@ -156,6 +172,9 @@ function Update-AdaptersAndWeights {
                     Stability   = if ($_.StabilityScore) { $_.StabilityScore } else { 80 }
                     Trend       = if ($_.HealthTrend) { $_.HealthTrend } else { 0 }
                     IsDegrading = if ($_.IsDegrading) { $_.IsDegrading } else { $false }
+                    DownloadMbps = if ($_.DownloadMbps) { $_.DownloadMbps } else { 0 }
+                    EstimatedDownMbps = $estimate
+                    LinkSpeedMbps = if ($_.LinkSpeedMbps) { $_.LinkSpeedMbps } else { 0 }
                 }
             }
             $s.adapterHealth = $health
@@ -167,7 +186,14 @@ function Update-AdaptersAndWeights {
         } catch {}
     }
     if (Test-Path $s.configFile) {
-        try { $s.currentMode = (Get-Content $s.configFile -Raw | ConvertFrom-Json).mode } catch {}
+        try {
+            $cfg = Get-Content $s.configFile -Raw | ConvertFrom-Json
+            if ($cfg.mode) { $s.currentMode = $cfg.mode }
+            $refresh = $cfg.intelligence.weightRefreshInterval
+            if ($null -ne $refresh -and [double]$refresh -gt 0) {
+                $s.weightRefreshInterval = [double]$refresh
+            }
+        } catch {}
     }
 
     $weights = @()
@@ -340,6 +366,20 @@ $HandlerScript = {
         }
 
         # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v5.1
+        $isBulkHint = $false
+        if ($method -ne 'CONNECT') {
+            $targetPath = if ($uri) { ($uri.AbsolutePath + $uri.Query) } else { '' }
+            if (
+                $text -match '(?im)^Range:\s*bytes=' -or
+                $targetPath -match '(?i)(^|/)(__down|download|downloads?|payload|bigfile|speedtest)' -or
+                $targetPath -match '(?i)\.(zip|iso|msi|exe|bin|7z|rar|tar|gz|pkg)(\?|$)' -or
+                $targetHost -match '(?i)(^|\.)speed\.cloudflare\.com$|speedtest|download'
+            ) {
+                $isBulkHint = $true
+            }
+        } elseif ($targetHost -match '(?i)(^|\.)speed\.cloudflare\.com$|speedtest') {
+            $isBulkHint = $true
+        }
 
         # v5.1: Track host concurrency for dynamic download manager detection
         $hostKey = $targetHost
@@ -356,6 +396,8 @@ $HandlerScript = {
             $connType = 'gaming' 
         } elseif ($rPort -in $voicePorts) { 
             $connType = 'voice' 
+        } elseif ($isBulkHint) {
+            $connType = 'bulk'
         } elseif ($rPort -in $bulkPorts) { 
             $connType = 'bulk' 
         } elseif ($rPort -eq 443 -or $rPort -eq 80) { 
@@ -469,19 +511,64 @@ $HandlerScript = {
                 $selectionReason = "round-robin(new-host)"
                 $affinityMode = "new-sticky"
             } else {
-                # Bulk Traffic: Active-load-aware round-robin
-                # v6.1: Uses actual health score to weight distribution, NOT theoretical link speed.
-                # Link speed (866 vs 130 Mbps) reflects radio capability, not ISP throughput.
-                # When adapters share the same gateway, their real internet speed is similar,
-                # so we balance by active connection count weighted by health score.
+                # Bulk Traffic: capacity-aware least-busy scheduling.
+                # Health-only balancing can overload the slower adapter and reduce
+                # total throughput, so bias by link capability as well.
                 $bestBulkIdx = 0
                 $bestBulkScore = [double]::MaxValue
                 for ($bi = 0; $bi -lt $avail.Count; $bi++) {
                     $aName  = $avail[$bi].Name
                     $active = if ($State.activePerAdapter.ContainsKey($aName)) { [int]($State.activePerAdapter[$aName]) } else { 0 }
-                    # Use health score as capacity proxy (0-100). Higher health = more capacity.
                     $aHealth = $State.adapterHealth[$aName]
-                    $capacity = if ($aHealth -and $aHealth.Score -gt 0) { [double]$aHealth.Score } else { 50.0 }
+                    $linkMbps = 100.0
+                    if ($null -ne $avail[$bi].Speed -and [double]$avail[$bi].Speed -gt 0) {
+                        $linkMbps = [double]$avail[$bi].Speed
+                    }
+                    if ($aHealth -and $null -ne $aHealth.LinkSpeedMbps -and [double]$aHealth.LinkSpeedMbps -gt 0) {
+                        $linkMbps = [double]$aHealth.LinkSpeedMbps
+                    }
+
+                    $observedMbps = 0.0
+                    if ($aHealth -and $null -ne $aHealth.EstimatedDownMbps -and [double]$aHealth.EstimatedDownMbps -gt 1.0) {
+                        $observedMbps = [double]$aHealth.EstimatedDownMbps
+                    } elseif ($aHealth -and $null -ne $aHealth.DownloadMbps -and [double]$aHealth.DownloadMbps -gt 1.0) {
+                        $observedMbps = [double]$aHealth.DownloadMbps
+                    }
+
+                    if ($observedMbps -gt 0) {
+                        $speedFactor = [math]::Max(1.0, [math]::Min(12.0, $observedMbps / 5.0))
+                    } else {
+                        $speedFactor = [math]::Max(1.0, [math]::Min(6.0, [math]::Sqrt([math]::Max(50.0, $linkMbps) / 50.0)))
+                    }
+
+                    $healthFactor = 0.6
+                    $successFactor = 1.0
+                    $stabilityFactor = 0.8
+                    $latencyPenalty = 1.0
+                    if ($aHealth) {
+                        if ($null -ne $aHealth.Score -and [double]$aHealth.Score -gt 0) {
+                            $healthFactor = [math]::Max(0.35, [double]$aHealth.Score / 100.0)
+                        }
+                        if ($null -ne $aHealth.SuccessRate -and [double]$aHealth.SuccessRate -gt 0) {
+                            $successFactor = [math]::Max(0.4, [double]$aHealth.SuccessRate / 100.0)
+                        }
+                        if ($null -ne $aHealth.Stability -and [double]$aHealth.Stability -gt 0) {
+                            $stabilityFactor = [math]::Max(0.5, [double]$aHealth.Stability / 100.0)
+                        }
+
+                        $lat = if ($null -ne $aHealth.LatencyEWMA) { [double]$aHealth.LatencyEWMA } else { 999.0 }
+                        if ($lat -gt 150) {
+                            $latencyPenalty = 0.55
+                        } elseif ($lat -gt 80) {
+                            $latencyPenalty = 0.75
+                        } elseif ($lat -gt 40) {
+                            $latencyPenalty = 0.9
+                        }
+
+                        if ($aHealth.IsDegrading) { $latencyPenalty *= 0.5 }
+                    }
+
+                    $capacity = [math]::Max(0.25, ($speedFactor * $healthFactor * $successFactor * $stabilityFactor * $latencyPenalty))
                     # Score = active connections / capacity. Lower = better candidate.
                     $score = [double]$active / [math]::Max(1.0, $capacity)
                     if ($score -lt $bestBulkScore) { $bestBulkScore = $score; $bestBulkIdx = $bi }
@@ -708,7 +795,8 @@ try {
         $now = Get-Date
 
         # Refresh adapter data and weights every 5 seconds
-        if (($now - $lastRefresh).TotalSeconds -gt 5) {
+        $refreshInterval = if ($global:ProxyState.weightRefreshInterval -gt 0) { [double]$global:ProxyState.weightRefreshInterval } else { 2.0 }
+        if (($now - $lastRefresh).TotalSeconds -gt $refreshInterval) {
             Update-AdaptersAndWeights
             Update-ProxyStats
             $lastRefresh = $now

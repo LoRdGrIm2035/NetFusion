@@ -6,6 +6,16 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "  NetFusion Combined Speed Verifier v6.1     " -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 
+function Get-DashboardStats {
+    $tokenFile = Join-Path $PSScriptRoot "config\dashboard-token.txt"
+    if (-not (Test-Path $tokenFile)) {
+        throw "Dashboard token file not found: $tokenFile"
+    }
+
+    $token = (Get-Content $tokenFile -Raw -ErrorAction Stop).Trim()
+    return Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/stats" -Headers @{ "X-NetFusion-Token" = $token } -Method Get
+}
+
 # Step 1: Verify adapter status
 Write-Host "`n--- STEP 1: Adapter Check ---" -ForegroundColor Yellow
 $wifi3 = Get-NetAdapter -Name "Wi-Fi 3" -ErrorAction SilentlyContinue
@@ -73,6 +83,7 @@ if ($routes.Count -lt 2) {
 Write-Host "`n--- STEP 3: Adapter-Bound Direct Download Test ---" -ForegroundColor Yellow
 Write-Host "  Using curl.exe --interface <local-ip> so each request is pinned to the selected adapter." -ForegroundColor DarkYellow
 $testURL = "http://speed.cloudflare.com/__down?bytes=10000000"  # 10MB
+$directResults = @{}
 
 foreach ($adapterInfo in @(@{Name="Wi-Fi 3";IP=$wifi3IP}, @{Name="Wi-Fi 4";IP=$wifi4IP})) {
     $name = $adapterInfo.Name
@@ -82,8 +93,10 @@ foreach ($adapterInfo in @(@{Name="Wi-Fi 3";IP=$wifi3IP}, @{Name="Wi-Fi 4";IP=$w
     try {
         $result = Invoke-BoundCurlDownload -LocalIP $ip -Url $testURL
         $mbps = if ($result.Seconds -gt 0) { [math]::Round(($result.Bytes * 8 / 1MB) / $result.Seconds, 2) } else { 0 }
+        $directResults[$name] = $mbps
         Write-Host " $mbps Mbps ($([math]::Round($result.Bytes/1MB, 1)) MB in $([math]::Round($result.Seconds, 2))s, source $($result.LocalIP))" -ForegroundColor Green
     } catch {
+        $directResults[$name] = 0
         Write-Host " FAILED: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
@@ -101,17 +114,24 @@ $proxyAddr = "http://127.0.0.1:8080"
 $connCount = 16
 
 $jobs = 1..$connCount | ForEach-Object {
+    $seed = [guid]::NewGuid().ToString('N')
+    $jobUrl = "$testURL&r=$seed"
     Start-Job -ScriptBlock {
         param($url, $proxy)
         try {
-            $wc = New-Object System.Net.WebClient
-            $wc.Proxy = New-Object System.Net.WebProxy($proxy)
-            $data = $wc.DownloadData($url)
-            return $data.Length
+            $curlCmd = Get-Command curl.exe -ErrorAction Stop
+            $format = "SIZE=%{size_download};TIME=%{time_total};CODE=%{http_code}"
+            $output = & $curlCmd.Source -x $proxy -L -o NUL -sS -w $format $url 2>&1
+            $text = ($output | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { return 0 }
+            if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0 }
+            $code = [int]$Matches[3]
+            if ($code -lt 200 -or $code -ge 400) { return 0 }
+            return [int64]$Matches[1]
         } catch {
             return 0
         }
-    } -ArgumentList $testURL, $proxyAddr
+    } -ArgumentList $jobUrl, $proxyAddr
 }
 
 Write-Host "  Downloading..." -NoNewline
@@ -133,6 +153,8 @@ $delta3 = $after3 - $before3
 $delta4 = $after4 - $before4
 $totalDelta = $delta3 + $delta4
 $combinedMbps = [math]::Round(($totalBytes * 8 / 1MB) / $swTotal.Elapsed.TotalSeconds, 2)
+$bestDirectMbps = if ($directResults.Count -gt 0) { [double](($directResults.Values | Measure-Object -Maximum).Maximum) } else { 0 }
+$gainVsBest = [math]::Round(($combinedMbps - $bestDirectMbps), 2)
 
 Write-Host " Done!" -ForegroundColor Green
 
@@ -143,7 +165,9 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "  Duration:          $([math]::Round($swTotal.Elapsed.TotalSeconds, 2)) seconds"
 Write-Host "  Connections:       $connCount parallel"
 Write-Host "  Total Downloaded:  $([math]::Round($totalBytes / 1MB, 2)) MB"
+Write-Host "  Best Single-Link:  $bestDirectMbps Mbps" -ForegroundColor DarkCyan
 Write-Host "  Combined Speed:    $combinedMbps Mbps" -ForegroundColor Cyan
+Write-Host "  Gain vs Best Link: $gainVsBest Mbps" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  --- Per-Adapter Traffic (OS Byte Counters) ---" -ForegroundColor Yellow
 $pct3 = if ($totalDelta -gt 0) { [math]::Round(($delta3 / $totalDelta) * 100) } else { 0 }
@@ -151,24 +175,33 @@ $pct4 = if ($totalDelta -gt 0) { [math]::Round(($delta4 / $totalDelta) * 100) } 
 
 $bar3 = '#' * [math]::Max(1, [int]($pct3 / 2))
 $bar4 = '#' * [math]::Max(1, [int]($pct4 / 2))
+$minPct = [math]::Min($pct3, $pct4)
 
 Write-Host "  Wi-Fi 3:  $([math]::Round($delta3 / 1MB, 2)) MB  ($pct3%)  [$bar3]" -ForegroundColor $(if($pct3 -gt 10){'Green'}else{'Red'})
 Write-Host "  Wi-Fi 4:  $([math]::Round($delta4 / 1MB, 2)) MB  ($pct4%)  [$bar4]" -ForegroundColor $(if($pct4 -gt 10){'Green'}else{'Red'})
 
 Write-Host ""
-if ($pct4 -lt 5) {
-    Write-Host "  [PROBLEM] Wi-Fi 4 carried less than 5% of traffic!" -ForegroundColor Red
-    Write-Host "  Possible causes: proxy not binding to Wi-Fi 4, or no default route" -ForegroundColor Red
-} elseif ($pct4 -lt 25) {
-    Write-Host "  [OK] Wi-Fi 4 is carrying traffic, but less than Wi-Fi 3 (expected with different link speeds)" -ForegroundColor Yellow
+if ($minPct -lt 5) {
+    Write-Host "  [PROBLEM] One adapter carried less than 5% of traffic." -ForegroundColor Red
+    Write-Host "  Possible causes: proxy not binding correctly, weak route state, or the workload never reached true bulk concurrency." -ForegroundColor Red
+} elseif ($minPct -lt 25) {
+    Write-Host "  [OK] Both adapters are active, but one link is clearly dominant." -ForegroundColor Yellow
 } else {
     Write-Host "  [EXCELLENT] Both adapters are actively carrying traffic!" -ForegroundColor Green
+}
+
+if ($bestDirectMbps -gt 0) {
+    if ($combinedMbps -le ($bestDirectMbps * 1.05)) {
+        Write-Host "  [WARN] Combined proxy speed is not materially above the best single adapter." -ForegroundColor Yellow
+    } else {
+        Write-Host "  [GOOD] Combined proxy speed is above the best single adapter." -ForegroundColor Green
+    }
 }
 
 # Step 6: Proxy stats
 Write-Host "`n--- Proxy Internal Stats ---" -ForegroundColor Yellow
 try {
-    $stats = curl.exe -s "http://127.0.0.1:9090/api/stats?token=AIqSCTmEekH5Dv" | ConvertFrom-Json
+    $stats = Get-DashboardStats
     if ($stats -and $stats.proxy) {
         foreach ($a in $stats.proxy.adapters) {
             Write-Host "  $($a.name): $($a.connections) connections, $($a.successes) successes, $($a.failures) failures"

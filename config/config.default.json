@@ -61,7 +61,7 @@
                          "degradationThreshold":  -2.0,
                          "connectionTypeDetection":  true,
                          "adaptiveBuffers":  true,
-                         "weightRefreshInterval":  5
+                         "weightRefreshInterval":  2
                      },
     "learning":  {
                      "enabled":  true,

@@ -161,12 +161,12 @@ $capPerAdapter = if ($config.proxy.maxConcurrentPerAdapter) { $config.proxy.maxC
 Write-Host ("  Max conns/adapt: {0}" -f $capPerAdapter) -ForegroundColor White
 Write-Host "  Main behavior file: config\\config.json" -ForegroundColor Gray
 
-# v6.0 #14: Generate dashboard token if not present
+# v6.2: Generate dashboard token if missing or still using a weak legacy value
 $tokenFile = Join-Path $configDir "dashboard-token.txt"
-if (-not (Test-Path $tokenFile)) {
-    $newToken = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+if (-not (Test-Path $tokenFile) -or ((Get-Content $tokenFile -Raw -ErrorAction SilentlyContinue).Trim()).Length -lt 24) {
+    $newToken = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
     Set-Content $tokenFile -Value $newToken -NoNewline -Force
-    Write-Ok "Dashboard token generated."
+    Write-Ok "Dashboard token generated or rotated."
 } else {
     Write-Ok "Dashboard token exists."
 }

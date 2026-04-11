@@ -26,97 +26,245 @@ $dashDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInv
 $projectDir = Split-Path $dashDir -Parent
 $configDir = Join-Path $projectDir "config"
 $logsDir = Join-Path $projectDir "logs"
+$tokenPath = Join-Path $configDir "dashboard-token.txt"
+$validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
 
-function Get-UnifiedStats {
-    $result = @{ timestamp = (Get-Date).ToString('o'); version = '5.0' }
-    $files = @{
-        interfaces = "interfaces.json"
-        health     = "health.json"
-        proxy      = "proxy-stats.json"
-        config     = "config.json"
-        safety     = "safety-state.json"
+function New-RandomSecret {
+    param([int]$Length = 32)
+    return (-join ((65..90) + (97..122) + (48..57) | Get-Random -Count $Length | ForEach-Object { [char]$_ }))
+}
+
+function Read-JsonFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    try { return (Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+function Normalize-DisplayText {
+    param([AllowNull()][object]$Value, [int]$MaxLength = 160)
+    if ($null -eq $Value) { return '' }
+    $text = [regex]::Replace([string]$Value, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
+    if ($text.Length -gt $MaxLength) { $text = $text.Substring(0, $MaxLength) }
+    return $text
+}
+
+function Get-ValidMode {
+    param([AllowNull()][object]$Mode)
+    if ($null -eq $Mode) { return $null }
+    $candidate = ([string]$Mode).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $null }
+    if ($candidate -in $validModes) { return $candidate }
+    return $null
+}
+
+function Ensure-DashboardToken {
+    $existing = ''
+    if (Test-Path $tokenPath) {
+        try { $existing = (Get-Content $tokenPath -Raw -ErrorAction Stop).Trim() } catch {}
     }
-    foreach ($key in $files.Keys) {
-        $path = Join-Path $configDir $files[$key]
-        if (Test-Path $path) {
-            try { $result[$key] = Get-Content $path -Raw | ConvertFrom-Json } catch {}
+    if ([string]::IsNullOrWhiteSpace($existing) -or $existing.Length -lt 24) {
+        $existing = New-RandomSecret -Length 32
+        Set-Content $tokenPath -Value $existing -NoNewline -Force -Encoding UTF8
+    }
+    return $existing
+}
+
+function Parse-Headers {
+    param([string]$RequestText)
+    $headers = @{}
+    foreach ($line in (($RequestText -split "`r`n") | Select-Object -Skip 1)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { break }
+        $idx = $line.IndexOf(':')
+        if ($idx -le 0) { continue }
+        $headers[$line.Substring(0, $idx).Trim().ToLowerInvariant()] = $line.Substring($idx + 1).Trim()
+    }
+    return $headers
+}
+
+function Get-RequestBody {
+    param([string]$RequestText)
+    $bodyStart = $RequestText.IndexOf("`r`n`r`n")
+    if ($bodyStart -lt 0) { return '' }
+    return $RequestText.Substring($bodyStart + 4)
+}
+
+function Test-AllowedOrigin {
+    param([string]$OriginHeader)
+    if ([string]::IsNullOrWhiteSpace($OriginHeader)) { return $true }
+    try { return (([System.Uri]$OriginHeader).Host -in @('127.0.0.1', 'localhost', '::1')) } catch { return $false }
+}
+
+function Test-IsLocalReferer {
+    param([string]$RefererHeader)
+    if ([string]::IsNullOrWhiteSpace($RefererHeader)) { return $false }
+    try { return (([System.Uri]$RefererHeader).Host -in @('127.0.0.1', 'localhost', '::1')) } catch { return $false }
+}
+
+function Test-IsMutationAuthorized {
+    param([hashtable]$Headers)
+    $headerToken = Normalize-DisplayText $Headers['x-netfusion-token'] 128
+    if ($headerToken -and $headerToken -eq $global:DashToken) { return $true }
+    if ($Headers['origin']) { return (Test-AllowedOrigin $Headers['origin']) }
+    return (Test-IsLocalReferer $Headers['referer'])
+}
+
+function Get-ClientInterfaces {
+    $data = Read-JsonFile (Join-Path $configDir "interfaces.json")
+    $interfaces = @()
+    if ($data -and $data.interfaces) {
+        foreach ($iface in @($data.interfaces)) {
+            $interfaces += @{
+                Name = Normalize-DisplayText $iface.Name 64
+                WiFiGeneration = if ($null -ne $iface.WiFiGeneration) { [double]$iface.WiFiGeneration } else { 0 }
+                WiFiGenerationLabel = Normalize-DisplayText $iface.WiFiGenerationLabel 48
+                SSID = Normalize-DisplayText $iface.SSID 64
+                LinkSpeedMbps = if ($null -ne $iface.LinkSpeedMbps) { [double]$iface.LinkSpeedMbps } else { 0 }
+            }
         }
     }
-    return ($result | ConvertTo-Json -Depth 6 -Compress)
+    return @{ timestamp = (Get-Date).ToString('o'); version = '6.2'; count = $interfaces.Count; interfaces = $interfaces }
+}
+
+function Get-ClientHealth {
+    $data = Read-JsonFile (Join-Path $configDir "health.json")
+    $adapters = @()
+    $degradation = @{}
+    if ($data -and $data.adapters) {
+        foreach ($a in @($data.adapters)) {
+            $adapters += @{
+                Name = Normalize-DisplayText $a.Name 64
+                Type = Normalize-DisplayText $a.Type 24
+                HealthScore = if ($null -ne $a.HealthScore) { [double]$a.HealthScore } else { 0 }
+                InternetLatency = if ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
+                InternetLatencyEWMA = if ($null -ne $a.InternetLatencyEWMA) { [double]$a.InternetLatencyEWMA } elseif ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
+                Jitter = if ($null -ne $a.Jitter) { [double]$a.Jitter } else { 0 }
+                DownloadMbps = if ($null -ne $a.DownloadMbps) { [double]$a.DownloadMbps } else { 0 }
+                UploadMbps = if ($null -ne $a.UploadMbps) { [double]$a.UploadMbps } else { 0 }
+                SuccessRate = if ($null -ne $a.SuccessRate) { [double]$a.SuccessRate } else { 100 }
+                StabilityScore = if ($null -ne $a.StabilityScore) { [double]$a.StabilityScore } else { 80 }
+                HealthTrend = if ($null -ne $a.HealthTrend) { [double]$a.HealthTrend } else { 0 }
+                IsDegrading = [bool]$a.IsDegrading
+            }
+        }
+    }
+    if ($data -and $data.degradation) {
+        foreach ($prop in $data.degradation.PSObject.Properties) {
+            $degradation[(Normalize-DisplayText $prop.Name 64)] = @{
+                health = if ($null -ne $prop.Value.health) { [double]$prop.Value.health } else { 0 }
+                warned = [bool]$prop.Value.warned
+                trend = if ($null -ne $prop.Value.trend) { [double]$prop.Value.trend } else { 0 }
+                since = if ($prop.Value.since) { Normalize-DisplayText $prop.Value.since 48 } else { $null }
+            }
+        }
+    }
+    return @{ timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; version = '6.2'; uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }; adapters = $adapters; degradation = $degradation }
+}
+
+function Get-ClientProxy {
+    $data = Read-JsonFile (Join-Path $configDir "proxy-stats.json")
+    $adapters = @()
+    $activePerAdapter = @{}
+    $connectionTypes = @{}
+    if ($data -and $data.adapters) {
+        foreach ($a in @($data.adapters)) {
+            $adapters += @{
+                name = Normalize-DisplayText $a.name 64
+                type = Normalize-DisplayText $a.type 24
+                connections = if ($null -ne $a.connections) { [int]$a.connections } else { 0 }
+                successes = if ($null -ne $a.successes) { [int]$a.successes } else { 0 }
+                failures = if ($null -ne $a.failures) { [int]$a.failures } else { 0 }
+                health = if ($null -ne $a.health) { [double]$a.health } else { 0 }
+                latency = if ($null -ne $a.latency) { [double]$a.latency } else { 999 }
+                jitter = if ($null -ne $a.jitter) { [double]$a.jitter } else { 0 }
+                isDegrading = [bool]$a.isDegrading
+            }
+        }
+    }
+    if ($data -and $data.activePerAdapter) { foreach ($prop in $data.activePerAdapter.PSObject.Properties) { $activePerAdapter[(Normalize-DisplayText $prop.Name 64)] = [int]$prop.Value } }
+    if ($data -and $data.connectionTypes) { foreach ($prop in $data.connectionTypes.PSObject.Properties) { $connectionTypes[(Normalize-DisplayText $prop.Name 24)] = [int]$prop.Value } }
+    return @{ running = if ($data) { [bool]$data.running } else { $false }; timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }; totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }; activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }; activePerAdapter = $activePerAdapter; adapterCount = $adapters.Count; adapters = $adapters; connectionTypes = $connectionTypes; safeMode = if ($data) { [bool]$data.safeMode } else { $false }; currentMaxThreads = if ($data -and $null -ne $data.currentMaxThreads) { [int]$data.currentMaxThreads } else { 0 } }
+}
+
+function Get-ClientConfig {
+    $cfg = Read-JsonFile (Join-Path $configDir "config.json")
+    $mode = Get-ValidMode $cfg.mode
+    if (-not $mode) { $mode = 'maxspeed' }
+    return @{ mode = $mode; version = '6.2' }
+}
+
+function Get-ClientSafety {
+    $state = Read-JsonFile (Join-Path $configDir "safety-state.json")
+    return @{ safeMode = if ($state) { [bool]$state.safeMode } else { $false }; circuitBreakerOpen = if ($state) { [bool]$state.circuitBreakerOpen } else { $false }; proxyHealthy = if ($state -and $null -ne $state.proxyHealthy) { [bool]$state.proxyHealthy } else { $true }; uptime = if ($state -and $null -ne $state.uptime) { [double]$state.uptime } else { 0 }; version = if ($state -and $state.version) { Normalize-DisplayText $state.version 16 } else { '6.2' }; lastEvent = if ($state -and $state.lastEvent) { Normalize-DisplayText $state.lastEvent 120 } else { '' } }
+}
+
+function Get-UnifiedStats {
+    return (@{ timestamp = (Get-Date).ToString('o'); version = '6.2'; interfaces = (Get-ClientInterfaces); health = (Get-ClientHealth); proxy = (Get-ClientProxy); config = (Get-ClientConfig); safety = (Get-ClientSafety) } | ConvertTo-Json -Depth 6 -Compress)
 }
 
 function Get-Events {
-    $eventsFile = Join-Path $logsDir "events.json"
-    if (Test-Path $eventsFile) {
-        try { return Get-Content $eventsFile -Raw } catch {}
+    $data = Read-JsonFile (Join-Path $logsDir "events.json")
+    $events = @()
+    if ($data -and $data.events) {
+        foreach ($e in @($data.events)) {
+            $events += @{ timestamp = if ($e.timestamp) { Normalize-DisplayText $e.timestamp 48 } else { '' }; type = Normalize-DisplayText $e.type 24; adapter = Normalize-DisplayText $e.adapter 64; message = Normalize-DisplayText $e.message 200 }
+        }
     }
-    return '{"events":[]}'
+    return (@{ events = $events } | ConvertTo-Json -Depth 4 -Compress)
 }
 
 function Get-Decisions {
-    $decisionsFile = Join-Path $configDir "decisions.json"
-    if (Test-Path $decisionsFile) {
-        try { return Get-Content $decisionsFile -Raw } catch {}
+    $data = Read-JsonFile (Join-Path $configDir "decisions.json")
+    $decisions = @()
+    if ($data -and $data.decisions) {
+        foreach ($d in @($data.decisions)) {
+            $decisions += @{ time = Normalize-DisplayText $d.time 16; host = Normalize-DisplayText $d.host 120; type = Normalize-DisplayText $d.type 24; adapter = Normalize-DisplayText $d.adapter 64; reason = Normalize-DisplayText $d.reason 64; affinity_mode = Normalize-DisplayText $d.affinity_mode 24 }
+        }
     }
-    return '{"decisions":[]}'
+    return (@{ decisions = $decisions } | ConvertTo-Json -Depth 4 -Compress)
 }
 
 function Get-LearningData {
-    $learningFile = Join-Path $configDir "learning-data.json"
-    if (Test-Path $learningFile) {
-        try { return Get-Content $learningFile -Raw } catch {}
+    $data = Read-JsonFile (Join-Path $configDir "learning-data.json")
+    $profiles = @{}
+    if ($data -and $data.adapterProfiles) {
+        foreach ($prop in $data.adapterProfiles.PSObject.Properties) {
+            $p = $prop.Value
+            $profiles[(Normalize-DisplayText $prop.Name 64)] = @{ name = if ($p.name) { Normalize-DisplayText $p.name 64 } else { Normalize-DisplayText $prop.Name 64 }; totalSamples = if ($null -ne $p.totalSamples) { [int]$p.totalSamples } else { 0 }; avgHealth = if ($null -ne $p.avgHealth) { [double]$p.avgHealth } else { 0 }; reliability = if ($null -ne $p.reliability) { [double]$p.reliability } else { 0 } }
+        }
     }
-    return '{"adapterProfiles":{},"recommendations":{},"patterns":[]}'
+    return (@{ version = if ($data -and $data.version) { Normalize-DisplayText $data.version 16 } else { '6.2' }; lastUpdated = if ($data -and $data.lastUpdated) { Normalize-DisplayText $data.lastUpdated 48 } else { (Get-Date).ToString('o') }; totalSessions = if ($data -and $null -ne $data.totalSessions) { [int]$data.totalSessions } else { 0 }; adapterProfiles = $profiles; recommendations = @{}; patterns = @() } | ConvertTo-Json -Depth 5 -Compress)
 }
 
 function Get-SafetyState {
-    $safetyFile = Join-Path $configDir "safety-state.json"
-    if (Test-Path $safetyFile) {
-        try { return Get-Content $safetyFile -Raw } catch {}
-    }
-    return '{"safeMode":false,"circuitBreakerOpen":false,"proxyHealthy":true,"version":"5.0"}'
+    return ((Get-ClientSafety) | ConvertTo-Json -Depth 4 -Compress)
 }
 
 function Get-Telemetry {
-    $result = @{ timestamp = (Get-Date).ToString('o') }
-    $healthPath = Join-Path $configDir "health.json"
-    if (Test-Path $healthPath) {
-        try {
-            $hData = Get-Content $healthPath -Raw | ConvertFrom-Json
-            $result.adapters = @()
-            foreach ($a in $hData.adapters) {
-                $result.adapters += @{
-                    name = $a.Name; type = $a.Type; health = $a.HealthScore
-                    latency = $a.InternetLatency
-                    latencyEWMA = if ($a.InternetLatencyEWMA) { $a.InternetLatencyEWMA } else { $a.InternetLatency }
-                    jitter = if ($a.Jitter) { $a.Jitter } else { 0 }
-                    downloadMbps = $a.DownloadMbps; uploadMbps = $a.UploadMbps
-                    successRate = if ($a.SuccessRate) { $a.SuccessRate } else { 100 }
-                    stability = if ($a.StabilityScore) { $a.StabilityScore } else { 80 }
-                    trend = if ($a.HealthTrend) { $a.HealthTrend } else { 0 }
-                    isDegrading = if ($a.IsDegrading) { $a.IsDegrading } else { $false }
-                }
-            }
-            $result.degradation = if ($hData.degradation) { $hData.degradation } else { @{} }
-        } catch {}
-    }
-    return ($result | ConvertTo-Json -Depth 4 -Compress)
+    $health = Get-ClientHealth
+    return (@{ timestamp = (Get-Date).ToString('o'); adapters = @($health.adapters | ForEach-Object { @{ name = $_.Name; type = $_.Type; health = $_.HealthScore; latency = $_.InternetLatency; latencyEWMA = $_.InternetLatencyEWMA; jitter = $_.Jitter; downloadMbps = $_.DownloadMbps; uploadMbps = $_.UploadMbps; successRate = $_.SuccessRate; stability = $_.StabilityScore; trend = $_.HealthTrend; isDegrading = $_.IsDegrading } }); degradation = $health.degradation } | ConvertTo-Json -Depth 4 -Compress)
+}
+
+function Get-Resources {
+    $proc = Get-Process -Id $PID -ErrorAction SilentlyContinue
+    return (@{ processId = $PID; workingSetMB = if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { 0 }; privateMB = if ($proc) { [math]::Round($proc.PrivateMemorySize64 / 1MB, 1) } else { 0 }; cpuSeconds = if ($proc) { [math]::Round($proc.CPU, 1) } else { 0 }; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 3 -Compress)
 }
 
 function Set-Mode {
-    param([string]$Mode)
+    param([AllowNull()][object]$Mode)
+    $safeMode = Get-ValidMode $Mode
+    if (-not $safeMode) { return $null }
     $cfgFile = Join-Path $configDir "config.json"
-    if (Test-Path $cfgFile) {
-        $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
-        $cfg.mode = $Mode
-        $cfg | ConvertTo-Json -Depth 4 | Set-Content $cfgFile -Force -Encoding UTF8
-    }
+    if (-not (Test-Path $cfgFile)) { return $null }
+    $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
+    $cfg.mode = $safeMode
+    $cfg | ConvertTo-Json -Depth 5 | Set-Content $cfgFile -Force -Encoding UTF8
+    return $safeMode
 }
 
 function Set-SafeMode {
     param([bool]$Enabled)
     $safetyFile = Join-Path $configDir "safety-state.json"
-    $state = @{ safeMode = $Enabled; version = '5.0'; lastEvent = "Safe mode toggled via dashboard" }
+    $state = @{ safeMode = $Enabled; version = '6.2'; lastEvent = "Safe mode toggled via dashboard" }
     if (Test-Path $safetyFile) {
         try {
             $existing = Get-Content $safetyFile -Raw | ConvertFrom-Json
@@ -132,7 +280,7 @@ function Set-SafeMode {
 function Reset-LearningData {
     $learningFile = Join-Path $configDir "learning-data.json"
     $empty = @{
-        version = '5.0'
+        version = '6.2'
         lastUpdated = (Get-Date).ToString('o')
         totalSessions = 0
         adapterProfiles = @{}
@@ -145,17 +293,32 @@ function Reset-LearningData {
 function Send-TcpResponse {
     param(
         [System.IO.Stream]$Stream, [int]$StatusCode, [string]$StatusText,
-        [string]$ContentType, [byte[]]$Body
+        [string]$ContentType, [byte[]]$Body, [hashtable]$ExtraHeaders = @{}
     )
-    $headers  = "HTTP/1.1 $StatusCode $StatusText`r`n"
-    $headers += "Content-Type: $ContentType`r`n"
-    $headers += "Content-Length: $($Body.Length)`r`n"
-    $headers += "Access-Control-Allow-Origin: *`r`n"
-    $headers += "Access-Control-Allow-Methods: GET, POST, OPTIONS`r`n"
-    $headers += "Access-Control-Allow-Headers: Content-Type`r`n"
-    $headers += "Cache-Control: no-cache`r`n"
-    $headers += "Connection: close`r`n`r`n"
-    $hBytes = [System.Text.Encoding]::UTF8.GetBytes($headers)
+
+    $headers = [ordered]@{
+        'Content-Type' = $ContentType
+        'Content-Length' = $Body.Length
+        'Cache-Control' = 'no-store'
+        'Referrer-Policy' = 'no-referrer'
+        'X-Content-Type-Options' = 'nosniff'
+        'X-Frame-Options' = 'DENY'
+        'Cross-Origin-Resource-Policy' = 'same-origin'
+        'Content-Security-Policy' = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        'Connection' = 'close'
+    }
+
+    foreach ($key in $ExtraHeaders.Keys) {
+        $headers[$key] = $ExtraHeaders[$key]
+    }
+
+    $rawHeaders = "HTTP/1.1 $StatusCode $StatusText`r`n"
+    foreach ($key in $headers.Keys) {
+        $rawHeaders += "${key}: $($headers[$key])`r`n"
+    }
+    $rawHeaders += "`r`n"
+
+    $hBytes = [System.Text.Encoding]::UTF8.GetBytes($rawHeaders)
     $Stream.Write($hBytes, 0, $hBytes.Length)
     if ($Body.Length -gt 0) { $Stream.Write($Body, 0, $Body.Length) }
     $Stream.Flush()
@@ -178,8 +341,8 @@ function Get-MimeType {
 # --- Main ---
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION DASHBOARD SERVER v5.0                  " -ForegroundColor Cyan
-Write-Host "    Production Observability + Safety Controls        " -ForegroundColor DarkGray
+Write-Host "    NETFUSION DASHBOARD SERVER v6.2                  " -ForegroundColor Cyan
+Write-Host "    Local Session Auth + Reduced Telemetry Surface    " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -188,17 +351,12 @@ try {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
     $listener.Start()
-    
-    $tokenPath = Join-Path $configDir "dashboard-token.txt"
-    if (-not (Test-Path $tokenPath)) {
-        $global:DashToken = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 14 | ForEach-Object {[char]$_})
-        $global:DashToken | Set-Content $tokenPath -Force
-    } else {
-        $global:DashToken = (Get-Content $tokenPath -Raw).Trim()
-    }
-    
-    Write-Host "  Dashboard: http://127.0.0.1:${Port}?token=$global:DashToken" -ForegroundColor Green
-    Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
+
+    $global:DashToken = Ensure-DashboardToken
+
+    Write-Host "  Dashboard: http://127.0.0.1:${Port}" -ForegroundColor Green
+    Write-Host "  Script token: config\\dashboard-token.txt (for local automation)" -ForegroundColor DarkGray
+    Write-Host "  APIs: /api/stats | /api/safety | /api/resources" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
     Write-Host "  [ERROR] Port ${Port} in use." -ForegroundColor Red
@@ -207,12 +365,6 @@ try {
 
 try {
     while ($true) {
-        # Cleanup dead SSE runspaces to prevent memory leaks
-        if (-not $global:ActiveSSE) { $global:ActiveSSE = @() }
-        if ($global:ActiveSSE.Count -gt 0) {
-            $global:ActiveSSE = @($global:ActiveSSE | Where-Object { $_.client.Connected })
-        }
-
         if (-not $listener.Pending()) {
             Start-Sleep -Milliseconds 50
             continue
@@ -221,7 +373,6 @@ try {
         $client = $listener.AcceptTcpClient()
         $stream = $client.GetStream()
         $stream.ReadTimeout = 5000
-        $suppressClose = $false
 
         try {
             $buffer = New-Object byte[] 16384
@@ -231,38 +382,33 @@ try {
 
             $firstLine = ($requestText -split "`r`n")[0]
             $reqParts = $firstLine -split ' '
-            $method = $reqParts[0]
-            $path = if ($reqParts.Length -ge 2) { $reqParts[1] } else { '/' }
+            if ($reqParts.Length -lt 2) {
+                $msg = [System.Text.Encoding]::UTF8.GetBytes("Bad Request")
+                Send-TcpResponse -Stream $stream -StatusCode 400 -StatusText 'Bad Request' -ContentType 'text/plain; charset=utf-8' -Body $msg
+                continue
+            }
+            $method = $reqParts[0].ToUpperInvariant()
+            $path = $reqParts[1]
+            $parsedPath = $path.Split('?')[0]
+            $headers = Parse-Headers -RequestText $requestText
+            $bodyText = Get-RequestBody -RequestText $requestText
 
             if ($method -eq 'OPTIONS') {
-                Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain' -Body ([byte[]]@())
+                Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
                 continue
             }
 
-            # Pre-parse query parameters and headers
-            $parsedPath = $path.Split('?')[0]
-            $queryString = if ($path.Contains('?')) { $path.Split('?')[1] } else { '' }
-            $tokenParam = if ($queryString -match 'token=([^&]+)') { $matches[1] } else { '' }
-            
-            $headerToken = ''
-            foreach ($line in ($requestText -split "`r`n")) {
-                if ($line -match '^X-NetFusion-Token:\s*(.+)$') { $headerToken = $matches[1].Trim() }
+            if (-not (Test-AllowedOrigin $headers['origin'])) {
+                $msg = [System.Text.Encoding]::UTF8.GetBytes('{"error":"origin_not_allowed"}')
+                Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json; charset=utf-8' -Body $msg
+                continue
             }
-            
-            $providedToken = if ($tokenParam) { $tokenParam } else { $headerToken }
 
-            # Auth Check for ALL requests
-            if ($providedToken -ne $global:DashToken) {
-                if ($parsedPath -eq '/' -or $parsedPath -eq '/index.html') {
-                    $loginHtml = "<html><head><title>NetFusion Login</title><style>body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;} .box{background:#161b22;padding:40px;border-radius:8px;border:1px solid #30363d;text-align:center;} input{padding:10px;margin-top:20px;width:300px;background:#0d1117;border:1px solid #30363d;color:white;border-radius:4px;} button{padding:10px 20px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;margin-top:15px;}</style></head><body><div class='box'><h2>NetFusion Dashboard</h2><p>Please enter your access token (found in the console).</p><input type='password' id='tok' placeholder='Token...'><br><button onclick='login()'>Login</button></div><script>function login(){ var t=document.getElementById('tok').value; if(t) window.location.href='/?token='+encodeURIComponent(t); }</script></body></html>"
-                    $body = [System.Text.Encoding]::UTF8.GetBytes($loginHtml)
-                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'text/html; charset=utf-8' -Body $body
-                    continue
-                } else {
-                    $err = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
-                    Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json' -Body $err
-                    continue
-                }
+            $isMutation = $method -in @('POST', 'PUT', 'PATCH', 'DELETE')
+            if ($isMutation -and -not (Test-IsMutationAuthorized -Headers $headers)) {
+                $err = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
+                Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json; charset=utf-8' -Body $err
+                continue
             }
 
             switch -Wildcard ($parsedPath) {
@@ -272,89 +418,8 @@ try {
                     Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                 }
                 '/api/stream' {
-                    # [V5-FIX-5] Server-Sent Events (SSE) Loop - ASYNCHRONOUS OFF-THREADING
-                    $client.ReceiveTimeout = 5000
-                    $client.SendTimeout = 5000
-                    
-                    $headers  = "HTTP/1.1 200 OK`r`n"
-                    $headers += "Content-Type: text/event-stream`r`n"
-                    $headers += "Cache-Control: no-cache`r`n"
-                    $headers += "Connection: keep-alive`r`n`r`n"
-                    $hBytes = [System.Text.Encoding]::UTF8.GetBytes($headers)
-                    $stream.Write($hBytes, 0, $hBytes.Length)
-                    $stream.Flush()
-                    
-                    $sseLogic = {
-                        param($c, $s, $cDir, $lDir)
-                        
-                        function Get-StatsAsync {
-                            $res = @{ timestamp = (Get-Date).ToString('o') }
-                            $fs = @{ interfaces="interfaces.json"; health="health.json"; proxy="proxy-stats.json"; config="config.json"; safety="safety-state.json" }
-                            foreach ($k in $fs.Keys) {
-                                $p = Join-Path $cDir $fs[$k]
-                                if (Test-Path $p) { 
-                                    try { 
-                                        $cnt = Get-Content $p -Raw -ErrorAction SilentlyContinue
-                                        if ([string]::IsNullOrWhiteSpace($cnt)) { throw "Empty" }
-                                        $res[$k] = $cnt | ConvertFrom-Json -ErrorAction Stop
-                                    } catch {} 
-                                }
-                            }
-                            return ($res | ConvertTo-Json -Depth 6 -Compress)
-                        }
-                        function Get-EvtAsync {
-                            $p = Join-Path $lDir "events.json"
-                            if (Test-Path $p) { try { $c = Get-Content $p -Raw -ErrorAction SilentlyContinue; if (-not [string]::IsNullOrWhiteSpace($c)) { return $c } } catch {} }
-                            return '{"events":[]}'
-                        }
-                        
-                        function Get-DecAsync {
-                            $p = Join-Path $cDir "decisions.json"
-                            if (Test-Path $p) { try { $c = Get-Content $p -Raw -ErrorAction SilentlyContinue; if (-not [string]::IsNullOrWhiteSpace($c)) { return $c } } catch {} }
-                            return '{"decisions":[]}'
-                        }
-                        
-                        function Get-LrnAsync {
-                            $p = Join-Path $cDir "learning-data.json"
-                            if (Test-Path $p) { try { $c = Get-Content $p -Raw -ErrorAction SilentlyContinue; if (-not [string]::IsNullOrWhiteSpace($c)) { return $c } } catch {} }
-                            return '{"adapterProfiles":{},"recommendations":{},"patterns":[]}'
-                        }
-
-                        try {
-                            while ($c.Connected) {
-                                $ping = [System.Text.Encoding]::UTF8.GetBytes(": keepalive`n`n")
-                                $s.Write($ping, 0, $ping.Length)
-                                
-                                try {
-                                    $pl = @{
-                                        stats     = (Get-StatsAsync) | ConvertFrom-Json
-                                        events    = (Get-EvtAsync) | ConvertFrom-Json
-                                        decisions = (Get-DecAsync) | ConvertFrom-Json
-                                        learning  = (Get-LrnAsync) | ConvertFrom-Json
-                                    } | ConvertTo-Json -Depth 6 -Compress
-                                    
-                                    $msg = [System.Text.Encoding]::UTF8.GetBytes("data: $($pl)`n`n")
-                                    $s.Write($msg, 0, $msg.Length)
-                                } catch {
-                                    # Ignore partial parse failures caused by race conditions so the socket stays open
-                                }
-                                
-                                $s.Flush()
-                                Start-Sleep -Seconds 2
-                            }
-                        } catch {} finally {
-                            try { $c.Close() } catch {}
-                        }
-                    }
-
-                    $ps = [System.Management.Automation.PowerShell]::Create()
-                    $ps.AddScript($sseLogic).AddArgument($client).AddArgument($stream).AddArgument($configDir).AddArgument($logsDir) | Out-Null
-                    $handle = $ps.BeginInvoke()
-                    
-                    # [V5-FIX] Anchor the client, stream, and runspace to prevent .NET Garbage Collection disposal
-                    $global:ActiveSSE += @{ ps = $ps; client = $client; stream = $stream; handle = $handle }
-                    $suppressClose = $true
-                    continue
+                    $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"streaming_disabled","message":"Dashboard now uses authenticated polling."}')
+                    Send-TcpResponse -Stream $stream -StatusCode 410 -StatusText 'Gone' -ContentType 'application/json; charset=utf-8' -Body $body
                 }
                 '/api/events' {
                     $json = Get-Events
@@ -378,21 +443,17 @@ try {
                 }
                 '/api/safety' {
                     if ($method -eq 'POST') {
-                        $bodyStart = $requestText.IndexOf("`r`n`r`n")
-                        if ($bodyStart -gt 0) {
-                            $bodyText = $requestText.Substring($bodyStart + 4)
-                            try {
-                                $safeData = $bodyText | ConvertFrom-Json
-                                Set-SafeMode -Enabled ([bool]$safeData.safeMode)
-                                $resp = @{ ok = $true; safeMode = [bool]$safeData.safeMode } | ConvertTo-Json -Compress
-                                $body = [System.Text.Encoding]::UTF8.GetBytes($resp)
-                                Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $body
-                                $modeStr = if ($safeData.safeMode) { 'ENABLED' } else { 'DISABLED' }
-                                Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Safe Mode -> $modeStr" -ForegroundColor Yellow
-                            } catch {
-                                $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"invalid"}')
-                                Send-TcpResponse -Stream $stream -StatusCode 400 -StatusText 'Bad Request' -ContentType 'application/json' -Body $body
-                            }
+                        try {
+                            $safeData = $bodyText | ConvertFrom-Json -ErrorAction Stop
+                            Set-SafeMode -Enabled ([bool]$safeData.safeMode)
+                            $resp = @{ ok = $true; safeMode = [bool]$safeData.safeMode } | ConvertTo-Json -Compress
+                            $body = [System.Text.Encoding]::UTF8.GetBytes($resp)
+                            Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
+                            $modeStr = if ($safeData.safeMode) { 'ENABLED' } else { 'DISABLED' }
+                            Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Safe Mode -> $modeStr" -ForegroundColor Yellow
+                        } catch {
+                            $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"invalid"}')
+                            Send-TcpResponse -Stream $stream -StatusCode 400 -StatusText 'Bad Request' -ContentType 'application/json; charset=utf-8' -Body $body
                         }
                     } else {
                         $json = Get-SafetyState
@@ -405,41 +466,41 @@ try {
                         Reset-LearningData
                         $resp = @{ ok = $true; message = 'Learning data cleared' } | ConvertTo-Json -Compress
                         $body = [System.Text.Encoding]::UTF8.GetBytes($resp)
-                        Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $body
+                        Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                         Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Learning data RESET" -ForegroundColor Magenta
+                    } else {
+                        $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"method_not_allowed"}')
+                        Send-TcpResponse -Stream $stream -StatusCode 405 -StatusText 'Method Not Allowed' -ContentType 'application/json; charset=utf-8' -Body $body
                     }
                 }
                 '/api/mode' {
                     if ($method -eq 'POST') {
-                        $bodyStart = $requestText.IndexOf("`r`n`r`n")
-                        if ($bodyStart -gt 0) {
-                            $bodyText = $requestText.Substring($bodyStart + 4)
-                            try {
-                                $modeData = $bodyText | ConvertFrom-Json
-                                Set-Mode -Mode $modeData.mode
-                                $resp = @{ ok = $true; mode = $modeData.mode } | ConvertTo-Json -Compress
-                                $body = [System.Text.Encoding]::UTF8.GetBytes($resp)
-                                Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $body
-                                Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Mode -> $($modeData.mode)" -ForegroundColor Green
-                            } catch {
-                                $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"invalid"}')
-                                Send-TcpResponse -Stream $stream -StatusCode 400 -StatusText 'Bad Request' -ContentType 'application/json' -Body $body
-                            }
+                        try {
+                            $modeData = $bodyText | ConvertFrom-Json -ErrorAction Stop
+                            $updatedMode = Set-Mode -Mode $modeData.mode
+                            if (-not $updatedMode) { throw "Invalid mode" }
+                            $resp = @{ ok = $true; mode = $updatedMode } | ConvertTo-Json -Compress
+                            $body = [System.Text.Encoding]::UTF8.GetBytes($resp)
+                            Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
+                            Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Mode -> $updatedMode" -ForegroundColor Green
+                        } catch {
+                            $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"invalid_mode"}')
+                            Send-TcpResponse -Stream $stream -StatusCode 400 -StatusText 'Bad Request' -ContentType 'application/json; charset=utf-8' -Body $body
                         }
+                    } else {
+                        $body = [System.Text.Encoding]::UTF8.GetBytes('{"error":"method_not_allowed"}')
+                        Send-TcpResponse -Stream $stream -StatusCode 405 -StatusText 'Method Not Allowed' -ContentType 'application/json; charset=utf-8' -Body $body
                     }
                 }
                 '/api/resources' {
-                    $json = Get-SafetyState
+                    $json = Get-Resources
                     $body = [System.Text.Encoding]::UTF8.GetBytes($json)
                     Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                 }
                 '/api/config' {
-                    $cfgFile = Join-Path $configDir "config.json"
-                    if (Test-Path $cfgFile) {
-                        $json = Get-Content $cfgFile -Raw
-                        $body = [System.Text.Encoding]::UTF8.GetBytes($json)
-                        Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json' -Body $body
-                    }
+                    $json = (Get-ClientConfig | ConvertTo-Json -Depth 3 -Compress)
+                    $body = [System.Text.Encoding]::UTF8.GetBytes($json)
+                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                 }
                 '/' {
                     $filePath = Join-Path $dashDir "index.html"
@@ -456,39 +517,21 @@ try {
                     }
                 }
                 '/favicon.ico' {
-                    Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain' -Body ([byte[]]@())
+                    Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
                 }
                 default {
-                    $safePath = $parsedPath.TrimStart('/').Replace('/', '\')
-                    
-                    # [V5-FIX-17] Path traversal protection
-                    if ($safePath -match '\.\.') {
-                        $msg = [System.Text.Encoding]::UTF8.GetBytes("Forbidden")
-                        Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'text/plain' -Body $msg
-                        continue
-                    }
-                    
-                    $filePath = Join-Path $dashDir $safePath
-                    if ((Test-Path $filePath) -and -not (Get-Item $filePath).PSIsContainer) {
-                        $ext = [System.IO.Path]::GetExtension($filePath)
-                        $content = [System.IO.File]::ReadAllBytes($filePath)
-                        Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType (Get-MimeType $ext) -Body $content
-                    } else {
-                        $msg = [System.Text.Encoding]::UTF8.GetBytes("Not found")
-                        Send-TcpResponse -Stream $stream -StatusCode 404 -StatusText 'Not Found' -ContentType 'text/plain' -Body $msg
-                    }
+                    $msg = [System.Text.Encoding]::UTF8.GetBytes("Not found")
+                    Send-TcpResponse -Stream $stream -StatusCode 404 -StatusText 'Not Found' -ContentType 'text/plain; charset=utf-8' -Body $msg
                 }
             }
         } catch {
             try {
                 $err = [System.Text.Encoding]::UTF8.GetBytes("Error")
-                Send-TcpResponse -Stream $stream -StatusCode 500 -StatusText 'Error' -ContentType 'text/plain' -Body $err
+                Send-TcpResponse -Stream $stream -StatusCode 500 -StatusText 'Error' -ContentType 'text/plain; charset=utf-8' -Body $err
             } catch {}
         } finally {
-            if (-not $suppressClose) {
-                try { $stream.Close() } catch {}
-                try { $client.Close() } catch {}
-            }
+            try { $stream.Close() } catch {}
+            try { $client.Close() } catch {}
         }
     }
 } finally {

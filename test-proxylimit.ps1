@@ -5,6 +5,16 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "This test measures absolute proxy capacity by bypassing the internet"
 Write-Host "and pushing local loopback data to max out the proxy thread pool."
 
+function Get-DashboardStats {
+    $tokenFile = Join-Path $PSScriptRoot "config\dashboard-token.txt"
+    if (-not (Test-Path $tokenFile)) {
+        throw "Dashboard token file not found: $tokenFile"
+    }
+
+    $token = (Get-Content $tokenFile -Raw -ErrorAction Stop).Trim()
+    return Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/stats" -Headers @{ "X-NetFusion-Token" = $token } -Method Get
+}
+
 # 1. Start Local Test Server (Bypassing Internet)
 $port = 9095
 $code = @"
@@ -94,7 +104,7 @@ if ($failures.Count -gt 0) {
 Write-Host "Total Data:       $([math]::Round($bytesHandled / 1MB, 2)) MB"
 Write-Host "RAW ENGINE SPEED: $([math]::Round($mbps, 2)) Mbps" -ForegroundColor Cyan
 
-$stats = curl.exe -s "http://127.0.0.1:9090/api/stats?token=AIqSCTmEekH5Dv" | ConvertFrom-Json
+$stats = Get-DashboardStats
 if ($stats) {
     Write-Host "`nMax Proxy Threads Registered: $($stats.proxy.currentMaxThreads)"
     Write-Host "Total Connections Handled:    $($stats.proxy.totalConnections)"
