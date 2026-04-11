@@ -15,8 +15,8 @@
                   "connectTimeout":  5000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
-                  "minThreads":  16,
-                  "maxThreads":  64,
+                  "minThreads":  64,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
                   "healthEndpoint":  true

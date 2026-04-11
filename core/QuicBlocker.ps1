@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    QuicBlocker v6.0 -- UDP 443 Firewall Manager
+    QuicBlocker v5.0 -- UDP 443 Firewall Manager
 .DESCRIPTION
     Modern browsers attempt to use QUIC (UDP 443) for Google/YouTube/Cloudflare.
     NetFusion TCP proxies CANNOT route UDP. This script explicitly creates an
@@ -42,7 +42,7 @@ $ruleName = "NetFusion_Block_QUIC"
 try {
     $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
     
-    # v6.0 #12: Fix — key is at root level, not nested under routing
+    # The QUIC toggle lives at the config root. If this is false, browsers can bypass the TCP proxy.
     $shouldBlock = if ($config -and $config.blockQUICOnSecondaryAdapters -eq $true) { $true } else { $false }
     
     $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
@@ -64,8 +64,7 @@ try {
         } else {
             Write-Host "  [+] QUIC firewall rule already enforcing." -ForegroundColor DarkGray
         }
-        # Atomic sentinel write
-        $tmp = [IO.Path]::GetTempFileName()
+        $tmp = [System.IO.Path]::GetTempFileName()
         @{ rules = @($ruleName); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
         Move-Item $tmp $sentinelFile -Force
     } else {
@@ -74,7 +73,7 @@ try {
             Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
             Write-Host "  [-] QUIC block removed." -ForegroundColor DarkGray
         }
-        $tmp = [IO.Path]::GetTempFileName()
+        $tmp = [System.IO.Path]::GetTempFileName()
         @{ rules = @(); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
         Move-Item $tmp $sentinelFile -Force
     }

@@ -1,8 +1,7 @@
-{
+﻿{
     "proxyPort":  8080,
     "dashboardPort":  9090,
     "dashboardAllowLAN":  false,
-    "dashboardTLS":  false,
     "blockQUICOnSecondaryAdapters":  true,
     "mode":  "maxspeed",
     "monitorInterval":  2000,
@@ -16,9 +15,8 @@
                   "connectTimeout":  5000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
-                  "minThreads":  32,
-                  "maxThreads":  64,
-                  "maxConcurrentPerAdapter":  48,
+                  "minThreads":  64,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  120,
                   "sessionAffinityTTL":  300,
                   "healthEndpoint":  true
@@ -73,7 +71,49 @@
                      "sessionInterval":  60,
                      "minSamplesForRecommendation":  20
                  },
-    "_trafficRules_NOTE":  "Per-app routing (IDMan.exe, chrome.exe etc.) was removed in v6.0. The proxy operates at TCP socket level and cannot distinguish processes without a kernel driver. Connection-type detection via L4 port classification is used instead.",
+    "trafficRules":  {
+                         "downloadManagers":  {
+                                                  "mode":  "maxspeed",
+                                                  "apps":  [
+                                                               "IDMan.exe",
+                                                               "aria2c.exe",
+                                                               "wget.exe",
+                                                               "curl.exe"
+                                                           ]
+                                              },
+                         "torrentClients":  {
+                                                "mode":  "maxspeed",
+                                                "apps":  [
+                                                             "qbittorrent.exe",
+                                                             "utorrent.exe",
+                                                             "BitTorrent.exe",
+                                                             "Deluge.exe"
+                                                         ]
+                                            },
+                         "streaming":  {
+                                           "mode":  "maxspeed",
+                                           "apps":  [
+                                                        "spotify.exe"
+                                                    ]
+                                       },
+                         "gaming":  {
+                                        "mode":  "maxspeed",
+                                        "apps":  [
+                                                     "steam.exe",
+                                                     "EpicGamesLauncher.exe"
+                                                 ]
+                                    },
+                         "browsers":  {
+                                          "mode":  "maxspeed",
+                                          "apps":  [
+                                                       "chrome.exe",
+                                                       "firefox.exe",
+                                                       "msedge.exe",
+                                                       "opera.exe",
+                                                       "brave.exe"
+                                                   ]
+                                      }
+                     },
     "telemetry":  {
                       "enabled":  true,
                       "decisionLogSize":  100,
@@ -116,3 +156,4 @@
                          ],
     "autoStart":  false
 }
+

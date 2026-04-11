@@ -186,8 +186,6 @@ canvas{display:block;width:100%!important;height:100%!important}
     <div id="pillMode" class="pill pill-info"><span class="dot"></span>Max Speed</div>
     <div class="ss-divider"></div>
     <div id="pillAdapters" class="pill pill-info"><span class="dot"></span>0 Adapters</div>
-    <div class="ss-divider"></div>
-    <div id="pillWatchdog" class="pill pill-ok"><span class="dot"></span>Watchdog</div>
     <span class="ss-spacer"></span>
     <span class="ss-uptime" id="ssUptime">Uptime: --</span>
   </div>
@@ -415,7 +413,7 @@ function updateProxy(proxy){
   // connection types
   const ct=proxy?.connectionTypes||{};
   const typesEl=document.getElementById('ppTypes');
-  const typeColors={bulk:'var(--accent)',interactive:'var(--text3)',streaming:'var(--accent2)',gaming:'var(--green)',voice:'#a855f7'};
+  const typeColors={bulk:'var(--accent)',interactive:'var(--text3)',streaming:'var(--accent2)',gaming:'var(--green)'};
   typesEl.innerHTML=Object.entries(ct).filter(([k,v])=>v>0).map(([k,v])=>`<div class="pp-type"><span class="pp-dot" style="background:${typeColors[k]||'var(--text3)'}"></span>${k}: ${v}</div>`).join('');
   // mini chart
   drawChart('connChart',[connHist],['#3b82f6']);
@@ -543,20 +541,6 @@ function processStats(stats){
     }else{
       pillSys.className='pill pill-err';pillSys.innerHTML='<span class="dot"></span>No Data';
     }
-
-    // Watchdog heartbeat
-    const wd=stats.watchdog;
-    const pillWD=document.getElementById('pillWatchdog');
-    if(wd&&wd.alive){
-      if(wd.stale){pillWD.className='pill pill-err';pillWD.innerHTML='<span class="dot"></span>Watchdog Stale';}
-      else{
-        const rc=wd.restartCount||0;
-        const lbl=rc>0?'Watchdog ('+rc+' restarts)':'Watchdog';
-        pillWD.className='pill pill-ok';pillWD.innerHTML='<span class="dot"></span>'+lbl;
-      }
-    }else{
-      pillWD.className='pill pill-err';pillWD.innerHTML='<span class="dot"></span>Watchdog Down';
-    }
   }
 }
 
@@ -653,45 +637,32 @@ document.querySelectorAll('.mbtn').forEach(b=>{
 drawThroughput();
 drawChart('connChart',[connHist],['#3b82f6']);
 
-// ===== LIVE STREAM =====
-let evtSource=null,reconnectDelayMs=1000,reconnectTimer=null;
-function attachStreamHandlers(source){
-  source.onmessage = (e) => {
-    reconnectDelayMs = 1000;
-    if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
-    try {
-      const data = JSON.parse(e.data);
-      if(data.stats) processStats(data.stats);
-      if(data.decisions?.decisions && data.decisions.decisions.length > 0) renderDecs(data.decisions.decisions);
-      if(data.events?.events && data.events.events.length > 0) renderEvts(data.events.events);
-      if(data.learning) renderLearning(data.learning);
-    } catch(err) {}
-  };
-
-  source.onerror = () => {
-    if(source.readyState === EventSource.CLOSED){
-      try{source.close()}catch{}
+// [V5-FIX-5] SSE Stream initialization
+const evtSource = new EventSource('/api/stream'+API);
+evtSource.onmessage = (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    if(data.stats) processStats(data.stats);
+    // Route Decisions
+    if(data.decisions?.decisions && data.decisions.decisions.length > 0){
+      renderDecs(data.decisions.decisions);
     }
-    if(reconnectTimer) return;
-    const waitMs = reconnectDelayMs;
-    console.warn(`[NetFusion] SSE disconnected - retrying in ${Math.round(waitMs/1000)}s`);
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connectStream();
-    }, waitMs);
-    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
-  };
-}
+    // Sys Events
+    if(data.events?.events && data.events.events.length > 0){
+      renderEvts(data.events.events);
+    }
+    if(data.learning) renderLearning(data.learning);
+  } catch(err) {}
+};
 
-function connectStream(){
-  if(evtSource){
-    try{evtSource.close()}catch{}
-  }
-  evtSource = new EventSource('/api/stream'+API);
-  attachStreamHandlers(evtSource);
-}
-
-connectStream();
+evtSource.onerror = () => {
+  console.warn('[NetFusion] SSE disconnected — auto-reconnecting...');
+  setTimeout(() => {
+    const newSource = new EventSource('/api/stream'+API);
+    newSource.onmessage = evtSource.onmessage;
+    newSource.onerror = evtSource.onerror;
+  }, 3000);
+};
 
 window.addEventListener('resize',()=>{drawThroughput();drawChart('connChart',[connHist],['#3b82f6'])});
 </script>

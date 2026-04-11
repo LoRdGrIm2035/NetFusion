@@ -1,54 +1,23 @@
-# Per-adapter speed test -- auto-discovers adapters from interfaces.json
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
-$ifFile = Join-Path $scriptDir "config\interfaces.json"
-
-# Auto-discover adapters
-$adapters = @()
-if (Test-Path $ifFile) {
-    try {
-        $ifData = Get-Content $ifFile -Raw | ConvertFrom-Json
-        $adapters = @($ifData.interfaces | Where-Object { $_.Status -eq 'Up' -and $_.Type -match 'WiFi|USB-WiFi|Ethernet' })
-    } catch {
-        Write-Host "[!] Failed to parse interfaces.json: $_" -ForegroundColor Red
-    }
-}
-
-if ($adapters.Count -lt 2) {
-    # Fallback: detect from OS directly
-    Write-Host "[!] interfaces.json missing or has <2 adapters -- falling back to OS detection" -ForegroundColor Yellow
-    $adapters = @(Get-NetAdapter | Where-Object {
-        $_.Status -eq 'Up' -and
-        $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel'
-    } | Select-Object -First 2)
-}
-
-if ($adapters.Count -lt 2) {
-    Write-Host "[FAIL] Need 2+ network adapters for speed test. Found: $($adapters.Count)" -ForegroundColor Red
-    exit 1
-}
-
-# Resolve adapter indices
-$a1Name = $adapters[0].Name
-$a2Name = $adapters[1].Name
-$a1Idx = if ($adapters[0].ifIndex) { $adapters[0].ifIndex } else { (Get-NetAdapter -Name $a1Name).InterfaceIndex }
-$a2Idx = if ($adapters[1].ifIndex) { $adapters[1].ifIndex } else { (Get-NetAdapter -Name $a2Name).InterfaceIndex }
-$a1IP = (Get-NetIPAddress -InterfaceIndex $a1Idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-$a2IP = (Get-NetIPAddress -InterfaceIndex $a2Idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+# Per-adapter speed test using WebClient bound per adapter via route metrics
+$wifi3Idx = (Get-NetAdapter -Name "Wi-Fi 3").InterfaceIndex
+$wifi4Idx = (Get-NetAdapter -Name "Wi-Fi 4").InterfaceIndex
+$wifi3IP = (Get-NetIPAddress -InterfaceIndex $wifi3Idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+$wifi4IP = (Get-NetIPAddress -InterfaceIndex $wifi4Idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
 
 Write-Host "=== FULL SPEED TEST ===" -ForegroundColor Cyan
-Write-Host "$a1Name : $a1IP (idx $a1Idx)" -ForegroundColor Green
-Write-Host "$a2Name : $a2IP (idx $a2Idx)" -ForegroundColor Magenta
+Write-Host "Wi-Fi 3: $wifi3IP (idx $wifi3Idx)" -ForegroundColor Green
+Write-Host "Wi-Fi 4: $wifi4IP (idx $wifi4Idx)" -ForegroundColor Magenta
 Write-Host ""
 
 # Save original metrics
-$orig1 = (Get-NetIPInterface -InterfaceIndex $a1Idx -AddressFamily IPv4).InterfaceMetric
-$orig2 = (Get-NetIPInterface -InterfaceIndex $a2Idx -AddressFamily IPv4).InterfaceMetric
-Write-Host "Original metrics: $a1Name=$orig1, $a2Name=$orig2"
+$orig3 = (Get-NetIPInterface -InterfaceIndex $wifi3Idx -AddressFamily IPv4).InterfaceMetric
+$orig4 = (Get-NetIPInterface -InterfaceIndex $wifi4Idx -AddressFamily IPv4).InterfaceMetric
+Write-Host "Original metrics: Wi-Fi 3=$orig3, Wi-Fi 4=$orig4"
 
-# --- TEST A: Adapter 1 only ---
-Write-Host "`n[A] $a1Name ONLY ($a2Name metric=9999):" -ForegroundColor Green
-Set-NetIPInterface -InterfaceIndex $a1Idx -InterfaceMetric 1
-Set-NetIPInterface -InterfaceIndex $a2Idx -InterfaceMetric 9999
+# --- TEST A: Wi-Fi 3 only (disable Wi-Fi 4 route) ---
+Write-Host "`n[A] Wi-Fi 3 ONLY (Wi-Fi 4 metric=9999):" -ForegroundColor Green
+Set-NetIPInterface -InterfaceIndex $wifi3Idx -InterfaceMetric 1
+Set-NetIPInterface -InterfaceIndex $wifi4Idx -InterfaceMetric 9999
 Start-Sleep -Seconds 1
 $sw1 = [System.Diagnostics.Stopwatch]::StartNew()
 $wc1 = New-Object System.Net.WebClient
@@ -60,10 +29,10 @@ try {
     Write-Host "  $([math]::Round($d1.Length/1MB,2)) MB in $([math]::Round($sw1.Elapsed.TotalSeconds,2))s = $([math]::Round($s1,2)) Mbps" -ForegroundColor Green
 } catch { Write-Host "  FAIL: $_" -ForegroundColor Red; $s1 = 0 }
 
-# --- TEST B: Adapter 2 only ---
-Write-Host "`n[B] $a2Name ONLY ($a1Name metric=9999):" -ForegroundColor Magenta
-Set-NetIPInterface -InterfaceIndex $a2Idx -InterfaceMetric 1
-Set-NetIPInterface -InterfaceIndex $a1Idx -InterfaceMetric 9999
+# --- TEST B: Wi-Fi 4 only (disable Wi-Fi 3 route) ---
+Write-Host "`n[B] Wi-Fi 4 ONLY (Wi-Fi 3 metric=9999):" -ForegroundColor Magenta
+Set-NetIPInterface -InterfaceIndex $wifi4Idx -InterfaceMetric 1
+Set-NetIPInterface -InterfaceIndex $wifi3Idx -InterfaceMetric 9999
 Start-Sleep -Seconds 1
 $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
 $wc2 = New-Object System.Net.WebClient
@@ -72,17 +41,17 @@ try {
     $d2 = $wc2.DownloadData("http://proof.ovh.net/files/10Mb.dat")
     $sw2.Stop()
     $s2 = (($d2.Length/1MB)*8)/$sw2.Elapsed.TotalSeconds
-    Write-Host "  $([math]::Round($d2.Length/1MB,2)) MB in $([math]::Round($sw2.Elapsed.TotalSeconds,2))s = $([math]::Round($s2,2)) Mbps" -ForegroundColor Magenta
+    Write-Host "  $([math]::Round($d2.Length/1MB,2)) MB in $([math]::Round($sw2.Elapsed.TotalSeconds,2))s = $([math]::Round($s2,2)) Mbps" -ForegroundColor Magenta  
 } catch { Write-Host "  FAIL: $_" -ForegroundColor Red; $s2 = 0 }
 
 # Restore original metrics
-Set-NetIPInterface -InterfaceIndex $a1Idx -InterfaceMetric $orig1
-Set-NetIPInterface -InterfaceIndex $a2Idx -InterfaceMetric $orig2
+Set-NetIPInterface -InterfaceIndex $wifi3Idx -InterfaceMetric $orig3
+Set-NetIPInterface -InterfaceIndex $wifi4Idx -InterfaceMetric $orig4
 
-# --- TEST C: BOTH via metric split ---
+# --- TEST C: BOTH via metric split (each metric=1, round-robin) ---
 Write-Host "`n[C] BOTH simultaneously (parallel WebClient, no proxy):" -ForegroundColor Yellow
-Set-NetIPInterface -InterfaceIndex $a1Idx -InterfaceMetric 25
-Set-NetIPInterface -InterfaceIndex $a2Idx -InterfaceMetric 30
+Set-NetIPInterface -InterfaceIndex $wifi3Idx -InterfaceMetric 25
+Set-NetIPInterface -InterfaceIndex $wifi4Idx -InterfaceMetric 30
 Start-Sleep -Seconds 1
 
 $j1 = Start-Job -ScriptBlock {
@@ -134,15 +103,11 @@ if ($totalBytes -gt 0) {
     Write-Host "  Proxy throughput: $([math]::Round($proxySpd,2)) Mbps" -ForegroundColor Cyan
 }
 
-# Restore metrics
-Set-NetIPInterface -InterfaceIndex $a1Idx -InterfaceMetric $orig1
-Set-NetIPInterface -InterfaceIndex $a2Idx -InterfaceMetric $orig2
-
 # Summary
 Write-Host ""
 Write-Host "====== SPEED TEST SUMMARY ======" -ForegroundColor White
-Write-Host "  $a1Name alone:  $([math]::Round($s1,1)) Mbps" -ForegroundColor Green
-Write-Host "  $a2Name alone:  $([math]::Round($s2,1)) Mbps" -ForegroundColor Magenta
+Write-Host "  Wi-Fi 3 alone:  $([math]::Round($s1,1)) Mbps" -ForegroundColor Green
+Write-Host "  Wi-Fi 4 alone:  $([math]::Round($s2,1)) Mbps" -ForegroundColor Magenta
 $theoretical = $s1 + $s2
 Write-Host "  Theoretical:    $([math]::Round($theoretical,1)) Mbps" -ForegroundColor Yellow
 if ($totalBytes -gt 0) {

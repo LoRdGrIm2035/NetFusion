@@ -37,27 +37,7 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 
 # Load config
 $configPath = Join-Path $projectDir "config\config.json"
-$script:cachedConfig = $null
-$script:lastConfigTime = [DateTime]::MinValue
-$script:configCacheTtl = [TimeSpan]::FromSeconds(15)
-
-function Get-CachedConfig {
-    $now = Get-Date
-    if ($script:cachedConfig -and (($now - $script:lastConfigTime) -le $script:configCacheTtl)) {
-        return $script:cachedConfig
-    }
-
-    if (Test-Path $configPath) {
-        try {
-            $script:cachedConfig = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            $script:lastConfigTime = $now
-        } catch {}
-    }
-
-    return $script:cachedConfig
-}
-
-$config = Get-CachedConfig
+$config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
 $pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
 $pingTarget2 = '1.1.1.1'
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
@@ -448,20 +428,6 @@ function Measure-InterfaceHealth {
         # Packet loss penalty
         if ($packetLoss -gt 0) { $score -= [math]::Min(15, [int]($packetLoss / 5)) }
 
-        # Strong latency/jitter penalties so unusable links are not mislabeled as healthy.
-        if ($inetLatencySmoothed -ge 400) { $score -= 25 }
-        elseif ($inetLatencySmoothed -ge 250) { $score -= 18 }
-        elseif ($inetLatencySmoothed -ge 150) { $score -= 12 }
-        elseif ($inetLatencySmoothed -ge 100) { $score -= 6 }
-
-        if ($gwLatencySmoothed -ge 250) { $score -= 15 }
-        elseif ($gwLatencySmoothed -ge 120) { $score -= 10 }
-        elseif ($gwLatencySmoothed -ge 60) { $score -= 5 }
-
-        if ($jitter -ge 150) { $score -= 20 }
-        elseif ($jitter -ge 80) { $score -= 12 }
-        elseif ($jitter -ge 40) { $score -= 6 }
-
         $score = [math]::Max(0, [math]::Min(100, [math]::Round($score)))
 
         # --- Predictive degradation check ---
@@ -475,8 +441,8 @@ function Measure-InterfaceHealth {
 
     # --- Status ---
     $status = 'offline'
-    if ($score -ge 80) { $status = 'healthy' }
-    elseif ($score -ge 50) { $status = 'degraded' }
+    if ($score -ge 70) { $status = 'healthy' }
+    elseif ($score -ge 40) { $status = 'degraded' }
     elseif ($score -gt 0) { $status = 'critical' }
 
     # --- State change events ---
@@ -538,7 +504,7 @@ if (-not (Test-Path $LogFile)) {
 function Update-HealthState {
     try {
         try {
-            $liveCfg = Get-CachedConfig
+            $liveCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
             $activeMode = if ($liveCfg -and $liveCfg.mode) { $liveCfg.mode } else { 'maxspeed' }
             
             $alphaMap = @{ gaming = 0.65; streaming = 0.25; balanced = 0.45; download = 0.15; maxspeed = 0.15 }

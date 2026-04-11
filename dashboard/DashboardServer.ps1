@@ -28,28 +28,19 @@ $configDir = Join-Path $projectDir "config"
 $logsDir = Join-Path $projectDir "logs"
 
 function Get-UnifiedStats {
-    $result = @{ timestamp = (Get-Date).ToString('o'); version = '6.0' }
+    $result = @{ timestamp = (Get-Date).ToString('o'); version = '5.0' }
     $files = @{
         interfaces = "interfaces.json"
         health     = "health.json"
         proxy      = "proxy-stats.json"
         config     = "config.json"
         safety     = "safety-state.json"
-        watchdog   = "watchdog-heartbeat.json"
     }
     foreach ($key in $files.Keys) {
         $path = Join-Path $configDir $files[$key]
         if (Test-Path $path) {
             try { $result[$key] = Get-Content $path -Raw | ConvertFrom-Json } catch {}
         }
-    }
-    # v6.0 #10: Flag watchdog as stale if heartbeat is older than 15 seconds
-    if ($result.watchdog -and $result.watchdog.lastCheck) {
-        try {
-            $lastBeat = [DateTime]::Parse($result.watchdog.lastCheck)
-            $age = ((Get-Date) - $lastBeat).TotalSeconds
-            $result.watchdog | Add-Member -NotePropertyName 'stale' -NotePropertyValue ($age -gt 15) -Force
-        } catch {}
     }
     return ($result | ConvertTo-Json -Depth 6 -Compress)
 }
@@ -86,57 +77,6 @@ function Get-SafetyState {
     return '{"safeMode":false,"circuitBreakerOpen":false,"proxyHealthy":true,"version":"5.0"}'
 }
 
-function Get-SystemResources {
-    try {
-        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        $totalMb = [math]::Round(([double]$os.TotalVisibleMemorySize / 1KB), 1)
-        $freeMb = [math]::Round(([double]$os.FreePhysicalMemory / 1KB), 1)
-        $usedMb = [math]::Round(($totalMb - $freeMb), 1)
-        $memoryPct = if ($totalMb -gt 0) { [math]::Round(($usedMb / $totalMb) * 100, 1) } else { 0 }
-
-        $procSamples = Get-Process -Name powershell,pwsh -ErrorAction SilentlyContinue
-        $netFusionProcs = @(
-            $procSamples | Where-Object {
-                $_.Path -or $_.ProcessName -match 'powershell|pwsh'
-            }
-        )
-
-        $procStats = foreach ($proc in $netFusionProcs) {
-            @{
-                id = $proc.Id
-                name = $proc.ProcessName
-                cpuSeconds = if ($null -ne $proc.CPU) { [math]::Round([double]$proc.CPU, 2) } else { 0 }
-                workingSetMb = [math]::Round(($proc.WorkingSet64 / 1MB), 1)
-                privateMemoryMb = [math]::Round(($proc.PrivateMemorySize64 / 1MB), 1)
-                startTime = try { $proc.StartTime.ToString('o') } catch { $null }
-            }
-        }
-
-        $result = @{
-            timestamp = (Get-Date).ToString('o')
-            cpu = @{
-                logicalProcessors = [int]$env:NUMBER_OF_PROCESSORS
-                processCpuSeconds = [math]::Round((($procStats | Measure-Object -Property cpuSeconds -Sum).Sum), 2)
-            }
-            memory = @{
-                totalMb = $totalMb
-                usedMb = $usedMb
-                freeMb = $freeMb
-                usedPercent = $memoryPct
-            }
-            powershellProcesses = $procStats
-        }
-
-        return ($result | ConvertTo-Json -Depth 4 -Compress)
-    } catch {
-        return (@{
-            timestamp = (Get-Date).ToString('o')
-            error = 'resource_query_failed'
-            message = $_.Exception.Message
-        } | ConvertTo-Json -Depth 3 -Compress)
-    }
-}
-
 function Get-Telemetry {
     $result = @{ timestamp = (Get-Date).ToString('o') }
     $healthPath = Join-Path $configDir "health.json"
@@ -169,10 +109,7 @@ function Set-Mode {
     if (Test-Path $cfgFile) {
         $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
         $cfg.mode = $Mode
-        # v6.0: Atomic write to prevent truncation on disk contention
-        $tmp = [IO.Path]::GetTempFileName()
-        $cfg | ConvertTo-Json -Depth 4 | Set-Content $tmp -Force -Encoding UTF8
-        Move-Item $tmp $cfgFile -Force
+        $cfg | ConvertTo-Json -Depth 4 | Set-Content $cfgFile -Force -Encoding UTF8
     }
 }
 
@@ -189,10 +126,7 @@ function Set-SafeMode {
         } catch {}
     }
     $state.safeMode = $Enabled
-    # v6.0: Atomic write to prevent truncation
-    $tmp = [IO.Path]::GetTempFileName()
-    $state | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
-    Move-Item $tmp $safetyFile -Force
+    $state | ConvertTo-Json -Depth 3 -Compress | Set-Content $safetyFile -Force -Encoding UTF8
 }
 
 function Reset-LearningData {
@@ -205,28 +139,21 @@ function Reset-LearningData {
         recommendations = @{}
         patterns = @()
     }
-    # v6.0: Atomic write
-    $tmp = [IO.Path]::GetTempFileName()
-    $empty | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
-    Move-Item $tmp $learningFile -Force
+    $empty | ConvertTo-Json -Depth 3 -Compress | Set-Content $learningFile -Force -Encoding UTF8
 }
 
 function Send-TcpResponse {
     param(
         [System.IO.Stream]$Stream, [int]$StatusCode, [string]$StatusText,
-        [string]$ContentType, [byte[]]$Body,
-        [string[]]$ExtraHeaders = @()
+        [string]$ContentType, [byte[]]$Body
     )
     $headers  = "HTTP/1.1 $StatusCode $StatusText`r`n"
     $headers += "Content-Type: $ContentType`r`n"
     $headers += "Content-Length: $($Body.Length)`r`n"
     $headers += "Access-Control-Allow-Origin: *`r`n"
     $headers += "Access-Control-Allow-Methods: GET, POST, OPTIONS`r`n"
-    $headers += "Access-Control-Allow-Headers: Content-Type, Authorization, X-NetFusion-Token`r`n"
+    $headers += "Access-Control-Allow-Headers: Content-Type`r`n"
     $headers += "Cache-Control: no-cache`r`n"
-    foreach ($header in $ExtraHeaders) {
-        $headers += "$header`r`n"
-    }
     $headers += "Connection: close`r`n`r`n"
     $hBytes = [System.Text.Encoding]::UTF8.GetBytes($headers)
     $Stream.Write($hBytes, 0, $hBytes.Length)
@@ -251,94 +178,26 @@ function Get-MimeType {
 # --- Main ---
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION DASHBOARD SERVER v6.0                  " -ForegroundColor Cyan
+Write-Host "    NETFUSION DASHBOARD SERVER v5.0                  " -ForegroundColor Cyan
 Write-Host "    Production Observability + Safety Controls        " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# v6.0 #7: Optional TLS support
-$dashConfig = $null
-$dashTLS = $false
-$tlsCert = $null
-$dashAllowLAN = $false
-$dashToken = $null
-$cfgPath = Join-Path $configDir "config.json"
-if (Test-Path $cfgPath) {
-    try { $dashConfig = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch {}
-}
-
-# v6.0 #7: LAN access with token auth
-if ($dashConfig -and $dashConfig.dashboardAllowLAN -eq $true) {
-    $dashAllowLAN = $true
-    $tokenFile = Join-Path $configDir "dashboard-token.txt"
-    if (Test-Path $tokenFile) {
-        $dashToken = (Get-Content $tokenFile -Raw).Trim()
-        Write-Host "  [Auth] LAN access ENABLED -- token required (X-NetFusion-Token header)" -ForegroundColor Yellow
-    } else {
-        Write-Host "  [Auth] WARNING: LAN access enabled but no token file found! Generate one with Setup-NetFusion.ps1" -ForegroundColor Red
-    }
-}
-
-if ($dashConfig -and $dashConfig.dashboardTLS -eq $true) {
-    $certPath = Join-Path $configDir "dashboard-cert.pfx"
-    # v6.0 #8: Random cert password stored in file, not hardcoded in source
-    $certPassFile = Join-Path $configDir "dashboard-cert-pass.txt"
-    if (-not (Test-Path $certPassFile)) {
-        $certPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
-        $certPass | Set-Content $certPassFile -Force
-    } else {
-        $certPass = (Get-Content $certPassFile -Raw).Trim()
-    }
-    
-    if (-not (Test-Path $certPath)) {
-        Write-Host "  [TLS] Generating self-signed certificate..." -ForegroundColor Yellow
-        try {
-            $cert = New-SelfSignedCertificate `
-                -DnsName "localhost","127.0.0.1" `
-                -CertStoreLocation "Cert:\CurrentUser\My" `
-                -FriendlyName "NetFusion Dashboard" `
-                -NotAfter (Get-Date).AddYears(5) `
-                -KeyExportPolicy Exportable `
-                -KeySpec Signature `
-                -KeyAlgorithm RSA -KeyLength 2048
-            
-            $secPass = ConvertTo-SecureString -String $certPass -Force -AsPlainText
-            Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $certPath -Password $secPass | Out-Null
-            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
-            Write-Host "  [TLS] Certificate saved to $certPath" -ForegroundColor Green
-        } catch {
-            Write-Host "  [TLS] Certificate generation failed: $_" -ForegroundColor Red
-            Write-Host "  [TLS] Falling back to plain HTTP" -ForegroundColor Yellow
-        }
-    }
-    
-    if (Test-Path $certPath) {
-        try {
-            $secPass = ConvertTo-SecureString -String $certPass -Force -AsPlainText
-            $tlsCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath, $secPass)
-            $dashTLS = $true
-            Write-Host "  [TLS] Certificate loaded (expires $($tlsCert.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Green
-        } catch {
-            Write-Host "  [TLS] Failed to load certificate: $_" -ForegroundColor Red
-        }
-    }
-}
-
 $listener = $null
 try {
-    # v6.0 #7: Bind to Any for LAN access, Loopback for local-only
-    $bindAddr = if ($dashAllowLAN) { [System.Net.IPAddress]::Any } else { [System.Net.IPAddress]::Loopback }
-    $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Port)
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
     $listener.Start()
-
-    $proto = if ($dashTLS) { "https" } else { "http" }
-    $bindLabel = if ($dashAllowLAN) { "0.0.0.0" } else { "127.0.0.1" }
-    Write-Host "  Dashboard: ${proto}://${bindLabel}:${Port}" -ForegroundColor Green
-    if ($dashTLS) { Write-Host "  TLS: ENABLED (self-signed)" -ForegroundColor Green }
-    else          { Write-Host "  TLS: disabled (set dashboardTLS=true in config to enable)" -ForegroundColor DarkGray }
-    if ($dashAllowLAN) { Write-Host "  Access: LAN (token-protected)" -ForegroundColor Yellow }
-    else               { Write-Host "  Access: loopback only" -ForegroundColor Green }
+    
+    $tokenPath = Join-Path $configDir "dashboard-token.txt"
+    if (-not (Test-Path $tokenPath)) {
+        $global:DashToken = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 14 | ForEach-Object {[char]$_})
+        $global:DashToken | Set-Content $tokenPath -Force
+    } else {
+        $global:DashToken = (Get-Content $tokenPath -Raw).Trim()
+    }
+    
+    Write-Host "  Dashboard: http://127.0.0.1:${Port}?token=$global:DashToken" -ForegroundColor Green
     Write-Host "  APIs: /api/stream | /api/stats | /api/safety" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
@@ -360,21 +219,7 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
-        $rawStream = $client.GetStream()
-        $stream = $rawStream
-        
-        # v6.0 #7: Wrap in SslStream if TLS is enabled
-        if ($dashTLS -and $tlsCert) {
-            try {
-                $sslStream = New-Object System.Net.Security.SslStream($rawStream, $false)
-                $sslStream.AuthenticateAsServer($tlsCert, $false, [System.Security.Authentication.SslProtocols]::Tls12, $false)
-                $stream = $sslStream
-            } catch {
-                try { $rawStream.Close(); $client.Close() } catch {}
-                continue
-            }
-        }
-        
+        $stream = $client.GetStream()
         $stream.ReadTimeout = 5000
         $suppressClose = $false
 
@@ -394,18 +239,28 @@ try {
                 continue
             }
 
-            # Pre-parse query parameters
+            # Pre-parse query parameters and headers
             $parsedPath = $path.Split('?')[0]
+            $queryString = if ($path.Contains('?')) { $path.Split('?')[1] } else { '' }
+            $tokenParam = if ($queryString -match 'token=([^&]+)') { $matches[1] } else { '' }
+            
+            $headerToken = ''
+            foreach ($line in ($requestText -split "`r`n")) {
+                if ($line -match '^X-NetFusion-Token:\s*(.+)$') { $headerToken = $matches[1].Trim() }
+            }
+            
+            $providedToken = if ($tokenParam) { $tokenParam } else { $headerToken }
 
-            # v6.0 #7: Token auth for LAN access -- enforce on API and dashboard pages
-            if ($dashAllowLAN -and $dashToken -and ($parsedPath -match '^/api/' -or $parsedPath -eq '/' -or $parsedPath -eq '/index.html')) {
-                $tokenHeader = $null
-                foreach ($hline in ($requestText -split "`r`n")) {
-                    if ($hline -match '^X-NetFusion-Token:\s*(.+)$') { $tokenHeader = $Matches[1].Trim(); break }
-                }
-                if ($tokenHeader -ne $dashToken) {
-                    $errBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized","message":"Valid X-NetFusion-Token header required"}')
-                    Send-TcpResponse -Stream $stream -StatusCode 401 -StatusText 'Unauthorized' -ContentType 'application/json' -Body $errBody
+            # Auth Check for ALL requests
+            if ($providedToken -ne $global:DashToken) {
+                if ($parsedPath -eq '/' -or $parsedPath -eq '/index.html') {
+                    $loginHtml = "<html><head><title>NetFusion Login</title><style>body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;} .box{background:#161b22;padding:40px;border-radius:8px;border:1px solid #30363d;text-align:center;} input{padding:10px;margin-top:20px;width:300px;background:#0d1117;border:1px solid #30363d;color:white;border-radius:4px;} button{padding:10px 20px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;margin-top:15px;}</style></head><body><div class='box'><h2>NetFusion Dashboard</h2><p>Please enter your access token (found in the console).</p><input type='password' id='tok' placeholder='Token...'><br><button onclick='login()'>Login</button></div><script>function login(){ var t=document.getElementById('tok').value; if(t) window.location.href='/?token='+encodeURIComponent(t); }</script></body></html>"
+                    $body = [System.Text.Encoding]::UTF8.GetBytes($loginHtml)
+                    Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'text/html; charset=utf-8' -Body $body
+                    continue
+                } else {
+                    $err = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
+                    Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json' -Body $err
                     continue
                 }
             }
@@ -574,7 +429,7 @@ try {
                     }
                 }
                 '/api/resources' {
-                    $json = Get-SystemResources
+                    $json = Get-SafetyState
                     $body = [System.Text.Encoding]::UTF8.GetBytes($json)
                     Send-TcpResponse -Stream $stream -StatusCode 200 -StatusText 'OK' -ContentType 'application/json; charset=utf-8' -Body $body
                 }

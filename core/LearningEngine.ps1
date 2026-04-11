@@ -265,29 +265,6 @@ function Update-Recommendations {
         updatedAt = (Get-Date).ToString('o')
         confidence = if ($profiles.Values | Where-Object { $_.totalSamples -ge $minSamples }) { 'high' } else { 'low' }
     }
-
-    # v6.0 #6: Track recommendation effectiveness — compare latency before/after adoption
-    $prevSnapshot = $LearningData['_recSnapshot']
-    if ($prevSnapshot -and $prevSnapshot.Count -gt 0) {
-        $effectiveness = @{}
-        foreach ($key in $profiles.Keys) {
-            $p = $profiles[$key]
-            $prevLat = if ($prevSnapshot.ContainsKey($p.name)) { $prevSnapshot[$p.name] } else { 0 }
-            $curLat = $p.avgLatency
-            if ($prevLat -gt 0 -and $curLat -gt 0) {
-                # Positive = improvement (latency decreased), Negative = regression
-                $delta = [math]::Round($prevLat - $curLat, 1)
-                $pct = [math]::Round(($delta / [math]::Max(1, $prevLat)) * 100, 1)
-                $effectiveness[$p.name] = @{ latencyDelta = $delta; improvementPct = $pct }
-            }
-        }
-        $LearningData.recommendations['effectiveness'] = $effectiveness
-    }
-
-    # Snapshot current latencies for next cycle comparison
-    $snapshot = @{}
-    foreach ($key in $profiles.Keys) { $snapshot[$profiles[$key].name] = $profiles[$key].avgLatency }
-    $LearningData['_recSnapshot'] = $snapshot
 }
 
 function Apply-Decay {
