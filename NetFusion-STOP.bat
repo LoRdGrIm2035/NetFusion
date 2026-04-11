@@ -28,8 +28,13 @@ taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
 
+<<<<<<< HEAD
 :: Fallback: kill by CommandLine matching DualWifi + known script names
 powershell -ExecutionPolicy Bypass -Command "Get-WmiObject Win32_Process -Filter 'Name=''powershell.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'DualWifi' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Write-Host ('  Killing PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+=======
+:: Fallback: kill by CommandLine matching NetFusion + known script names
+powershell -ExecutionPolicy Bypass -Command "& { Get-CimInstance Win32_Process -Filter 'Name=''powershell.exe'' OR Name=''pwsh.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Write-Host ('  Killing PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } }"
+>>>>>>> origin/main
 ping -n 2 127.0.0.1 >nul
 echo        Done
 
@@ -45,7 +50,11 @@ echo        Done
 :: STEP 3: Restore Default Networking
 :: =========================================================
 echo  [3/6] Restoring default routing...
+<<<<<<< HEAD
 powershell -ExecutionPolicy Bypass -Command "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue }"
+=======
+powershell -ExecutionPolicy Bypass -Command "& { Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue } }"
+>>>>>>> origin/main
 powershell -ExecutionPolicy Bypass -File "%~dp0core\Cleanup-OnCrash.ps1"
 echo        Done
 
@@ -60,7 +69,11 @@ powershell -ExecutionPolicy Bypass -Command "$k = 'HKCU:\Software\DownloadManage
 :: STEP 5: Clean state files
 :: =========================================================
 echo  [5/6] Cleaning up engine state...
+<<<<<<< HEAD
 powershell -ExecutionPolicy Bypass -Command "$f='%~dp0config\proxy-stats.json'; @{running=$false;timestamp=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8; Remove-Item '%~dp0config\safety-state.json' -Force -ErrorAction SilentlyContinue"
+=======
+powershell -ExecutionPolicy Bypass -Command "& { $f='%~dp0config\proxy-stats.json'; @{running=$false;timestamp=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8; Remove-Item '%~dp0config\safety-state.json' -Force -ErrorAction SilentlyContinue }"
+>>>>>>> origin/main
 echo        Done
 
 :: =========================================================

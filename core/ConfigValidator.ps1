@@ -82,8 +82,14 @@ Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
 
 # Validate proxy settings
 if ($config.proxy) {
+<<<<<<< HEAD
     Check-Number $config.proxy 'minThreads' 4 64 16
     Check-Number $config.proxy 'maxThreads' 8 128 64
+=======
+    Check-Number $config.proxy 'minThreads' 4 64 32
+    Check-Number $config.proxy 'maxThreads' 8 256 256
+    Check-Number $config.proxy 'maxConcurrentPerAdapter' 4 256 48
+>>>>>>> origin/main
     Check-Number $config.proxy 'bufferSize' 8192 1048576 65536
     Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
     Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 300
@@ -103,12 +109,16 @@ if ($config.safety) {
     }
 }
 
+<<<<<<< HEAD
 # Check traffic rules
 if ($config.trafficRules) {
     foreach ($category in $config.trafficRules.PSObject.Properties.Name) {
         Check-Enum $config.trafficRules.$category 'mode' $validModes 'maxspeed'
     }
 }
+=======
+# trafficRules section was removed in v6.0 (proxy has no process-awareness at TCP level)
+>>>>>>> origin/main
 
 if ($warnings -gt 0) {
     try {

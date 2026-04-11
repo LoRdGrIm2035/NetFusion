@@ -1,6 +1,10 @@
 <#
 .SYNOPSIS
+<<<<<<< HEAD
     SmartProxy v5.0 -- Production-grade intelligent connection orchestration engine.
+=======
+    SmartProxy v6.0 -- Production-grade intelligent connection orchestration engine.
+>>>>>>> origin/main
 .DESCRIPTION
     Local HTTP/HTTPS proxy with safety-first design:
       - Session affinity: same host maps to same adapter within TTL window
@@ -38,6 +42,7 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
     weights          = @()
+<<<<<<< HEAD
     connectionCounts = [hashtable]::Synchronized(@{})
     successCounts    = [hashtable]::Synchronized(@{})
     failCounts       = [hashtable]::Synchronized(@{})
@@ -46,6 +51,16 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     activeConnections = 0        # v5.1: live active connection count
     activePerAdapter  = [hashtable]::Synchronized(@{})      # v5.1: per-adapter active counts
     activePerHost     = [hashtable]::Synchronized(@{})      # v5.1: per-host active counts for dynamic bulk detection
+=======
+    connectionCounts = @{}
+    successCounts    = @{}
+    failCounts       = @{}
+    totalConnections = 0
+    totalFails       = 0
+    activeConnections = 0        # v6.0: live active connection count
+    activePerAdapter  = [hashtable]::Synchronized(@{})      # v6.0: per-adapter active counts
+    activePerHost     = [hashtable]::Synchronized(@{})      # v6.0: per-host active counts for dynamic bulk detection
+>>>>>>> origin/main
     currentMode      = 'maxspeed'
     rrIndex          = 0
     connectTimeout   = 5000
@@ -57,11 +72,20 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     decisionsFile    = $decisionsFile
     safetyFile       = $safetyFile
     port             = $Port
+<<<<<<< HEAD
     # v5.0 Intelligence State
     adapterHealth    = @{}
     degradationFlags = @{}
     connectionTypes  = [hashtable]::Synchronized(@{})
     decisions        = @()
+=======
+    # v6.0 Intelligence State
+    adapterHealth    = @{}
+    degradationFlags = @{}
+    connectionTypes  = @{}
+    decisions        = @()
+    decisionQueue    = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+>>>>>>> origin/main
     maxDecisions     = 100
     bandwidthEstimates = @{}
     activeConns      = @{}
@@ -72,6 +96,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'gaming'      = 8192     # 8KB for gaming (low latency)
         'default'     = 131072   # 128KB default
     }
+<<<<<<< HEAD
     # v5.0 Session Affinity
     sessionMap     = [hashtable]::Synchronized(@{})    # { "host:port" -> @{ adapter=Name; time=DateTime } }
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
@@ -82,11 +107,21 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         voice  = @(3478, 3479, 3480, 5004, 5005, 5060, 5061)
         bulk   = @(20, 21, 22, 8080, 8443, 9000, 9090)
     }
+=======
+    # v6.0 Session Affinity
+    sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
+    # v6.0 Safety
+    safeMode       = $false
+    # v6.0 #5: Per-adapter connection cap
+    maxConcurrentPerAdapter = 48
+>>>>>>> origin/main
 })
 
 function Write-ProxyEvent {
     param([string]$Message)
     try {
+<<<<<<< HEAD
         $ef = $global:ProxyState.eventsFile
         $events = @()
         if (Test-Path $ef) {
@@ -97,6 +132,27 @@ function Write-ProxyEvent {
         $events = @($evt) + $events
         if ($events.Count -gt 200) { $events = $events[0..199] }
         @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $ef -Force -Encoding UTF8 -ErrorAction SilentlyContinue
+=======
+        # v6.0 Fix #9: Use mutex for cross-process coordination (matching LearningEngine/InterfaceMonitor)
+        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+        try {
+            $mutex.WaitOne(3000) | Out-Null
+            $ef = $global:ProxyState.eventsFile
+            $events = @()
+            if (Test-Path $ef) {
+                $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($data -and $data.events) { $events = @($data.events) }
+            }
+            $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
+            $events = @($evt) + $events
+            if ($events.Count -gt 200) { $events = $events[0..199] }
+            $tmp = [IO.Path]::GetTempFileName()
+            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $ef -Force
+        } finally {
+            $mutex.ReleaseMutex()
+        }
+>>>>>>> origin/main
     } catch {}
 }
 
@@ -129,7 +185,11 @@ function Update-AdaptersAndWeights {
     $s = $global:ProxyState
     $s.adapters = @(Get-ProxyAdapters)
 
+<<<<<<< HEAD
     # v5.0: Check safe mode
+=======
+    # v6.0: Check safe mode
+>>>>>>> origin/main
     if (Test-Path $s.safetyFile) {
         try {
             $safety = Get-Content $s.safetyFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -170,6 +230,19 @@ function Update-AdaptersAndWeights {
         try { $s.currentMode = (Get-Content $s.configFile -Raw | ConvertFrom-Json).mode } catch {}
     }
 
+<<<<<<< HEAD
+=======
+    # v6.0: Load learning engine recommendations to bias weights
+    $learningRec = $null
+    $learningPath = Join-Path $projectDir "config\learning-data.json"
+    if (Test-Path $learningPath) {
+        try {
+            $lData = Get-Content $learningPath -Raw | ConvertFrom-Json
+            if ($lData -and $lData.recommendations) { $learningRec = $lData.recommendations }
+        } catch {}
+    }
+
+>>>>>>> origin/main
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
@@ -181,10 +254,21 @@ function Update-AdaptersAndWeights {
 
             switch ($s.currentMode) {
                 'maxspeed' {
+<<<<<<< HEAD
                     $w = [math]::Max(1.0, ($sc / 100) * 5.0)
                     if ($a.Type -eq 'Ethernet') { $w *= 2.0 }
                     if ($h.Jitter -gt 30) { $w *= 0.7 }
                     elseif ($h.Jitter -gt 15) { $w *= 0.85 }
+=======
+                    $speedMbps = if ($a.Speed -gt 0) { [double]$a.Speed } else { 100.0 }
+                    $speedNorm = [math]::Min(1.0, $speedMbps / 1000.0)
+                    $healthNorm = $sc / 100.0
+                    $w = [math]::Max(0.8, (($healthNorm * 0.65) + ($speedNorm * 0.35)) * 6.0)
+                    if ($a.Type -eq 'Ethernet') { $w *= 1.75 }
+                    if ($h.Jitter -gt 60) { $w *= 0.7 }
+                    elseif ($h.Jitter -gt 30) { $w *= 0.85 }
+                    elseif ($h.Jitter -gt 15) { $w *= 0.93 }
+>>>>>>> origin/main
                 }
                 'download' {
                     $w = [math]::Max(0.5, ($a.Speed / 100) * ($sc / 100))
@@ -214,6 +298,22 @@ function Update-AdaptersAndWeights {
             elseif ($h.Trend -gt 1) { $w *= 1.15 }
         }
 
+<<<<<<< HEAD
+=======
+        # v6.0: Apply learning engine recommendation boost
+        if ($learningRec) {
+            # Map mode -> recommendation field; check if this adapter is the recommended one
+            $recName = switch ($s.currentMode) {
+                'maxspeed'  { $learningRec.bulk }
+                'download'  { $learningRec.bulk }
+                'streaming' { $learningRec.streaming }
+                'gaming'    { $learningRec.gaming }
+                default     { $learningRec.bulk }
+            }
+            if ($recName -and $recName -eq $a.Name) { $w *= 1.2 }  # 20% boost to learned-best adapter
+        }
+
+>>>>>>> origin/main
         $weights += [math]::Max(0.1, $w)
         if (-not $s.connectionCounts.ContainsKey($a.Name)) {
             $s.connectionCounts[$a.Name] = 0
@@ -245,6 +345,7 @@ function Update-ProxyStats {
     foreach ($a in $s.adapters) {
         $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
     }
+<<<<<<< HEAD
     @{
         running = $true; port = $s.port; mode = $s.currentMode
         totalConnections = $s.totalConnections; totalFailures = $s.totalFails
@@ -252,10 +353,27 @@ function Update-ProxyStats {
         activePerAdapter = $activePerAdapterSnap
         adapterCount = $s.adapters.Count; adapters = $aStats
         connectionTypes = $s.connectionTypes
+=======
+    $activeConnectionTotal = 0
+    foreach ($value in $activePerAdapterSnap.Values) {
+        $activeConnectionTotal += [int]$value
+    }
+    # Snapshot connectionTypes to prevent ConvertTo-Json crash from concurrent mutation
+    $connTypeSnap = @{}
+    foreach ($k in @($s.connectionTypes.Keys)) { $connTypeSnap[$k] = $s.connectionTypes[$k] }
+    @{
+        running = $true; port = $s.port; mode = $s.currentMode
+        totalConnections = $s.totalConnections; totalFailures = $s.totalFails
+        activeConnections = $activeConnectionTotal
+        activePerAdapter = $activePerAdapterSnap
+        adapterCount = $s.adapters.Count; adapters = $aStats
+        connectionTypes = $connTypeSnap
+>>>>>>> origin/main
         safeMode = $s.safeMode
         sessionMapSize = $s.sessionMap.Count
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
+<<<<<<< HEAD
     } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.statsFile -Force -ErrorAction SilentlyContinue
 
     try {
@@ -277,15 +395,65 @@ function Clear-ExpiredSessions {
     foreach ($key in $expired) {
         $s.sessionMap.Remove($key)
     }
+=======
+    } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+        # v6.0: Atomic write — prevents DashboardServer SSE from reading a half-written file
+        $tmp = [IO.Path]::GetTempFileName()
+        $_ | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $s.statsFile -Force
+    }
+
+    try {
+        while ($s.decisionQueue.Count -gt $s.maxDecisions) {
+            $discardedDecision = $null
+            $s.decisionQueue.TryDequeue([ref]$discardedDecision) | Out-Null
+        }
+
+        $decisionSnapshot = @($s.decisionQueue.ToArray())
+        [array]::Reverse($decisionSnapshot)
+        $s.decisions = $decisionSnapshot
+
+        @{ decisions = $decisionSnapshot } | ConvertTo-Json -Depth 3 -Compress | ForEach-Object {
+            $tmp = [IO.Path]::GetTempFileName()
+            $_ | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $s.decisionsFile -Force
+        }
+    } catch {}
+}
+
+# v6.0: Clean expired session affinity entries
+function Clear-ExpiredSessions {
+    $s = $global:ProxyState
+    $now = Get-Date
+    foreach ($entryKvp in $s.sessionMap.GetEnumerator()) {
+        $key = $entryKvp.Key
+        $entry = $entryKvp.Value
+        if ($entry -and $entry.time -and (($now - $entry.time).TotalSeconds -gt $s.sessionTTL)) {
+            $removedEntry = $null
+            $s.sessionMap.TryRemove($key, [ref]$removedEntry) | Out-Null
+        }
+    }
+>>>>>>> origin/main
 }
 
 # ===== Connection Handler ScriptBlock (runs in separate runspace) =====
 $HandlerScript = {
     param($ClientSocket, $State)
 
+<<<<<<< HEAD
     $connAdapter = $null  # track which adapter this connection uses
     try {
         # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
+=======
+    # v6.0: Port classification tables (must be defined inside scriptblock for runspace isolation)
+    $gamingPorts = @(3074, 3478, 3479, 25565, 27015, 27016)
+    $voicePorts  = @(3478, 3479, 5004, 5060, 50000)
+    $bulkPorts   = @(20, 21, 22, 989, 990)
+
+    $connAdapter = $null  # track which adapter this connection uses
+    try {
+        # v6.0: Safe mode check -- if active, act as simple pass-through on default adapter
+>>>>>>> origin/main
         $isSafeMode = $State.safeMode
 
         $clientStream = $ClientSocket.GetStream()
@@ -300,7 +468,11 @@ $HandlerScript = {
         $parts = $lines[0] -split ' '
         $method = $parts[0].ToUpper()
 
+<<<<<<< HEAD
         # ===== v5.0: Health check endpoint for SafetyController =====
+=======
+        # ===== v6.0: Health check endpoint for SafetyController =====
+>>>>>>> origin/main
         if ($method -eq 'GET' -and $parts.Count -ge 2 -and $parts[1] -eq '/health') {
             $resp = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 2`r`nConnection: close`r`n`r`nOK")
             $clientStream.Write($resp, 0, $resp.Length)
@@ -339,19 +511,28 @@ $HandlerScript = {
             $rPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port } else { 80 }
         }
 
+<<<<<<< HEAD
         # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v5.1
 
         # v5.1: Track host concurrency for dynamic download manager detection
+=======
+        # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v6.0
+
+        # v6.0: Track host concurrency for dynamic download manager detection
+>>>>>>> origin/main
         $hostKey = $targetHost
         if (-not $State.activePerHost.ContainsKey($hostKey)) { $State.activePerHost[$hostKey] = 0 }
         $State.activePerHost[$hostKey]++
         $activeHostCount = $State.activePerHost[$hostKey]
 
+<<<<<<< HEAD
         $portClasses = $State.portClasses
         $gamingPorts = if ($portClasses -and $portClasses.gaming) { @($portClasses.gaming) } else { @() }
         $voicePorts = if ($portClasses -and $portClasses.voice) { @($portClasses.voice) } else { @() }
         $bulkPorts = if ($portClasses -and $portClasses.bulk) { @($portClasses.bulk) } else { @() }
 
+=======
+>>>>>>> origin/main
         if ($rPort -in $gamingPorts) { 
             $connType = 'gaming' 
         } elseif ($rPort -in $voicePorts) { 
@@ -368,15 +549,65 @@ $HandlerScript = {
             $connType = 'bulk' 
         }
 
+<<<<<<< HEAD
+=======
+        # Telemetry counters — approximate under high concurrency, not used for routing correctness
+>>>>>>> origin/main
         if (-not $State.connectionTypes.ContainsKey($connType)) { $State.connectionTypes[$connType] = 0 }
         $State.connectionTypes[$connType]++
 
         # ===== Adapter Selection =====
+<<<<<<< HEAD
         $avail = @(); $aw = @()
         for ($i = 0; $i -lt $State.adapters.Count; $i++) {
             $avail += $State.adapters[$i]
             $aw += $State.weights[$i]
         }
+=======
+        $availableEntries = @()
+        for ($i = 0; $i -lt $State.adapters.Count; $i++) {
+            $availableEntries += [pscustomobject]@{
+                Adapter = $State.adapters[$i]
+                Weight  = if ($i -lt $State.weights.Count) { [double]$State.weights[$i] } else { 1.0 }
+            }
+        }
+        # v6.0 #5: Filter out adapters that hit maxConcurrentPerAdapter cap
+        $maxPerAdapter = if ($State.maxConcurrentPerAdapter -gt 0) { $State.maxConcurrentPerAdapter } else { 48 }
+        $availableEntries = @($availableEntries | Where-Object {
+            $active = if ($State.activePerAdapter.ContainsKey($_.Adapter.Name)) { [int]$State.activePerAdapter[$_.Adapter.Name] } else { 0 }
+            $active -lt $maxPerAdapter
+        })
+        if ($connType -eq 'bulk' -and $availableEntries.Count -gt 1) {
+            $bulkHealthyEntries = @($availableEntries | Where-Object {
+                $h = $State.adapterHealth[$_.Adapter.Name]
+                if (-not $h) { return $true }
+
+                $scoreOk = (-not $h.Score) -or ([double]$h.Score -ge 55)
+                $latOk = (-not $h.LatencyEWMA) -or ([double]$h.LatencyEWMA -lt 250)
+                $jitterOk = (-not $h.Jitter) -or ([double]$h.Jitter -lt 100)
+                $stableEnough = $h.IsDegrading -ne $true
+                return ($scoreOk -and $latOk -and $jitterOk -and $stableEnough)
+            })
+            if ($bulkHealthyEntries.Count -ge 1 -and $bulkHealthyEntries.Count -lt $availableEntries.Count) {
+                $availableEntries = $bulkHealthyEntries
+            }
+        }
+        if ($availableEntries.Count -eq 0) {
+            # All saturated — fall back to full list so connection isn't dropped
+            $availableEntries = @(
+                for ($i = 0; $i -lt $State.adapters.Count; $i++) {
+                    if ($State.adapters[$i].IP) {
+                        [pscustomobject]@{
+                            Adapter = $State.adapters[$i]
+                            Weight  = if ($i -lt $State.weights.Count) { [double]$State.weights[$i] } else { 1.0 }
+                        }
+                    }
+                }
+            )
+        }
+        $avail = @($availableEntries | ForEach-Object { $_.Adapter })
+        $aw = @($availableEntries | ForEach-Object { $_.Weight })
+>>>>>>> origin/main
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
         $State.totalConnections++
         $State.activeConnections++
@@ -391,6 +622,10 @@ $HandlerScript = {
             # Safe mode: use first adapter only (most reliable, default Windows behavior)
             $selectionReason = 'safe-mode(single-adapter)'
         } elseif ($avail.Count -eq 1) {
+<<<<<<< HEAD
+=======
+            $State.connectionCounts[$avail[0].Name]++
+>>>>>>> origin/main
             $selectionReason = 'only-adapter'
         } else {
             # [V5-FIX-4] Resolve Round-Robin vs Session Affinity
@@ -401,8 +636,13 @@ $HandlerScript = {
                 $skipAffinity = $true
             } else {
                 $skipAffinity = $false
+<<<<<<< HEAD
                 if ($State.sessionMap.ContainsKey($sessionKey)) {
                     $cached = $State.sessionMap[$sessionKey]
+=======
+                $cached = $null
+                if ($State.sessionMap.TryGetValue($sessionKey, [ref]$cached)) {
+>>>>>>> origin/main
                     $elapsed = ((Get-Date) - $cached.time).TotalSeconds
                     if ($elapsed -lt $State.sessionTTL) {
                         $found = $avail | Where-Object { $_.Name -eq $cached.adapter } | Select-Object -First 1
@@ -461,6 +701,7 @@ $HandlerScript = {
                 } else { $adapter = $avail[0] }
                 $selectionReason = "weighted-latency(streaming)"
                 $affinityMode = "new-sticky"
+<<<<<<< HEAD
             } elseif ($connType -eq 'interactive') {
                 # Strict round-robin per NEW HOST
                 $idx = $State.rrIndex % $avail.Count
@@ -488,6 +729,71 @@ $HandlerScript = {
                 }
                 $adapter = $avail[$bestBulkIdx]
                 $selectionReason = "active-load-balanced-bulk"
+=======
+            } elseif ($connType -eq 'voice') {
+                # Voice (SIP/RTP): identical to gaming — lowest latency, single adapter, sticky
+                $bestIdx = 0; $bestScore = -1
+                for ($i = 0; $i -lt $avail.Count; $i++) {
+                    $aHealth = $State.adapterHealth[$avail[$i].Name]
+                    $latScore = 0
+                    if ($aHealth) {
+                        $lat = if ($aHealth.LatencyEWMA -lt 998) { $aHealth.LatencyEWMA } else { 200 }
+                        $latScore = 1000 / [math]::Max(1, $lat)
+                        if ($avail[$i].Type -eq 'Ethernet') { $latScore *= 2 }
+                        if ($aHealth.IsDegrading) { $latScore *= 0.3 }
+                    }
+                    if ($latScore -gt $bestScore) { $bestScore = $latScore; $bestIdx = $i }
+                }
+                $adapter = $avail[$bestIdx]
+                $selectionReason = "lowest-latency(voice)"
+                $affinityMode = "new-sticky"
+            } elseif ($connType -eq 'interactive') {
+                # Strict round-robin per NEW HOST — atomic increment for thread safety
+                $idx = ([System.Threading.Interlocked]::Increment([ref]$State.rrIndex) - 1) % $avail.Count
+                $adapter = $avail[$idx]
+                $selectionReason = "round-robin(new-host)"
+                $affinityMode = "new-sticky"
+            } else {
+                # Bulk Traffic: active-load-aware weighted balancing.
+                # Prefer the stronger link, but do not let "better" collapse into "exclusive"
+                # or we lose the aggregate-speed benefit of multiple concurrent transfers.
+                $candidateScores = @()
+                $bestBulkScore = [double]::MaxValue
+                for ($bi = 0; $bi -lt $avail.Count; $bi++) {
+                    $candidate = $avail[$bi]
+                    $aName  = $candidate.Name
+                    $active = if ($State.activePerAdapter.ContainsKey($aName)) { [int]($State.activePerAdapter[$aName]) } else { 0 }
+                    $aHealth = $State.adapterHealth[$aName]
+                    $baseWeight = if ($bi -lt $aw.Count) { [double]$aw[$bi] } else { 1.0 }
+                    $speedMbps = if ($candidate.Speed -gt 0) { [double]$candidate.Speed } else { 100.0 }
+                    $speedFactor = [math]::Max(0.45, [math]::Min(1.75, $speedMbps / 600.0))
+                    $healthFactor = if ($aHealth -and $aHealth.Score -gt 0) { [math]::Max(0.45, [double]$aHealth.Score / 100.0) } else { 0.6 }
+                    $successFactor = if ($aHealth -and $aHealth.SuccessRate -gt 0) { [math]::Max(0.5, [double]$aHealth.SuccessRate / 100.0) } else { 0.9 }
+                    $jitterPenalty = 1.0
+                    if ($aHealth) {
+                        if ($aHealth.Jitter -gt 80) { $jitterPenalty = 0.6 }
+                        elseif ($aHealth.Jitter -gt 40) { $jitterPenalty = 0.8 }
+                        elseif ($aHealth.Jitter -gt 20) { $jitterPenalty = 0.9 }
+                        if ($aHealth.IsDegrading) { $jitterPenalty *= 0.75 }
+                    }
+                    $capacity = [math]::Max(0.2, $baseWeight * $speedFactor * $healthFactor * $successFactor * $jitterPenalty)
+                    $score = [double]$active / $capacity
+                    $candidateScores += [pscustomobject]@{
+                        Index = $bi
+                        Score = $score
+                        Capacity = $capacity
+                    }
+                    if ($score -lt $bestBulkScore) { $bestBulkScore = $score }
+                }
+                $bulkChoices = @($candidateScores | Where-Object { $_.Score -le ($bestBulkScore + 0.12) })
+                if ($bulkChoices.Count -eq 0) {
+                    $bulkChoices = @($candidateScores | Sort-Object Score | Select-Object -First 1)
+                }
+                $choiceOrdinal = ([System.Threading.Interlocked]::Increment([ref]$State.rrIndex) - 1) % $bulkChoices.Count
+                $chosen = $bulkChoices[$choiceOrdinal]
+                $adapter = $avail[$chosen.Index]
+                $selectionReason = "weighted-capacity-bulk"
+>>>>>>> origin/main
             }
 
             if (-not $skipAffinity) {
@@ -495,6 +801,14 @@ $HandlerScript = {
             }
         }
 
+<<<<<<< HEAD
+=======
+        # v6.0: Track active connection per adapter
+        $connAdapter = $adapter.Name
+        if (-not $State.activePerAdapter.ContainsKey($connAdapter)) { $State.activePerAdapter[$connAdapter] = 0 }
+        $State.activePerAdapter[$connAdapter]++
+
+>>>>>>> origin/main
         # Log decision
         $decision = @{
             time = (Get-Date).ToString('HH:mm:ss')
@@ -504,7 +818,11 @@ $HandlerScript = {
             reason = $selectionReason
             affinity_mode = $affinityMode
         }
+<<<<<<< HEAD
         $State.decisions = @($decision) + @($State.decisions | Select-Object -First ($State.maxDecisions - 1))
+=======
+        $State.decisionQueue.Enqueue($decision)
+>>>>>>> origin/main
 
         # ===== Connect to remote via chosen adapter (with failover) =====
         $remoteClient = $null
@@ -535,6 +853,7 @@ $HandlerScript = {
             }
 
             try {
+<<<<<<< HEAD
                 if ($connAdapter -ne $adapter.Name) {
                     if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
                         $State.activePerAdapter[$connAdapter] = [math]::Max(0, [int]$State.activePerAdapter[$connAdapter] - 1)
@@ -544,6 +863,8 @@ $HandlerScript = {
                     $connAdapter = $adapter.Name
                 }
 
+=======
+>>>>>>> origin/main
                 $remoteClient = New-Object System.Net.Sockets.TcpClient
                 $remoteClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Linger, (New-Object System.Net.Sockets.LingerOption($true, 1)))
                 $remoteClient.SendBufferSize = $bufSize
@@ -631,7 +952,11 @@ $HandlerScript = {
         }
 
     } catch {} finally {
+<<<<<<< HEAD
         # v5.1: Decrement active connection counters
+=======
+        # v6.0: Decrement active connection counters
+>>>>>>> origin/main
         if ($State.activeConnections -gt 0) { $State.activeConnections-- }
         if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
             $State.activePerAdapter[$connAdapter] = [math]::Max(0, $State.activePerAdapter[$connAdapter] - 1)
@@ -645,11 +970,25 @@ $HandlerScript = {
 }
 
 # ===== Dynamic Adaptive Runspace Pool =====
+<<<<<<< HEAD
 # v6.0: Speedtest Burst Optimized Pool
 $minThreads = 32
 $maxThreads = 256
 $currentMaxThreads = 64
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
+=======
+# v6.0: Read thread pool bounds from config.json, with sane defaults
+$cfgProxy = $null
+if (Test-Path $configFile) {
+    try { $cfgProxy = (Get-Content $configFile -Raw | ConvertFrom-Json).proxy } catch {}
+}
+$minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 32 }
+$maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
+$currentMaxThreads = [math]::Min($maxThreads, [math]::Max($minThreads, 64))
+$global:ProxyState.currentMaxThreads = $currentMaxThreads
+# v6.0 #5: Per-adapter concurrent connection cap from config
+$global:ProxyState.maxConcurrentPerAdapter = if ($cfgProxy -and $cfgProxy.maxConcurrentPerAdapter -gt 0) { [int]$cfgProxy.maxConcurrentPerAdapter } else { 48 }
+>>>>>>> origin/main
 
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
 $rsPool.Open()
@@ -658,7 +997,11 @@ $jobs = [System.Collections.Generic.List[object]]::new()
 # ===== Main =====
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
+<<<<<<< HEAD
 Write-Host "    NETFUSION SMART PROXY v5.0                       " -ForegroundColor Cyan
+=======
+Write-Host "    NETFUSION SMART PROXY v6.0                       " -ForegroundColor Cyan
+>>>>>>> origin/main
 Write-Host "    Production Connection Orchestration Engine        " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -689,7 +1032,11 @@ Write-Host ""
 Write-Host "  Configure apps: proxy 127.0.0.1 port ${Port}" -ForegroundColor Yellow
 Write-Host ""
 
+<<<<<<< HEAD
 Write-ProxyEvent "Proxy v5.0 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
+=======
+Write-ProxyEvent "Proxy v6.0 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
+>>>>>>> origin/main
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
@@ -733,9 +1080,21 @@ try {
             }
             
             # [V5-FIX-8] Dynamic Thread Pool Scaling Policy
+<<<<<<< HEAD
             $activeThreads = $activeCount
             $queueDepth = if ($listener.Pending()) { 5 } else { 0 } # Estimate pending requests
             
+=======
+            # SetMaxRunspaces affects future scheduling only; existing runspaces are allowed
+            # to finish, so thread count can temporarily remain above the new cap after scale-down.
+            $activeThreads = $activeCount
+            $queueDepth = if ($listener.Pending()) { 5 } else { 0 } # Estimate pending requests
+            
+            # v6.0 #15 NOTE: SetMaxRunspaces only affects *future* allocation, not active runspaces.
+            # If $currentMaxThreads drops during scale-down, existing runspaces beyond the new cap
+            # will continue running until their connections complete naturally.
+            # This is expected PowerShell RunspacePool behavior — the pool drains gracefully.
+>>>>>>> origin/main
             if ($queueDepth -gt 0 -and $activeThreads -ge ($currentMaxThreads - 2) -and $currentMaxThreads -lt $maxThreads) {
                 $currentMaxThreads = [math]::Min($maxThreads, $currentMaxThreads + 8)
                 $rsPool.SetMaxRunspaces($currentMaxThreads)
@@ -761,7 +1120,11 @@ try {
             $lastCleanup = $now
         }
 
+<<<<<<< HEAD
         # v5.0: Clean expired session affinity entries every 60s
+=======
+        # v6.0: Clean expired session affinity entries every 60s
+>>>>>>> origin/main
         if (($now - $lastSessionClean).TotalSeconds -gt 60) {
             Clear-ExpiredSessions
             $lastSessionClean = $now
@@ -787,7 +1150,11 @@ try {
             $connParts = @()
             foreach ($a in $s.adapters) { $connParts += "$($a.Name):$($s.connectionCounts[$a.Name])" }
             $typeStr = @()
+<<<<<<< HEAD
             foreach ($k in @('bulk','interactive','streaming','gaming')) {
+=======
+            foreach ($k in @('bulk','interactive','streaming','gaming','voice')) {
+>>>>>>> origin/main
                 if ($s.connectionTypes.ContainsKey($k)) { $typeStr += "$k=$($s.connectionTypes[$k])" }
             }
             $safeFlag = if ($s.safeMode) { ' [SAFE]' } else { '' }

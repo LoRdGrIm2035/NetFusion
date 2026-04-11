@@ -75,7 +75,11 @@ echo  ^|   Proxy:      127.0.0.1:8080                      ^|
 echo  ^|   Emergency:  Run NetFusion-SAFE.bat              ^|
 echo  ====================================================+
 echo  System is ready. Auto-launching dashboard...
+<<<<<<< HEAD
 powershell -Command "Start-Sleep -Seconds 1; $t = Get-Content '%~dp0config\dashboard-token.txt' -Raw -ErrorAction SilentlyContinue; if ($t) { Start-Process \"http://127.0.0.1:9090/?token=$($t.Trim())\" } else { Start-Process \"http://127.0.0.1:9090/\" }"
+=======
+powershell -Command "Start-Sleep -Seconds 1; Start-Process 'http://127.0.0.1:9090/'"
+>>>>>>> origin/main
 echo  Press any key to safely close this console...
 echo.
 pause

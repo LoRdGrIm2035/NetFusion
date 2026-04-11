@@ -8,6 +8,7 @@ echo  ^|   Restoring default internet connectivity          ^|
 echo  =====================================================
 echo.
 
+<<<<<<< HEAD
 :: ---- Kill ALL NetFusion processes ----
 echo  [1/6] Killing all NetFusion services...
 taskkill /FI "WINDOWTITLE eq NF-NetworkManager*" /F >nul 2>&1
@@ -23,11 +24,27 @@ timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----
 echo  [2/6] Releasing network ports...
+=======
+:: ---- Kill ALL NetFusion processes (v6.0 titles) ----
+echo  [1/7] Killing all NetFusion services...
+taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
+powershell -ExecutionPolicy Bypass -Command "& { Get-CimInstance Win32_Process -Filter 'Name=''powershell.exe'' OR Name=''pwsh.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } }"
+timeout /t 1 /nobreak >nul
+
+:: ---- Release ports ----
+echo  [2/7] Releasing network ports...
+>>>>>>> origin/main
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":9090" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":8080" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 
 :: ---- Restore IDM ----
+<<<<<<< HEAD
 echo  [3/6] Restoring IDM to direct connection...
+=======
+echo  [3/7] Restoring IDM to direct connection...
+>>>>>>> origin/main
 reg query "HKCU\Software\DownloadManager" >nul 2>&1
 if not errorlevel 1 (
     reg add "HKCU\Software\DownloadManager" /v nProxyMode /t REG_DWORD /d 1 /f >nul 2>&1
@@ -38,12 +55,17 @@ if not errorlevel 1 (
     echo       IDM proxy removed
 )
 
+<<<<<<< HEAD
 :: ---- Remove system proxy (CRITICAL - was missing!) ----
+=======
+:: ---- Remove system proxy (CRITICAL) ----
+>>>>>>> origin/main
 echo  [4/7] Removing system proxy...
 powershell -ExecutionPolicy Bypass -Command "$inetKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; Set-ItemProperty $inetKey 'ProxyEnable' 0 -Type DWord -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyServer' -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyOverride' -Force -ErrorAction SilentlyContinue; Write-Host '       System proxy cleared' -ForegroundColor Green"
 
 :: ---- Restore routes ----
 echo  [5/7] Restoring default routing...
+<<<<<<< HEAD
 net session >nul 2>&1
 if errorlevel 1 (
     powershell -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-ExecutionPolicy Bypass -Command \"Remove-NetRoute -DestinationPrefix 0.0.0.0/1 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 128.0.0.0/1 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 0.0.0.0/2 -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix 64.0.0.0/2 -Confirm:$false -ErrorAction SilentlyContinue; Get-NetAdapter | Where-Object { $_.Status -eq ''Up'' -and $_.InterfaceDescription -notmatch ''Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel'' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue }\"'"
@@ -54,6 +76,13 @@ if errorlevel 1 (
 :: ---- Set safe mode flag ----
 echo  [6/7] Setting safe mode flag...
 powershell -ExecutionPolicy Bypass -Command "$f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='5.0'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8"
+=======
+powershell -ExecutionPolicy Bypass -Command "& { Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '0.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetRoute -DestinationPrefix '64.0.0.0/2' -Confirm:$false -ErrorAction SilentlyContinue; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue } }"
+
+:: ---- Set safe mode flag ----
+echo  [6/7] Setting safe mode flag...
+powershell -ExecutionPolicy Bypass -Command "& { $f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='6.0'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8 }"
+>>>>>>> origin/main
 
 :: ---- Done ----
 echo  [7/7] Verifying internet connectivity...

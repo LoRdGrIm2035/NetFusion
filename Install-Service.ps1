@@ -26,6 +26,11 @@ if ($Install) {
 
     $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$batPath`""
     $trigger = New-ScheduledTaskTrigger -AtLogOn
+<<<<<<< HEAD
+=======
+    # v6.0 #19: 15s delay so network adapters have time to initialize after login/sleep
+    $trigger.Delay = 'PT15S'
+>>>>>>> origin/main
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 

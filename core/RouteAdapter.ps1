@@ -1,6 +1,10 @@
 <#
 .SYNOPSIS
+<<<<<<< HEAD
     RouteAdapter v5.0 -- OS-level networking abstraction layer
+=======
+    RouteAdapter v6.0 -- OS-level networking abstraction layer
+>>>>>>> origin/main
 .DESCRIPTION
     Abstracts all `route add/delete`, `Set-NetIPInterface`, and `Get-NetAdapter` calls.
     Provides robust logging and a dry-run mode for testing.
@@ -23,11 +27,28 @@ function Write-AdapterLog {
     
     try {
         if (-not (Test-Path $adapterEventsFile)) { return }
+<<<<<<< HEAD
         $data = Get-Content $adapterEventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
         $events = if ($data -and $data.events) { @($data.events) } else { @() }
         $events = @(@{ timestamp = $ts; type = 'adapter'; message = "$prefix $Message"; level = $Level }) + $events
         if ($events.Count -gt 200) { $events = $events[0..199] }
         @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $adapterEventsFile -Force -ErrorAction SilentlyContinue
+=======
+        # v6.0 #17: Use mutex + atomic write pattern matching all other loggers
+        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+        try {
+            $mutex.WaitOne(3000) | Out-Null
+            $data = Get-Content $adapterEventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+            $events = if ($data -and $data.events) { @($data.events) } else { @() }
+            $events = @(@{ timestamp = $ts; type = 'adapter'; message = "$prefix $Message"; level = $Level }) + $events
+            if ($events.Count -gt 200) { $events = $events[0..199] }
+            $tmp = [IO.Path]::GetTempFileName()
+            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8
+            Move-Item $tmp $adapterEventsFile -Force
+        } finally {
+            $mutex.ReleaseMutex()
+        }
+>>>>>>> origin/main
     } catch {}
 }
 
@@ -36,7 +57,12 @@ function Get-NetworkAdapters {
     if ($global:RouteAdapterDryRun) {
         Write-Output @()
     } else {
+<<<<<<< HEAD
         $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier' } | Sort-Object InterfaceMetric | Select-Object -First 3
+=======
+        # v6.0: Sort by MacAddress for deterministic adapter ordering across reboots
+        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier' } | Sort-Object MacAddress | Select-Object -First 3
+>>>>>>> origin/main
         Write-Output $adapters
     }
 }
