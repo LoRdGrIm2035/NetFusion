@@ -64,15 +64,19 @@ try {
         } else {
             Write-Host "  [+] QUIC firewall rule already enforcing." -ForegroundColor DarkGray
         }
-        # [FIX-B] Write active firewall rules to sentinel
-        @{ rules = @($ruleName); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $sentinelFile -Force
+        # Atomic sentinel write
+        $tmp = [IO.Path]::GetTempFileName()
+        @{ rules = @($ruleName); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $sentinelFile -Force
     } else {
         if ($existingRule) {
             Write-QuicEvent "Removing QUIC Firewall Rule (Disabled in config)"
             Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
             Write-Host "  [-] QUIC block removed." -ForegroundColor DarkGray
         }
-        @{ rules = @(); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $sentinelFile -Force
+        $tmp = [IO.Path]::GetTempFileName()
+        @{ rules = @(); created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $tmp -Force -Encoding UTF8
+        Move-Item $tmp $sentinelFile -Force
     }
 } catch {
     Write-Host "  [QUIC] Failed to manage firewall bounds: $_" -ForegroundColor Red
