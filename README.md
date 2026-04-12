@@ -294,61 +294,89 @@ Use these files as ground truth:
 
 ## Troubleshooting
 
-<details>
-<summary><strong>Only one adapter carries traffic</strong></summary>
+Use the list below when NetFusion does not behave the way you expect. Each issue includes a visible step-by-step procedure so the guidance shows directly on GitHub.
 
-Check that:
+### 1. Only one adapter carries traffic
 
-- the second adapter has a valid IPv4 address
-- the second adapter has a default route
-- the application is actually using the local proxy
-- the workload opens multiple concurrent connections
-- the adapter is not stuck on an APIPA address such as `169.254.x.x`
+1. Confirm both adapters have valid IPv4 addresses.
 
-</details>
+```powershell
+Get-NetIPAddress -AddressFamily IPv4 |
+Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
+Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
+```
 
-<details>
-<summary><strong>You expected one browser download to equal both links combined</strong></summary>
+2. Confirm both adapters have a default route.
 
-That expectation does not match the current design. Modern browsers often reuse a small number of HTTPS connections, and NetFusion distributes per connection, not per packet.
+```powershell
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
+Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
+```
 
-</details>
+3. Confirm the application is actually using the local proxy at `127.0.0.1:8080`.
 
-<details>
-<summary><strong>Browser traffic is not balancing well</strong></summary>
+4. Test with a workload that opens many concurrent TCP sessions, such as IDM, `aria2`, or a segmented downloader.
 
-Check whether:
+5. Check whether one adapter is stuck on APIPA such as `169.254.x.x`. If it is, follow the recovery steps in section 4 below.
 
-- QUIC blocking is enabled where needed
-- the browser is actually using the configured proxy
-- the traffic pattern contains enough parallel TCP sessions to distribute
+### 2. One browser download does not equal both links combined
 
-</details>
+1. Expect per-connection steering, not per-packet bonding.
 
-<details>
-<summary><strong>An adapter has no gateway or falls back to APIPA</strong></summary>
+2. Remember that modern browsers often reuse a small number of HTTPS sessions.
 
-Use the recovery helpers:
+3. Test with a downloader that opens many parallel connections before concluding that balancing failed.
 
-- `test-wifi4-fix.ps1`
-- `fix-wifi4.ps1`
-- `fix-wifi4-arp.ps1`
+4. Verify real adapter counters instead of relying only on the browser speed display.
 
-Then re-check:
+```powershell
+Get-NetAdapterStatistics -Name 'Wi-Fi 3'
+Get-NetAdapterStatistics -Name 'Wi-Fi 4'
+```
+
+### 3. Browser traffic is not balancing well
+
+1. Confirm the browser is actually configured to use the local proxy.
+
+2. If the browser prefers QUIC or HTTP/3, enable QUIC blocking where needed so traffic stays on TCP and can be proxied.
+
+3. Retry with a traffic pattern that creates many concurrent requests instead of one long-lived connection.
+
+4. Compare adapter counters while the workload is running.
+
+```powershell
+Get-NetAdapterStatistics -Name 'Wi-Fi 3'
+Get-NetAdapterStatistics -Name 'Wi-Fi 4'
+```
+
+### 4. An adapter has no gateway or falls back to APIPA
+
+1. Check the adapter IP and route state.
 
 ```powershell
 Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
 Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 ```
 
-</details>
+2. If the adapter has no valid address or no usable route, run one of the recovery helpers as Administrator.
 
-<details>
-<summary><strong>You need to override a Wi-Fi adapter's default gateway manually</strong></summary>
+- `test-wifi4-fix.ps1`
+- `fix-wifi4.ps1`
+- `fix-wifi4-arp.ps1`
 
-Use this when Windows got a gateway from DHCP, but you still want to force a different default route for one specific adapter.
+3. Re-check the adapter after the recovery script finishes.
 
-### Step-by-step process for any adapter
+```powershell
+Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
+```
+
+4. If the adapter still has no working gateway, inspect the DHCP state and renew or reconnect the adapter before retrying NetFusion.
+
+### 5. Override a Wi-Fi adapter default gateway manually
+
+Use this when Windows received a gateway from DHCP, but you still want to force a different default route for one specific adapter.
 
 1. Open PowerShell as Administrator.
    If Windows returns `Access is denied`, the shell is not elevated.
@@ -401,9 +429,9 @@ Format-Table ifIndex,InterfaceAlias,NextHop,RouteMetric,PolicyStore -AutoSize
 8. Repeat the same process for each adapter you want to override.
    Replace the adapter name, old gateway, and new gateway with the values for that specific device.
 
-### Per-device examples
+Per-device examples:
 
-Example for `Wi-Fi 2`:
+For `Wi-Fi 2`:
 
 ```powershell
 $if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4).InterfaceIndex
@@ -412,7 +440,7 @@ New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0
 Get-NetRoute -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
 
-Example for `Wi-Fi 3`:
+For `Wi-Fi 3`:
 
 ```powershell
 $if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4).InterfaceIndex
@@ -421,7 +449,7 @@ New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0
 Get-NetRoute -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
 
-Example for `Wi-Fi 4`:
+For `Wi-Fi 4`:
 
 ```powershell
 $if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4).InterfaceIndex
@@ -430,25 +458,23 @@ New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0
 Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
 
-Notes:
+Important notes:
 
 - This is a manual route override, not a DHCP lease change.
 - If the adapter is still on DHCP, the old gateway can come back after reconnecting, rebooting, or renewing the lease.
 - If the new gateway IP is not reachable on that subnet, the adapter can lose connectivity.
-- If you want to check whether the new gateway answers before changing routes, test it first:
+- Test the replacement gateway before changing routes if you are not sure it is alive.
 
 ```powershell
 Test-NetConnection 192.168.1.253
 ```
 
-- If you prefer using adapter names directly instead of interface indexes, this also works:
+- If you prefer adapter names instead of interface indexes, this also works:
 
 ```powershell
 Remove-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
 New-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
 ```
-
-</details>
 
 ## Known Limits
 
