@@ -64,6 +64,9 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     decisions        = @()
     maxDecisions     = 100
     bandwidthEstimates = @{}
+    uploadBandwidthEstimates = @{}
+    uploadHostHints  = [hashtable]::Synchronized(@{})
+    uploadHintTTL    = 300
     activeConns      = @{}
     weightRefreshInterval = 2.0
     bufferSizes      = @{
@@ -241,7 +244,9 @@ function Update-AdaptersAndWeights {
             if (-not $hData) { throw "Health data unavailable." }
             $hData.adapters | ForEach-Object {
                 $currentDown = if ($_.DownloadMbps) { [double]$_.DownloadMbps } else { 0.0 }
+                $currentUp = if ($_.UploadMbps) { [double]$_.UploadMbps } else { 0.0 }
                 $prevEstimate = if ($s.bandwidthEstimates.ContainsKey($_.Name)) { [double]$s.bandwidthEstimates[$_.Name] } else { 0.0 }
+                $prevUpEstimate = if ($s.uploadBandwidthEstimates.ContainsKey($_.Name)) { [double]$s.uploadBandwidthEstimates[$_.Name] } else { 0.0 }
                 if ($currentDown -gt 1.0) {
                     $estimate = if ($prevEstimate -gt 0) {
                         [math]::Round(($prevEstimate * 0.65) + ($currentDown * 0.35), 2)
@@ -253,7 +258,19 @@ function Update-AdaptersAndWeights {
                 } else {
                     $estimate = 0.0
                 }
+                if ($currentUp -gt 1.0) {
+                    $upEstimate = if ($prevUpEstimate -gt 0) {
+                        [math]::Round(($prevUpEstimate * 0.65) + ($currentUp * 0.35), 2)
+                    } else {
+                        [math]::Round($currentUp, 2)
+                    }
+                } elseif ($prevUpEstimate -gt 0) {
+                    $upEstimate = [math]::Round($prevUpEstimate * 0.9, 2)
+                } else {
+                    $upEstimate = 0.0
+                }
                 $s.bandwidthEstimates[$_.Name] = $estimate
+                $s.uploadBandwidthEstimates[$_.Name] = $upEstimate
 
                 $health[$_.Name] = @{
                     Score       = $_.HealthScore
@@ -265,7 +282,9 @@ function Update-AdaptersAndWeights {
                     Trend       = if ($_.HealthTrend) { $_.HealthTrend } else { 0 }
                     IsDegrading = if ($_.IsDegrading) { $_.IsDegrading } else { $false }
                     DownloadMbps = if ($_.DownloadMbps) { $_.DownloadMbps } else { 0 }
+                    UploadMbps = if ($_.UploadMbps) { $_.UploadMbps } else { 0 }
                     EstimatedDownMbps = $estimate
+                    EstimatedUpMbps = $upEstimate
                     LinkSpeedMbps = if ($_.LinkSpeedMbps) { $_.LinkSpeedMbps } else { 0 }
                 }
             }
@@ -394,6 +413,7 @@ function Update-ProxyStats {
         connectionTypes = $s.connectionTypes
         safeMode = $s.safeMode
         sessionMapSize = $s.sessionMap.Count
+        uploadHintHostCount = $s.uploadHostHints.Count
         sessionStats = $sessionStats
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
@@ -457,6 +477,30 @@ function Clear-ExpiredSessions {
     }
 
     return $purgedCount
+}
+
+function Clear-ExpiredUploadHostHints {
+    $s = $global:ProxyState
+    $ttl = if ($s.uploadHintTTL -gt 0) { [int]$s.uploadHintTTL } else { 300 }
+    $now = Get-Date
+    $expired = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($key in @($s.uploadHostHints.Keys)) {
+        $entry = $s.uploadHostHints[$key]
+        try {
+            if (-not $entry -or -not $entry.time -or (($now - [datetime]$entry.time).TotalSeconds -gt $ttl)) {
+                $expired.Add($key)
+            }
+        } catch {
+            $expired.Add($key)
+        }
+    }
+
+    foreach ($key in @($expired)) {
+        try { [void]$s.uploadHostHints.Remove($key) } catch {}
+    }
+
+    return $expired.Count
 }
 
 # ===== Connection Handler ScriptBlock (runs in separate runspace) =====
@@ -545,6 +589,24 @@ $HandlerScript = {
         return $body.ToArray()
     }
 
+    function Set-UploadHostHint {
+        param(
+            [hashtable]$ProxyState,
+            [string]$Host,
+            [string]$Reason,
+            [long]$ClientToRemoteBytes = 0,
+            [long]$RemoteToClientBytes = 0
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Host)) { return }
+        $ProxyState.uploadHostHints[$Host] = @{
+            time = (Get-Date)
+            reason = $Reason
+            clientToRemoteBytes = $ClientToRemoteBytes
+            remoteToClientBytes = $RemoteToClientBytes
+        }
+    }
+
     $connAdapter = $null  # track which adapter this connection uses
     $hostKey = $null
     $remoteClient = $null
@@ -578,6 +640,16 @@ $HandlerScript = {
         if ($parts.Count -lt 2) { $ClientSocket.Close(); return }
         $method = $parts[0].ToUpperInvariant()
         $text = ($lines -join "`r`n") + "`r`n`r`n"
+        $requestContentLength = 0L
+        if ($text -match '(?im)^Content-Length:\s*(\d+)') { $requestContentLength = [int64]$Matches[1] }
+        $uploadContentLength = 0L
+        if ($text -match '(?im)^X-Upload-Content-Length:\s*(\d+)') { $uploadContentLength = [int64]$Matches[1] }
+        $isChunkedRequest = $text -match '(?im)^Transfer-Encoding:\s*.*\bchunked\b'
+        $hasContentRange = $text -match '(?im)^Content-Range:\s*bytes\s+\d+-\d+/\d+'
+        $hasExpectContinue = $text -match '(?im)^Expect:\s*100-continue'
+        $hasTusResumable = $text -match '(?im)^Tus-Resumable:\s*'
+        $contentType = ''
+        if ($text -match '(?im)^Content-Type:\s*([^\r\n]+)') { $contentType = $Matches[1].Trim() }
 
         # ===== v5.0: Health check endpoint for SafetyController =====
         if ($method -eq 'GET' -and $parts.Count -ge 2 -and $parts[1] -eq '/health') {
@@ -627,20 +699,72 @@ $HandlerScript = {
             $rPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port } else { 80 }
         }
 
+        $isGoogleDriveServiceHost = $targetHost -match '(?i)(^|\.)drivefrontend-pa\.clients\d+\.google\.com$|(^|\.)drive-thirdparty\.googleusercontent\.com$|(^|\.)workspaceui-pa\.clients\d+\.google\.com$'
+        $isGoogleDriveHost = $isGoogleDriveServiceHost -or ($targetHost -match '(?i)^drive\.google\.com$')
+        $isUploadMethod = $method -in @('POST', 'PUT', 'PATCH')
+        $hasUploadContentType = $contentType -match '(?i)\bmultipart/form-data\b|\bapplication/octet-stream\b|\bapplication/x-www-form-urlencoded\b|\bimage\/|\bvideo\/|\baudio\/'
+        $recentUploadHint = $false
+        if ($targetHost -and $State.uploadHostHints.ContainsKey($targetHost)) {
+            $hint = $State.uploadHostHints[$targetHost]
+            try {
+                if ($hint -and $hint.time -and (((Get-Date) - [datetime]$hint.time).TotalSeconds -lt $State.uploadHintTTL)) {
+                    $recentUploadHint = $true
+                } else {
+                    [void]$State.uploadHostHints.Remove($targetHost)
+                }
+            } catch {
+                [void]$State.uploadHostHints.Remove($targetHost)
+            }
+        }
+
         # Note: L7 connection type detection using regex heuristics was replaced by strict L4 Arbitration Table in v5.1
         $isBulkHint = $false
         if ($method -ne 'CONNECT') {
             $targetPath = if ($uri) { ($uri.AbsolutePath + $uri.Query) } else { '' }
+            $hasGenericUploadPathHint = $targetPath -match '(?i)(^|/)(upload|uploads|uploading|attach|attachment|attachments|multipart|resumable|media|files|file|chunks?)(/|$)|[?&](upload|uploadType|resumable|chunk|partNumber|session)='
+            $isGenericUploadHint = $hasContentRange -or
+                $uploadContentLength -gt 0 -or
+                $hasTusResumable -or
+                (
+                    $isUploadMethod -and (
+                        $requestContentLength -ge 262144 -or
+                        $isChunkedRequest -or
+                        $hasExpectContinue -or
+                        $hasUploadContentType -or
+                        $hasGenericUploadPathHint
+                    )
+                )
             if (
                 $text -match '(?im)^Range:\s*bytes=' -or
                 $targetPath -match '(?i)(^|/)(__down|download|downloads?|payload|bigfile|speedtest)' -or
                 $targetPath -match '(?i)\.(zip|iso|msi|exe|bin|7z|rar|tar|gz|pkg)(\?|$)' -or
-                $targetHost -match '(?i)(^|\.)speed\.cloudflare\.com$|speedtest|download'
+                $targetHost -match '(?i)(^|\.)speed\.cloudflare\.com$|speedtest|download' -or
+                $isGenericUploadHint -or
+                (
+                    $isGoogleDriveHost -and (
+                        $isUploadMethod -or
+                        $targetPath -match '(?i)(^|/)(upload|resumable|multipart)(/|$)|[?&]uploadType=' -or
+                        $text -match '(?im)^X-Goog-Upload-(Command|Protocol):' -or
+                        $hasContentRange
+                    )
+                )
             ) {
                 $isBulkHint = $true
             }
         } elseif ($targetHost -match '(?i)(^|\.)speed\.cloudflare\.com$|speedtest') {
             $isBulkHint = $true
+        } elseif ($recentUploadHint -and $State.currentMode -in @('maxspeed', 'download')) {
+            # HTTPS uploads hide the inner request method. Reuse short-lived host hints so
+            # repeated upload tunnels to the same service stop getting sticky treatment.
+            $isBulkHint = $true
+        } elseif ($isGoogleDriveServiceHost -and $State.currentMode -in @('maxspeed', 'download')) {
+            # Drive uploads are often hidden behind HTTPS CONNECT tunnels to service hosts.
+            # Treat those tunnels as bulk-capable so parallel upload channels are not kept sticky.
+            $isBulkHint = $true
+        }
+
+        if ($method -ne 'CONNECT' -and $isBulkHint -and ($isUploadMethod -or $uploadContentLength -gt 0 -or $requestContentLength -ge 262144 -or $isChunkedRequest -or $hasTusResumable -or $hasContentRange)) {
+            Set-UploadHostHint -ProxyState $State -Host $targetHost -Reason 'http-upload-signal' -ClientToRemoteBytes ([math]::Max($requestContentLength, $uploadContentLength)) -RemoteToClientBytes 0
         }
 
         # v5.1: Track host concurrency for dynamic download manager detection
@@ -790,11 +914,20 @@ $HandlerScript = {
                         $linkMbps = [double]$aHealth.LinkSpeedMbps
                     }
 
+                    # Bulk flows can be upload-heavy or download-heavy. Use the strongest
+                    # observed direction so scheduling is not biased by download-only telemetry.
                     $observedMbps = 0.0
-                    if ($aHealth -and $null -ne $aHealth.EstimatedDownMbps -and [double]$aHealth.EstimatedDownMbps -gt 1.0) {
+                    if ($aHealth -and $null -ne $aHealth.EstimatedDownMbps -and [double]$aHealth.EstimatedDownMbps -gt $observedMbps) {
                         $observedMbps = [double]$aHealth.EstimatedDownMbps
-                    } elseif ($aHealth -and $null -ne $aHealth.DownloadMbps -and [double]$aHealth.DownloadMbps -gt 1.0) {
+                    }
+                    if ($aHealth -and $null -ne $aHealth.EstimatedUpMbps -and [double]$aHealth.EstimatedUpMbps -gt $observedMbps) {
+                        $observedMbps = [double]$aHealth.EstimatedUpMbps
+                    }
+                    if ($aHealth -and $null -ne $aHealth.DownloadMbps -and [double]$aHealth.DownloadMbps -gt $observedMbps) {
                         $observedMbps = [double]$aHealth.DownloadMbps
+                    }
+                    if ($aHealth -and $null -ne $aHealth.UploadMbps -and [double]$aHealth.UploadMbps -gt $observedMbps) {
+                        $observedMbps = [double]$aHealth.UploadMbps
                     }
 
                     if ($observedMbps -gt 0) {
@@ -1143,6 +1276,10 @@ try {
             $removedSessions = Clear-ExpiredSessions
             if ($removedSessions -gt 0) {
                 Write-ProxyEvent "Cleared $removedSessions expired or invalid session affinity entr$(if($removedSessions -eq 1){'y'}else{'ies'})"
+            }
+            $removedUploadHints = Clear-ExpiredUploadHostHints
+            if ($removedUploadHints -gt 0) {
+                Write-ProxyEvent "Cleared $removedUploadHints expired upload-host hint$(if($removedUploadHints -eq 1){''}else{'s'})"
             }
             $lastSessionClean = $now
         }
