@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    NetFusionWatchdog v6.0 -- Failsafe Guardian
+    NetFusionWatchdog v6.2 -- Failsafe Guardian
 .DESCRIPTION
     A micro-script that ensures if NetFusionEngine dies or port 8080 stops responding,
     the system instantly clears the Windows proxy, preventing the "No Internet" offline state.

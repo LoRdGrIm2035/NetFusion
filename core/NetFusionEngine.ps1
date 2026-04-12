@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    NetFusionEngine v6.0 -- Core Orchestrator
+    NetFusionEngine v6.2 -- Core Orchestrator
 .DESCRIPTION
     A highly optimized, single-process master loop that coordinates:
       - SmartProxy (Async Background Runspace)
@@ -32,6 +32,48 @@ $maxProxyRestarts = if ($engineConfig -and $engineConfig.safety -and $engineConf
     3
 }
 $proxyRestartCount = 0
+
+function Test-ProxyProcessHealth {
+    param([System.Diagnostics.Process]$ProcessObject)
+
+    if ($null -eq $ProcessObject) {
+        return @{
+            Alive = $false
+            Reason = 'Process object is null'
+            ExitCode = $null
+        }
+    }
+
+    try { $ProcessObject.Refresh() } catch {}
+
+    try {
+        if ($ProcessObject.HasExited) {
+            return @{
+                Alive = $false
+                Reason = "Process exited with code $($ProcessObject.ExitCode)"
+                ExitCode = $ProcessObject.ExitCode
+            }
+        }
+    } catch [System.InvalidOperationException] {
+        return @{
+            Alive = $false
+            Reason = 'Process is no longer available'
+            ExitCode = $null
+        }
+    } catch {
+        return @{
+            Alive = $false
+            Reason = $_.Exception.Message
+            ExitCode = $null
+        }
+    }
+
+    return @{
+        Alive = $true
+        Reason = 'Running'
+        ExitCode = $null
+    }
+}
 
 function Write-AtomicJson {
     param(
@@ -84,6 +126,36 @@ function Wait-ProxyBind {
     return $false
 }
 
+function Get-AvailableRecoveryIP {
+    param(
+        [string]$Subnet,
+        [int]$StartOctet = 147
+    )
+
+    $usedIPs = @()
+    try {
+        $usedIPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -like "$Subnet.*" } |
+            Select-Object -ExpandProperty IPAddress)
+    } catch {}
+
+    for ($octet = [math]::Max(2, $StartOctet); $octet -lt 254; $octet++) {
+        $candidate = "$Subnet.$octet"
+        if ($candidate -in $usedIPs) { continue }
+
+        $inUse = $false
+        try {
+            $inUse = Test-Connection -ComputerName $candidate -Count 1 -Quiet -ErrorAction SilentlyContinue
+        } catch {}
+
+        if (-not $inUse) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host " NetFusion Engine v$script:NetFusionVersion SOLID Starting..." -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
@@ -129,7 +201,7 @@ if ($portOpen) {
 $script:routesActive = $false
 $TargetMetric = 25
 
-# v6.0: Initialize safety-state.json so dashboard never shows "NO DATA"
+# v6.2: Initialize safety-state.json so dashboard never shows "NO DATA"
 $safetyFile = Join-Path $projectDir "config\safety-state.json"
 $engineStartTime = Get-Date
 $initSafety = @{
@@ -183,11 +255,16 @@ function Repair-AdapterDHCP {
                         # Apply static IP with same gateway as working adapter
                         $gwParts = $workingGW -split '\.'
                         $subnet = "$($gwParts[0]).$($gwParts[1]).$($gwParts[2])"
+                        $availableIP = Get-AvailableRecoveryIP -Subnet $subnet -StartOctet $lastOctet
+                        if (-not $availableIP) {
+                            Write-Host "  [REPAIR] No available recovery IP found in $subnet.0/24 for $($adapter.Name)" -ForegroundColor Red
+                            continue
+                        }
                         
-                        New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress "$subnet.$lastOctet" -PrefixLength 24 -DefaultGateway $workingGW -ErrorAction SilentlyContinue | Out-Null
+                        New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $availableIP -PrefixLength 24 -DefaultGateway $workingGW -ErrorAction SilentlyContinue | Out-Null
                         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @("8.8.8.8","1.1.1.1") -ErrorAction SilentlyContinue
                         
-                        Write-Host "  [REPAIR] Applied static IP $subnet.$lastOctet to $($adapter.Name)" -ForegroundColor Green
+                        Write-Host "  [REPAIR] Applied static IP $availableIP to $($adapter.Name)" -ForegroundColor Green
                     } catch {
                         Write-Host "  [REPAIR] Failed: $_" -ForegroundColor Red
                     }
@@ -220,15 +297,24 @@ function Enforce-ECMP {
 while ($true) {
     try {
         # Check if proxy process crashed
-        if ($proxyProc.HasExited) {
+        $proxyHealth = Test-ProxyProcessHealth -ProcessObject $proxyProc
+        if (-not $proxyHealth.Alive) {
             if ($proxyRestartCount -ge $maxProxyRestarts) {
-                Write-Host "  [Engine] FATAL: SmartProxy crashed $maxProxyRestarts times (last exit: $($proxyProc.ExitCode)). Giving up." -ForegroundColor Red
+                $crashReport = @{
+                    timestamp = (Get-Date).ToString('o')
+                    restartAttempts = $proxyRestartCount
+                    reason = $proxyHealth.Reason
+                    exitCode = $proxyHealth.ExitCode
+                }
+                $crashFile = Join-Path $projectDir ("logs\crash-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+                try { Write-AtomicJson -Path $crashFile -Data $crashReport -Depth 3 } catch {}
+                Write-Host "  [Engine] FATAL: SmartProxy crashed $maxProxyRestarts times. Last failure: $($proxyHealth.Reason)" -ForegroundColor Red
                 exit 1
             }
 
             $proxyRestartCount++
             $backoffSeconds = [math]::Min(30, [math]::Pow(2, $proxyRestartCount))
-            Write-Host "  [Engine] SmartProxy crashed (Exit: $($proxyProc.ExitCode)). Restart $proxyRestartCount/$maxProxyRestarts in ${backoffSeconds}s..." -ForegroundColor Yellow
+            Write-Host "  [Engine] SmartProxy health check failed: $($proxyHealth.Reason). Restart $proxyRestartCount/$maxProxyRestarts in ${backoffSeconds}s..." -ForegroundColor Yellow
             Start-Sleep -Seconds $backoffSeconds
 
             try {
@@ -244,6 +330,7 @@ while ($true) {
             }
 
             Write-Host "  [Engine] SmartProxy restart successful (PID: $($proxyProc.Id))." -ForegroundColor Green
+            $proxyRestartCount = 0
             continue
         }
         
@@ -275,7 +362,7 @@ while ($true) {
             Enforce-ECMP
         }
         
-        # 7. v6.0: Update safety-state uptime every loop
+        # 7. v6.2: Update safety-state uptime every loop
         try {
             $uptimeMin = [math]::Round(((Get-Date) - $engineStartTime).TotalMinutes, 1)
             $curSafety = @{

@@ -17,9 +17,6 @@ logs/*.json
 logs/*.log
 logs/*.txt
 
-# Local secrets or machine-specific files
-config/dashboard-token.txt
-
 # OS / editor clutter
 .DS_Store
 Thumbs.db
@@ -32,3 +29,7 @@ Desktop.ini
 config/dashboard-cert.pfx
 config/watchdog-heartbeat.json
 config/dashboard-cert-pass.txt
+
+# Local secrets or machine-specific files
+config/dashboard-token.txt
+config/dashboard-token-hash.txt

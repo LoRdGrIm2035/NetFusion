@@ -110,6 +110,12 @@ Check-Number $config 'dashboardPort' 1024 65535 9090
 Check-Enum $config 'mode' $validModes 'maxspeed'
 Check-Bool $config 'dashboardAllowLAN' $false
 Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
+if ($config.proxyPort -eq $config.dashboardPort) {
+    Write-Host "  [Config] WARNING: 'dashboardPort' cannot match 'proxyPort'. Using 9090." -ForegroundColor Yellow
+    $config.dashboardPort = 9090
+    $script:warnings++
+    $script:configChanged = $true
+}
 
 # Validate proxy settings
 if ($config.proxy) {

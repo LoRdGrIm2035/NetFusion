@@ -69,6 +69,24 @@ function Write-AtomicJson {
     }
 }
 
+function Repair-EventsFile {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        Write-AtomicJson -Path $Path -Data @{ events = @() } -Depth 3
+        return
+    }
+
+    try {
+        $existing = Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not $existing -or -not $existing.events) {
+            throw "Invalid event store"
+        }
+    } catch {
+        Write-AtomicJson -Path $Path -Data @{ events = @() } -Depth 3
+    }
+}
+
 function Test-SafeMode {
     <# v5.0: Check if safe mode is active -- skip all routing changes if true. #>
     if (Test-Path $SafetyFile) {
@@ -88,6 +106,7 @@ function Write-RouteEvent {
         try {
             $mutexTaken = $script:RouteControllerLogMutex.WaitOne(3000)
         } catch [System.Threading.AbandonedMutexException] {
+            try { Repair-EventsFile -Path $EventsFile } catch {}
             $mutexTaken = $true
         }
 

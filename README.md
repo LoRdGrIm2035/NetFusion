@@ -45,6 +45,9 @@ This project is designed for real aggregate throughput on workloads that already
 > [!TIP]
 > The best proof of value is a segmented downloader, torrent client, or any workload that opens many concurrent TCP sessions. A single browser download is usually the wrong benchmark.
 
+> [!NOTE]
+> The documented target right now is multi-adapter operation with at least two active links. Mixed pairs such as `Wi-Fi + Ethernet` or `2 Wi-Fi` are valid current use cases. Three-adapter layouts should be treated as exploratory unless they are explicitly validated and documented in a future update.
+
 <table>
   <tr>
     <td width="33%" valign="top">
@@ -74,6 +77,25 @@ This project is designed for real aggregate throughput on workloads that already
 | Best workloads | IDM, `aria2`, torrent clients, multi-request downloaders, parallel API fetchers |
 | Runtime config | [`config/config.default.json`](./config/config.default.json) |
 
+## Multi-Adapter Support
+
+NetFusion is designed around multi-adapter traffic steering, but this README should only claim configurations that are intentionally documented today.
+
+Currently documented use cases:
+
+- `Wi-Fi + Ethernet`
+- `2 Wi-Fi adapters`
+- Other two-adapter combinations that Windows exposes cleanly with valid IPv4 addresses and gateways
+
+Scope notes:
+
+- Some backend components are adapter-count aware beyond two interfaces, but that should be treated as an implementation detail, not a documented feature promise.
+- The current dashboard throughput chart and legend are still tuned for the first two adapters.
+- If three-adapter layouts such as `2 USB Wi-Fi + 1 Ethernet` or `2 Ethernet + 1 Wi-Fi` are validated later, they should be added back as explicit support statements at that time.
+
+> [!IMPORTANT]
+> NetFusion does per-connection steering, not packet bonding. Even in multi-adapter scenarios, it does not turn one TCP download into a true summed link.
+
 ## Requirements & Safety
 
 Before expecting useful results, make sure the environment actually supports multi-adapter distribution:
@@ -82,7 +104,7 @@ Before expecting useful results, make sure the environment actually supports mul
 - PowerShell 5.1 or newer
 - Administrator privileges
 - At least two active adapters with valid IPv4 addresses
-- A working gateway on each adapter if you expect both to carry traffic
+- A working gateway on each adapter you expect NetFusion to use
 - `curl.exe` available for adapter-bound diagnostics
 
 Recommended:
@@ -90,9 +112,13 @@ Recommended:
 - Separate upstream paths when possible
 - A downloader that supports many parallel connections
 - Verify real adapter traffic counters instead of trusting app-level speed numbers
+- Keep adapter chipsets and drivers stable if you plan to run three active links at once
 
 > [!WARNING]
-> If both adapters ultimately feed the same router and the same constrained WAN uplink, NetFusion cannot manufacture more internet bandwidth than that upstream bottleneck allows.
+> If all active adapters ultimately feed the same router and the same constrained WAN uplink, NetFusion cannot manufacture more internet bandwidth than that upstream bottleneck allows.
+
+> [!WARNING]
+> Two USB Wi-Fi adapters can work, but USB bus contention, driver quality, and RF interference can make them less stable than one internal radio plus Ethernet.
 
 ## Fit Matrix
 
@@ -159,9 +185,9 @@ flowchart LR
 
 ## Quick Start
 
-### Step 1: Verify both adapters are healthy
+### Step 1: Verify the adapters you want to use are healthy
 
-Each adapter should have:
+Each active adapter should have:
 
 - a valid IPv4 address
 - a working gateway
@@ -186,6 +212,8 @@ Get-NetRoute -DestinationPrefix '0.0.0.0/0'
 ```text
 http://localhost:9090
 ```
+
+The local browser session signs in automatically on first visit. The dashboard token file is still kept for local automation and scripted access.
 
 ### Step 4: Point supported apps to the proxy
 
@@ -216,6 +244,12 @@ Configure:
 | `core/QuicBlocker.ps1` | Helps browsers fall back to TCP by blocking UDP 443 on configured paths |
 | `core/LearningEngine.ps1` | Learns from previous behavior and feeds adaptive decisions |
 | `dashboard/DashboardServer.ps1` | Serves dashboard telemetry on `localhost:9090` |
+
+### Adapter type notes
+
+- `WiFi` usually represents the internal wireless card.
+- `USB-WiFi` is detected separately and scored with a small stability penalty because USB radios are often less consistent under load.
+- `Ethernet` usually gets the highest capability score because it is the most predictable path.
 
 <details>
 <summary><strong>Repository map</strong></summary>
@@ -263,7 +297,7 @@ The default profile is `maxspeed`.
 
 ### Validate actual adapter usage
 
-Do not rely on application-level speed displays alone. Confirm that both adapters are moving traffic:
+Do not rely on application-level speed displays alone. Confirm that the adapters you expect to use are moving traffic:
 
 ```powershell
 Get-NetAdapterStatistics -Name 'Wi-Fi 3'
@@ -292,13 +326,15 @@ Use these files as ground truth:
 - `config/decisions.json`
 - `logs/events.json`
 
+If you are testing three active links, compare all three adapters instead of only the two shown in the dashboard throughput chart.
+
 ## Troubleshooting
 
 Use the list below when NetFusion does not behave the way you expect. Each issue includes a visible step-by-step procedure so the guidance shows directly on GitHub.
 
 ### 1. Only one adapter carries traffic
 
-1. Confirm both adapters have valid IPv4 addresses.
+1. Confirm the adapters you expect to use have valid IPv4 addresses.
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 |
@@ -306,7 +342,7 @@ Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
 Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
 ```
 
-2. Confirm both adapters have a default route.
+2. Confirm the adapters you expect to use have a default route.
 
 ```powershell
 Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
@@ -320,7 +356,7 @@ Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
 
 5. Check whether one adapter is stuck on APIPA such as `169.254.x.x`. If it is, follow the recovery steps in section 4 below.
 
-### 2. One browser download does not equal both links combined
+### 2. One browser download does not equal all links combined
 
 1. Expect per-connection steering, not per-packet bonding.
 

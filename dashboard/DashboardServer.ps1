@@ -14,7 +14,7 @@
       /api/safety/reset-learning -- POST to clear learning data
       /api/resources  -- CPU/memory metrics
 .PARAMETER Port
-    Dashboard port. Default: 8877.
+    Dashboard port. Default: 9090.
 #>
 
 [CmdletBinding()]
@@ -27,15 +27,11 @@ $projectDir = Split-Path $dashDir -Parent
 $configDir = Join-Path $projectDir "config"
 $logsDir = Join-Path $projectDir "logs"
 $tokenPath = Join-Path $configDir "dashboard-token.txt"
+$tokenHashPath = Join-Path $configDir "dashboard-token-hash.txt"
 $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
 $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
-
-function New-RandomSecret {
-    param([int]$Length = 32)
-    return (-join ((65..90) + (97..122) + (48..57) | Get-Random -Count $Length | ForEach-Object { [char]$_ }))
-}
 
 function Write-AtomicJson {
     param(
@@ -53,6 +49,7 @@ function Write-AtomicJson {
     try {
         $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
         Move-Item $tmp $Path -Force -ErrorAction Stop
+        try { Copy-Item $Path "$Path.bak" -Force -ErrorAction SilentlyContinue } catch {}
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         throw
@@ -60,9 +57,25 @@ function Write-AtomicJson {
 }
 
 function Read-JsonFile {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return $null }
-    try { return (Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+    param(
+        [string]$Path,
+        [object]$DefaultValue = $null
+    )
+
+    if (-not (Test-Path $Path)) { return $DefaultValue }
+    try {
+        return (Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        $backupPath = "$Path.bak"
+        if (Test-Path $backupPath) {
+            try {
+                $backup = Get-Content $backupPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                Copy-Item $backupPath $Path -Force -ErrorAction SilentlyContinue
+                return $backup
+            } catch {}
+        }
+        return $DefaultValue
+    }
 }
 
 function Normalize-DisplayText {
@@ -82,6 +95,36 @@ function Get-ValidMode {
     return $null
 }
 
+function New-RandomSecret {
+    param([int]$Length = 32)
+    return (-join ((65..90) + (97..122) + (48..57) | Get-Random -Count $Length | ForEach-Object { [char]$_ }))
+}
+
+function Get-TokenHash {
+    param([string]$Token)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Token)
+        return [Convert]::ToBase64String($sha256.ComputeHash($bytes))
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Compare-FixedToken {
+    param([string]$Left, [string]$Right)
+
+    if ([string]::IsNullOrEmpty($Left) -or [string]::IsNullOrEmpty($Right)) { return $false }
+    if ($Left.Length -ne $Right.Length) { return $false }
+
+    $diff = 0
+    for ($i = 0; $i -lt $Left.Length; $i++) {
+        $diff = $diff -bor ([byte][char]$Left[$i] -bxor [byte][char]$Right[$i])
+    }
+    return ($diff -eq 0)
+}
+
 function Ensure-DashboardToken {
     $existing = ''
     if (Test-Path $tokenPath) {
@@ -91,7 +134,100 @@ function Ensure-DashboardToken {
         $existing = New-RandomSecret -Length 32
         Set-Content $tokenPath -Value $existing -NoNewline -Force -Encoding UTF8
     }
+
+    $hash = Get-TokenHash -Token $existing
+    Set-Content $tokenHashPath -Value $hash -NoNewline -Force -Encoding UTF8
     return $existing
+}
+
+function Parse-Cookies {
+    param([hashtable]$Headers)
+
+    $cookies = @{}
+    $cookieHeader = if ($Headers) { $Headers['cookie'] } else { $null }
+    if ([string]::IsNullOrWhiteSpace($cookieHeader)) { return $cookies }
+
+    foreach ($segment in ($cookieHeader -split ';')) {
+        $part = $segment.Trim()
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        $idx = $part.IndexOf('=')
+        if ($idx -le 0) { continue }
+        $name = $part.Substring(0, $idx).Trim()
+        $value = $part.Substring($idx + 1).Trim()
+        $cookies[$name] = $value
+    }
+
+    return $cookies
+}
+
+function Parse-QueryParams {
+    param([string]$Path)
+
+    $query = @{}
+    $queryStart = $Path.IndexOf('?')
+    if ($queryStart -lt 0 -or $queryStart -ge ($Path.Length - 1)) { return $query }
+
+    foreach ($pair in ($Path.Substring($queryStart + 1) -split '&')) {
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+        $parts = $pair.Split('=', 2)
+        $name = [Uri]::UnescapeDataString($parts[0])
+        $value = if ($parts.Count -gt 1) { [Uri]::UnescapeDataString($parts[1]) } else { '' }
+        $query[$name] = $value
+    }
+
+    return $query
+}
+
+function Test-DashboardTokenValue {
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
+
+    $storedHash = ''
+    if (Test-Path $tokenHashPath) {
+        try { $storedHash = (Get-Content $tokenHashPath -Raw -ErrorAction Stop).Trim() } catch {}
+    }
+    if ([string]::IsNullOrWhiteSpace($storedHash)) {
+        $storedHash = Get-TokenHash -Token $global:DashToken
+        try { Set-Content $tokenHashPath -Value $storedHash -NoNewline -Force -Encoding UTF8 } catch {}
+    }
+
+    return (Compare-FixedToken -Left (Get-TokenHash -Token $Token) -Right $storedHash)
+}
+
+function Get-RequestAuthContext {
+    param(
+        [hashtable]$Headers,
+        [hashtable]$QueryParams
+    )
+
+    $cookies = Parse-Cookies -Headers $Headers
+    $headerToken = Normalize-DisplayText $Headers['x-netfusion-token'] 256
+    $queryToken = Normalize-DisplayText $QueryParams['token'] 256
+    $cookieToken = Normalize-DisplayText $cookies['NetFusion-Token'] 256
+
+    $resolvedToken = $null
+    $source = 'none'
+    foreach ($candidate in @(
+        @{ Value = $headerToken; Source = 'header' },
+        @{ Value = $queryToken; Source = 'query' },
+        @{ Value = $cookieToken; Source = 'cookie' }
+    )) {
+        if ([string]::IsNullOrWhiteSpace($candidate.Value)) { continue }
+        if (Test-DashboardTokenValue -Token $candidate.Value) {
+            $resolvedToken = $candidate.Value
+            $source = $candidate.Source
+            break
+        }
+    }
+
+    return @{
+        IsAuthenticated = ($null -ne $resolvedToken)
+        Token = $resolvedToken
+        Source = $source
+        HeaderTokenPresent = -not [string]::IsNullOrWhiteSpace($headerToken)
+        QueryTokenPresent = -not [string]::IsNullOrWhiteSpace($queryToken)
+    }
 }
 
 function Parse-Headers {
@@ -126,9 +262,13 @@ function Test-IsLocalReferer {
 }
 
 function Test-IsMutationAuthorized {
-    param([hashtable]$Headers)
-    $headerToken = Normalize-DisplayText $Headers['x-netfusion-token'] 128
-    if ($headerToken -and $headerToken -eq $global:DashToken) { return $true }
+    param(
+        [hashtable]$Headers,
+        [hashtable]$AuthContext
+    )
+
+    if (-not $AuthContext.IsAuthenticated) { return $false }
+    if ($AuthContext.HeaderTokenPresent) { return $true }
     if ($Headers['origin']) { return (Test-AllowedOrigin $Headers['origin']) }
     return (Test-IsLocalReferer $Headers['referer'])
 }
@@ -250,11 +390,57 @@ function Get-Decisions {
 
 function Get-LearningData {
     $data = Read-JsonFile (Join-Path $configDir "learning-data.json")
-    $profiles = @{}
+    $profiles = [ordered]@{}
+    $rawProfiles = @{}
+
     if ($data -and $data.adapterProfiles) {
         foreach ($prop in $data.adapterProfiles.PSObject.Properties) {
-            $p = $prop.Value
-            $profiles[(Normalize-DisplayText $prop.Name 64)] = @{ name = if ($p.name) { Normalize-DisplayText $p.name 64 } else { Normalize-DisplayText $prop.Name 64 }; totalSamples = if ($null -ne $p.totalSamples) { [int]$p.totalSamples } else { 0 }; avgHealth = if ($null -ne $p.avgHealth) { [double]$p.avgHealth } else { 0 }; reliability = if ($null -ne $p.reliability) { [double]$p.reliability } else { 0 } }
+            $rawProfiles[(Normalize-DisplayText $prop.Name 64)] = $prop.Value
+        }
+    }
+
+    $interfaceData = Read-JsonFile (Join-Path $configDir "interfaces.json")
+    if ($interfaceData -and $interfaceData.interfaces -and $rawProfiles.Count -gt 0) {
+        foreach ($iface in @($interfaceData.interfaces)) {
+            $ifaceName = Normalize-DisplayText $iface.Name 64
+            if ([string]::IsNullOrWhiteSpace($ifaceName) -or $profiles.Contains($ifaceName)) { continue }
+
+            $ifaceFingerprint = Normalize-DisplayText $iface.Fingerprint 64
+            $matchedKey = $null
+            if (-not [string]::IsNullOrWhiteSpace($ifaceFingerprint) -and $rawProfiles.ContainsKey($ifaceFingerprint)) {
+                $matchedKey = $ifaceFingerprint
+            } else {
+                foreach ($entry in $rawProfiles.GetEnumerator()) {
+                    $entryName = Normalize-DisplayText $entry.Value.name 64
+                    if ($entryName -eq $ifaceName -or $entry.Key -eq $ifaceName) {
+                        $matchedKey = $entry.Key
+                        break
+                    }
+                }
+            }
+
+            if ($matchedKey) {
+                $p = $rawProfiles[$matchedKey]
+                $profiles[$ifaceName] = @{
+                    name = $ifaceName
+                    totalSamples = if ($null -ne $p.totalSamples) { [int]$p.totalSamples } else { 0 }
+                    avgHealth = if ($null -ne $p.avgHealth) { [double]$p.avgHealth } else { 0 }
+                    reliability = if ($null -ne $p.reliability) { [double]$p.reliability } else { 0 }
+                }
+            }
+        }
+    }
+
+    if ($profiles.Count -eq 0 -and $rawProfiles.Count -gt 0) {
+        foreach ($entry in $rawProfiles.GetEnumerator()) {
+            $p = $entry.Value
+            $profileName = if ($p.name) { Normalize-DisplayText $p.name 64 } else { Normalize-DisplayText $entry.Key 64 }
+            $profiles[$entry.Key] = @{
+                name = $profileName
+                totalSamples = if ($null -ne $p.totalSamples) { [int]$p.totalSamples } else { 0 }
+                avgHealth = if ($null -ne $p.avgHealth) { [double]$p.avgHealth } else { 0 }
+                reliability = if ($null -ne $p.reliability) { [double]$p.reliability } else { 0 }
+            }
         }
     }
     return (@{ version = if ($data -and $data.version) { Normalize-DisplayText $data.version 16 } else { '6.2' }; lastUpdated = if ($data -and $data.lastUpdated) { Normalize-DisplayText $data.lastUpdated 48 } else { (Get-Date).ToString('o') }; totalSessions = if ($data -and $null -ne $data.totalSessions) { [int]$data.totalSessions } else { 0 }; adapterProfiles = $profiles; recommendations = @{}; patterns = @() } | ConvertTo-Json -Depth 5 -Compress)
@@ -349,6 +535,37 @@ function Send-TcpResponse {
     $Stream.Flush()
 }
 
+function Get-AutoLoginCookie {
+    return "NetFusion-Token=$($global:DashToken); Path=/; HttpOnly; SameSite=Strict; Max-Age=28800"
+}
+
+function Send-RedirectResponse {
+    param(
+        [System.IO.Stream]$Stream,
+        [string]$Location,
+        [string]$CookieValue = ''
+    )
+
+    $headers = @{ Location = $Location }
+    if (-not [string]::IsNullOrWhiteSpace($CookieValue)) {
+        $headers['Set-Cookie'] = $CookieValue
+    }
+
+    $body = [System.Text.Encoding]::UTF8.GetBytes('Redirecting')
+    Send-TcpResponse -Stream $Stream -StatusCode 302 -StatusText 'Found' -ContentType 'text/plain; charset=utf-8' -Body $body -ExtraHeaders $headers
+}
+
+function Send-AuthenticationChallenge {
+    param([System.IO.Stream]$Stream)
+
+    $payload = @{
+        error = 'authentication_required'
+        message = 'Open the dashboard root once to establish the local session automatically.'
+    } | ConvertTo-Json -Compress
+    $body = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    Send-TcpResponse -Stream $Stream -StatusCode 401 -StatusText 'Unauthorized' -ContentType 'application/json; charset=utf-8' -Body $body
+}
+
 function Get-MimeType {
     param([string]$Ext)
     switch ($Ext) {
@@ -367,7 +584,7 @@ function Get-MimeType {
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host "    NETFUSION DASHBOARD SERVER v6.2                  " -ForegroundColor Cyan
-Write-Host "    Local Session Auth + Reduced Telemetry Surface    " -ForegroundColor DarkGray
+Write-Host "    Local Auto-Login + Reduced Telemetry Surface      " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -380,7 +597,7 @@ try {
     $global:DashToken = Ensure-DashboardToken
 
     Write-Host "  Dashboard: http://127.0.0.1:${Port}" -ForegroundColor Green
-    Write-Host "  Script token: config\\dashboard-token.txt (for local automation)" -ForegroundColor DarkGray
+    Write-Host "  Script token: config\\dashboard-token.txt (browser login is automatic)" -ForegroundColor DarkGray
     Write-Host "  APIs: /api/stats | /api/safety | /api/resources" -ForegroundColor DarkGray
     Write-Host ""
 } catch {
@@ -416,7 +633,10 @@ try {
             $path = $reqParts[1]
             $parsedPath = $path.Split('?')[0]
             $headers = Parse-Headers -RequestText $requestText
+            $queryParams = Parse-QueryParams -Path $path
+            $authContext = Get-RequestAuthContext -Headers $headers -QueryParams $queryParams
             $bodyText = Get-RequestBody -RequestText $requestText
+            $autoLoginCookie = Get-AutoLoginCookie
 
             if ($method -eq 'OPTIONS') {
                 Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
@@ -429,8 +649,27 @@ try {
                 continue
             }
 
+            if ($parsedPath -in @('/', '/index.html', '/login') -and -not $authContext.IsAuthenticated -and -not $authContext.HeaderTokenPresent -and -not $authContext.QueryTokenPresent) {
+                Send-RedirectResponse -Stream $stream -Location '/' -CookieValue $autoLoginCookie
+                continue
+            }
+
+            if (($parsedPath -eq '/login' -or $authContext.Source -eq 'query') -and $authContext.IsAuthenticated) {
+                Send-RedirectResponse -Stream $stream -Location '/' -CookieValue $autoLoginCookie
+                continue
+            }
+
+            if (-not $authContext.IsAuthenticated) {
+                if ($parsedPath -eq '/favicon.ico') {
+                    Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
+                } else {
+                    Send-AuthenticationChallenge -Stream $stream
+                }
+                continue
+            }
+
             $isMutation = $method -in @('POST', 'PUT', 'PATCH', 'DELETE')
-            if ($isMutation -and -not (Test-IsMutationAuthorized -Headers $headers)) {
+            if ($isMutation -and -not (Test-IsMutationAuthorized -Headers $headers -AuthContext $authContext)) {
                 $err = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
                 Send-TcpResponse -Stream $stream -StatusCode 403 -StatusText 'Forbidden' -ContentType 'application/json; charset=utf-8' -Body $err
                 continue

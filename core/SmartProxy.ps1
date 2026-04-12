@@ -102,10 +102,68 @@ function Write-AtomicJson {
     try {
         $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
         Move-Item $tmp $Path -Force -ErrorAction Stop
+        try { Copy-Item $Path "$Path.bak" -Force -ErrorAction SilentlyContinue } catch {}
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         throw
     }
+}
+
+function Read-JsonFile {
+    param(
+        [string]$Path,
+        [object]$DefaultValue = $null
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $DefaultValue
+    }
+
+    try {
+        return (Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        $backupPath = "$Path.bak"
+        if (Test-Path $backupPath) {
+            try {
+                $backup = Get-Content $backupPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                Copy-Item $backupPath $Path -Force -ErrorAction SilentlyContinue
+                return $backup
+            } catch {}
+        }
+
+        return $DefaultValue
+    }
+}
+
+function Repair-EventsFile {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        Write-AtomicJson -Path $Path -Data @{ events = @() } -Depth 3
+        return
+    }
+
+    $data = Read-JsonFile -Path $Path -DefaultValue $null
+    if (-not $data -or -not $data.events) {
+        Write-AtomicJson -Path $Path -Data @{ events = @() } -Depth 3
+    }
+}
+
+function Get-SafeBufferSize {
+    param(
+        [int]$RequestedSize,
+        [int]$MaxSize = 1048576
+    )
+
+    $safe = [Math]::Max(8192, [Math]::Min($RequestedSize, $MaxSize))
+    if ([IntPtr]::Size -le 4 -and $safe -gt 262144) {
+        return 262144
+    }
+    return [int]$safe
+}
+
+foreach ($bufferKey in @($global:ProxyState.bufferSizes.Keys)) {
+    $global:ProxyState.bufferSizes[$bufferKey] = Get-SafeBufferSize -RequestedSize ([int]$global:ProxyState.bufferSizes[$bufferKey])
 }
 
 function Write-ProxyEvent {
@@ -115,6 +173,7 @@ function Write-ProxyEvent {
         try {
             $mutexTaken = $script:ProxyLogMutex.WaitOne(3000)
         } catch [System.Threading.AbandonedMutexException] {
+            try { Repair-EventsFile -Path $global:ProxyState.eventsFile } catch {}
             $mutexTaken = $true
         }
 
@@ -123,10 +182,8 @@ function Write-ProxyEvent {
         try {
             $ef = $global:ProxyState.eventsFile
             $events = @()
-            if (Test-Path $ef) {
-                $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($data -and $data.events) { $events = @($data.events) }
-            }
+            $data = Read-JsonFile -Path $ef -DefaultValue $null
+            if ($data -and $data.events) { $events = @($data.events) }
             $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
             $events = @($evt) + $events
             if ($events.Count -gt 200) { $events = $events[0..199] }
@@ -142,15 +199,13 @@ function Write-ProxyEvent {
 function Get-ProxyAdapters {
     $adapters = @()
     $ifFile = $global:ProxyState.interfacesFile
-    if (Test-Path $ifFile) {
-        try {
-            $data = Get-Content $ifFile -Raw | ConvertFrom-Json
-            foreach ($iface in $data.interfaces) {
-                if ($iface.IPAddress -and $iface.Status -eq 'Up') {
-                    $adapters += @{ Name = $iface.Name; IP = $iface.IPAddress; Type = $iface.Type; Speed = $iface.LinkSpeedMbps }
-                }
+    $data = Read-JsonFile -Path $ifFile -DefaultValue $null
+    if ($data -and $data.interfaces) {
+        foreach ($iface in $data.interfaces) {
+            if ($iface.IPAddress -and $iface.Status -eq 'Up') {
+                $adapters += @{ Name = $iface.Name; IP = $iface.IPAddress; Type = $iface.Type; Speed = $iface.LinkSpeedMbps }
             }
-        } catch {}
+        }
     }
     if ($adapters.Count -lt 1) {
         Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN' } | ForEach-Object {
@@ -170,21 +225,20 @@ function Update-AdaptersAndWeights {
 
     # v5.0: Check safe mode
     if (Test-Path $s.safetyFile) {
-        try {
-            $safety = Get-Content $s.safetyFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($safety -and $safety.safeMode -eq $true) {
-                $s.safeMode = $true
-            } else {
-                $s.safeMode = $false
-            }
-        } catch {}
+        $safety = Read-JsonFile -Path $s.safetyFile -DefaultValue $null
+        if ($safety -and $safety.safeMode -eq $true) {
+            $s.safeMode = $true
+        } else {
+            $s.safeMode = $false
+        }
     }
 
     # Read health data from InterfaceMonitor
     $health = @{}
     if (Test-Path $s.healthFile) {
         try {
-            $hData = Get-Content $s.healthFile -Raw | ConvertFrom-Json
+            $hData = Read-JsonFile -Path $s.healthFile -DefaultValue $null
+            if (-not $hData) { throw "Health data unavailable." }
             $hData.adapters | ForEach-Object {
                 $currentDown = if ($_.DownloadMbps) { [double]$_.DownloadMbps } else { 0.0 }
                 $prevEstimate = if ($s.bandwidthEstimates.ContainsKey($_.Name)) { [double]$s.bandwidthEstimates[$_.Name] } else { 0.0 }
@@ -225,7 +279,8 @@ function Update-AdaptersAndWeights {
     }
     if (Test-Path $s.configFile) {
         try {
-            $cfg = Get-Content $s.configFile -Raw | ConvertFrom-Json
+            $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
+            if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
             $refresh = $cfg.intelligence.weightRefreshInterval
             if ($null -ne $refresh -and [double]$refresh -gt 0) {
@@ -309,6 +364,27 @@ function Update-ProxyStats {
     foreach ($a in $s.adapters) {
         $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
     }
+    $sessionStats = @{
+        activeSessionCount = $s.sessionMap.Count
+        oldestSessionAge = 0
+        newestSessionAge = 0
+        averageSessionAge = 0
+    }
+    $sessionAges = @()
+    $sessionNow = Get-Date
+    foreach ($sessionKey in @($s.sessionMap.Keys)) {
+        $entry = $s.sessionMap[$sessionKey]
+        try {
+            if ($entry -and $entry.time) {
+                $sessionAges += ($sessionNow - [datetime]$entry.time).TotalSeconds
+            }
+        } catch {}
+    }
+    if ($sessionAges.Count -gt 0) {
+        $sessionStats.oldestSessionAge = [Math]::Round(($sessionAges | Measure-Object -Maximum).Maximum, 2)
+        $sessionStats.newestSessionAge = [Math]::Round(($sessionAges | Measure-Object -Minimum).Minimum, 2)
+        $sessionStats.averageSessionAge = [Math]::Round(($sessionAges | Measure-Object -Average).Average, 2)
+    }
     $statsSnapshot = @{
         running = $true; port = $s.port; mode = $s.currentMode
         totalConnections = $s.totalConnections; totalFailures = $s.totalFails
@@ -318,6 +394,7 @@ function Update-ProxyStats {
         connectionTypes = $s.connectionTypes
         safeMode = $s.safeMode
         sessionMapSize = $s.sessionMap.Count
+        sessionStats = $sessionStats
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
     }
@@ -332,16 +409,54 @@ function Update-ProxyStats {
 function Clear-ExpiredSessions {
     $s = $global:ProxyState
     $now = Get-Date
-    $expired = @()
+    $expired = [System.Collections.Generic.List[string]]::new()
+    $snapshot = @{}
+
     foreach ($key in @($s.sessionMap.Keys)) {
-        $entry = $s.sessionMap[$key]
-        if ($entry -and $entry.time -and (($now - $entry.time).TotalSeconds -gt $s.sessionTTL)) {
-            $expired += $key
+        $snapshot[$key] = $s.sessionMap[$key]
+    }
+
+    foreach ($key in @($snapshot.Keys)) {
+        $entry = $snapshot[$key]
+        if (-not $entry -or -not $entry.time) {
+            $expired.Add($key)
+            continue
+        }
+
+        try {
+            if (($now - [datetime]$entry.time).TotalSeconds -gt $s.sessionTTL) {
+                $expired.Add($key)
+            }
+        } catch {
+            $expired.Add($key)
         }
     }
-    foreach ($key in $expired) {
-        $s.sessionMap.Remove($key)
+
+    foreach ($key in @($expired)) {
+        try { [void]$s.sessionMap.Remove($key) } catch {}
     }
+
+    $purgedCount = $expired.Count
+    if ($s.sessionMap.Count -gt 10000) {
+        $orderedSessions = foreach ($key in @($s.sessionMap.Keys)) {
+            $entry = $s.sessionMap[$key]
+            [pscustomobject]@{
+                Key = $key
+                Entry = $entry
+                Time = try { if ($entry -and $entry.time) { [datetime]$entry.time } else { [datetime]::MinValue } } catch { [datetime]::MinValue }
+            }
+        }
+
+        $keepers = @($orderedSessions | Sort-Object Time -Descending | Select-Object -First 5000)
+        $removedForCap = [Math]::Max(0, $orderedSessions.Count - $keepers.Count)
+        $s.sessionMap.Clear()
+        foreach ($item in $keepers) {
+            $s.sessionMap[$item.Key] = $item.Entry
+        }
+        $purgedCount += $removedForCap
+    }
+
+    return $purgedCount
 }
 
 # ===== Connection Handler ScriptBlock (runs in separate runspace) =====
@@ -433,6 +548,8 @@ $HandlerScript = {
     $connAdapter = $null  # track which adapter this connection uses
     $hostKey = $null
     $remoteClient = $null
+    $clientStream = $null
+    $remoteStream = $null
     $uri = $null
     try {
         # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
@@ -791,9 +908,13 @@ $HandlerScript = {
                     $State.successCounts[$adapter.Name]++
                     break
                 }
-                try { $remoteClient.Close() } catch {}; $remoteClient = $null
+                try { $remoteClient.Close() } catch {}
+                try { $remoteClient.Dispose() } catch {}
+                $remoteClient = $null
             } catch {
-                try { $remoteClient.Close() } catch {}; $remoteClient = $null
+                try { $remoteClient.Close() } catch {}
+                try { $remoteClient.Dispose() } catch {}
+                $remoteClient = $null
             }
             $State.failCounts[$adapter.Name]++; $State.totalFails++
         }
@@ -870,7 +991,7 @@ $HandlerScript = {
             }
             $remoteStream.Flush()
 
-            # v6.0 SPEED BOOST: Use optimized async pipeline instead of slow string loop
+            # v6.2 SPEED BOOST: Use optimized async pipeline instead of slow string loop
             try { $remoteStream.CopyToAsync($clientStream, $bufSize).Wait(120000) } catch {}
         }
 
@@ -883,15 +1004,22 @@ $HandlerScript = {
         if ($hostKey -and $State.activePerHost.ContainsKey($hostKey)) {
             $State.activePerHost[$hostKey] = [math]::Max(0, $State.activePerHost[$hostKey] - 1)
         }
+        try { if ($remoteStream) { $remoteStream.Dispose() } } catch {}
+        try { if ($clientStream) { $clientStream.Dispose() } } catch {}
         try { if ($remoteClient) { $remoteClient.Close() } } catch {}
+        try { if ($remoteClient) { $remoteClient.Dispose() } } catch {}
         try { if ($ClientSocket) { $ClientSocket.Close() } } catch {}
+        try { if ($ClientSocket) { $ClientSocket.Dispose() } } catch {}
     }
 }
 
 # ===== Dynamic Adaptive Runspace Pool =====
 $cfgProxy = $null
 if (Test-Path $configFile) {
-    try { $cfgProxy = (Get-Content $configFile -Raw | ConvertFrom-Json).proxy } catch {}
+    try {
+        $cfgData = Read-JsonFile -Path $configFile -DefaultValue $null
+        if ($cfgData) { $cfgProxy = $cfgData.proxy }
+    } catch {}
 }
 $minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 64 }
 $maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
@@ -1012,7 +1140,10 @@ try {
 
         # v5.0: Clean expired session affinity entries every 60s
         if (($now - $lastSessionClean).TotalSeconds -gt 60) {
-            Clear-ExpiredSessions
+            $removedSessions = Clear-ExpiredSessions
+            if ($removedSessions -gt 0) {
+                Write-ProxyEvent "Cleared $removedSessions expired or invalid session affinity entr$(if($removedSessions -eq 1){'y'}else{'ies'})"
+            }
             $lastSessionClean = $now
         }
 

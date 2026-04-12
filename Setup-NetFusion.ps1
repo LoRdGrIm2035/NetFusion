@@ -104,7 +104,7 @@ function Show-MetricGuidance {
 
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION v6.0 -- FIRST-RUN SETUP                 " -ForegroundColor Cyan
+Write-Host "    NETFUSION v6.2 -- FIRST-RUN SETUP                 " -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 
 Write-Step "Checking prerequisites"
@@ -161,8 +161,9 @@ $capPerAdapter = if ($config.proxy.maxConcurrentPerAdapter) { $config.proxy.maxC
 Write-Host ("  Max conns/adapt: {0}" -f $capPerAdapter) -ForegroundColor White
 Write-Host "  Main behavior file: config\\config.json" -ForegroundColor Gray
 
-# v6.2: Generate dashboard token if missing or still using a weak legacy value
+# Dashboard token for local auto-login and automation
 $tokenFile = Join-Path $configDir "dashboard-token.txt"
+$tokenHashFile = Join-Path $configDir "dashboard-token-hash.txt"
 $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
@@ -173,6 +174,23 @@ if (-not (Test-Path $tokenFile) -or $existingToken.Length -lt 24 -or $existingTo
     Write-Ok "Dashboard token generated or rotated."
 } else {
     Write-Ok "Dashboard token exists."
+}
+
+$dashToken = if (Test-Path $tokenFile) { (Get-Content $tokenFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '' }
+if (-not [string]::IsNullOrWhiteSpace($dashToken)) {
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $tokenBytes = [System.Text.Encoding]::UTF8.GetBytes($dashToken)
+            $tokenHash = [Convert]::ToBase64String($sha.ComputeHash($tokenBytes))
+            Set-Content $tokenHashFile -Value $tokenHash -NoNewline -Force -Encoding UTF8
+            Write-Ok "Dashboard token hash refreshed."
+        } finally {
+            $sha.Dispose()
+        }
+    } catch {
+        Write-Warn "Failed to refresh dashboard token hash: $_"
+    }
 }
 
 $adapters = Get-UsableAdapters
@@ -196,7 +214,7 @@ Show-ProxyGuidance -Config $config
 Write-Step "Next steps"
 Write-Host "1. Review config\\config.json if you want to change ports, mode, or proxy thread settings." -ForegroundColor White
 Write-Host "2. Start NetFusion with NetFusion-START.bat as Administrator." -ForegroundColor White
-Write-Host "3. Open the dashboard at http://127.0.0.1:$($config.dashboardPort). It should open directly on the local machine." -ForegroundColor White
+Write-Host "3. Open the dashboard at http://127.0.0.1:$($config.dashboardPort). The local browser signs in automatically." -ForegroundColor White
 Write-Host "4. If you see same-subnet routing issues, review adapter metrics or run the routing helpers noted above." -ForegroundColor White
 
 Write-Host ""

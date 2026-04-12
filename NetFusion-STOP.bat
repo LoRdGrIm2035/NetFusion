@@ -1,9 +1,9 @@
 @echo off
-title NetFusion v6.0 SOLID - Shutdown
+title NetFusion v6.2 SOLID - Shutdown
 color 0E
 echo.
 echo  ====================================================+
-echo  ^|   NETFUSION v6.0 SOLID - SHUTTING DOWN             ^|
+echo  ^|   NETFUSION v6.2 SOLID - SHUTTING DOWN             ^|
 echo  ====================================================+
 echo.
 
