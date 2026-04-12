@@ -29,7 +29,7 @@ taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
 
 :: Fallback: kill by CommandLine matching DualWifi + known script names
-powershell -ExecutionPolicy Bypass -Command "Get-WmiObject Win32_Process -Filter 'Name=''powershell.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'DualWifi' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Write-Host ('  Killing PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter 'Name=''powershell.exe''' | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'DualWifi' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer|QuicBlocker)') { Write-Host ('  Killing PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
 ping -n 2 127.0.0.1 >nul
 echo        Done
 

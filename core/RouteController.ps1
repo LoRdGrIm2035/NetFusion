@@ -45,6 +45,29 @@ $script:dnsVerified = @{}          # DNS verification status
 $script:routeRetryCount = @{}     # Route creation retry tracking
 $script:prevGateways = @{}         # Previous gateways for DHCP change detection
 $script:loopCount = 0              # Watch loop counter for periodic tasks
+$script:RouteControllerLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 3
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
 
 function Test-SafeMode {
     <# v5.0: Check if safe mode is active -- skip all routing changes if true. #>
@@ -60,10 +83,17 @@ function Test-SafeMode {
 function Write-RouteEvent {
     param([string]$Message)
     Write-Host "  [RouteCtrl] $Message" -ForegroundColor Cyan
+    $mutexTaken = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
         try {
-            $mutex.WaitOne(3000) | Out-Null
+            $mutexTaken = $script:RouteControllerLogMutex.WaitOne(3000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexTaken = $true
+        }
+
+        if (-not $mutexTaken) { return }
+
+        try {
             $events = @()
             if (Test-Path $EventsFile) {
                 $data = Get-Content $EventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -72,12 +102,12 @@ function Write-RouteEvent {
             $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'route'; adapter = ''; message = $Message }
             $events = @($evt) + $events
             if ($events.Count -gt 200) { $events = $events[0..199] }
-            
-            $tmp = [System.IO.Path]::GetTempFileName()
-            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction SilentlyContinue
-            Move-Item $tmp $EventsFile -Force -ErrorAction SilentlyContinue
+
+            Write-AtomicJson -Path $EventsFile -Data @{ events = $events }
         } finally {
-            $mutex.ReleaseMutex()
+            if ($mutexTaken) {
+                try { $script:RouteControllerLogMutex.ReleaseMutex() } catch {}
+            }
         }
     } catch {}
 }
@@ -158,6 +188,7 @@ function Set-DynamicMetrics {
 
         $script:adapterMetrics[$name] = $metric
 
+        $liveIdx = $null
         try {
             # Always fetch the extreme live OS index in case the caching is desynced
             $liveAdapter = Get-NetworkAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -177,7 +208,8 @@ function Set-DynamicMetrics {
             Set-InterfaceMetric -InterfaceIndex $liveIdx -Metric $metric
             Write-Host "    * $name (index $liveIdx) -> metric $metric [$type HP:$($health.Score)]" -ForegroundColor Green
         } catch {
-            Write-Host "    x $name (index $liveIdx) -> $($_.Exception.Message)" -ForegroundColor Red
+            $idxLabel = if ($null -ne $liveIdx) { $liveIdx } else { '(unknown)' }
+            Write-Host "    x $name (index $idxLabel) -> $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }

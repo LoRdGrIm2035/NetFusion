@@ -163,9 +163,13 @@ Write-Host "  Main behavior file: config\\config.json" -ForegroundColor Gray
 
 # v6.2: Generate dashboard token if missing or still using a weak legacy value
 $tokenFile = Join-Path $configDir "dashboard-token.txt"
-if (-not (Test-Path $tokenFile) -or ((Get-Content $tokenFile -Raw -ErrorAction SilentlyContinue).Trim()).Length -lt 24) {
+$legacyDashboardTokens = @(
+    'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
+)
+$existingToken = if (Test-Path $tokenFile) { (Get-Content $tokenFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '' }
+if (-not (Test-Path $tokenFile) -or $existingToken.Length -lt 24 -or $existingToken -in $legacyDashboardTokens) {
     $newToken = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
-    Set-Content $tokenFile -Value $newToken -NoNewline -Force
+    Set-Content $tokenFile -Value $newToken -NoNewline -Force -Encoding UTF8
     Write-Ok "Dashboard token generated or rotated."
 } else {
     Write-Ok "Dashboard token exists."

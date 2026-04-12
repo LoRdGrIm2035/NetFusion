@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SmartProxy v5.0 -- Production-grade intelligent connection orchestration engine.
+    SmartProxy v6.2 -- Production-grade intelligent connection orchestration engine.
 .DESCRIPTION
     Local HTTP/HTTPS proxy with safety-first design:
       - Session affinity: same host maps to same adapter within TTL window
@@ -84,20 +84,58 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         bulk   = @(20, 21, 22, 8080, 8443, 9000, 9090)
     }
 })
+$script:ProxyLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 3
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
 
 function Write-ProxyEvent {
     param([string]$Message)
+    $mutexTaken = $false
     try {
-        $ef = $global:ProxyState.eventsFile
-        $events = @()
-        if (Test-Path $ef) {
-            $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($data -and $data.events) { $events = @($data.events) }
+        try {
+            $mutexTaken = $script:ProxyLogMutex.WaitOne(3000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexTaken = $true
         }
-        $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
-        $events = @($evt) + $events
-        if ($events.Count -gt 200) { $events = $events[0..199] }
-        @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $ef -Force -Encoding UTF8 -ErrorAction SilentlyContinue
+
+        if (-not $mutexTaken) { return }
+
+        try {
+            $ef = $global:ProxyState.eventsFile
+            $events = @()
+            if (Test-Path $ef) {
+                $data = Get-Content $ef -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($data -and $data.events) { $events = @($data.events) }
+            }
+            $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'proxy'; adapter = ''; message = $Message }
+            $events = @($evt) + $events
+            if ($events.Count -gt 200) { $events = $events[0..199] }
+            Write-AtomicJson -Path $ef -Data @{ events = $events } -Depth 3
+        } finally {
+            if ($mutexTaken) {
+                try { $script:ProxyLogMutex.ReleaseMutex() } catch {}
+            }
+        }
     } catch {}
 }
 
@@ -271,7 +309,7 @@ function Update-ProxyStats {
     foreach ($a in $s.adapters) {
         $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
     }
-    @{
+    $statsSnapshot = @{
         running = $true; port = $s.port; mode = $s.currentMode
         totalConnections = $s.totalConnections; totalFailures = $s.totalFails
         activeConnections = $s.activeConnections
@@ -282,10 +320,11 @@ function Update-ProxyStats {
         sessionMapSize = $s.sessionMap.Count
         currentMaxThreads = $s.currentMaxThreads
         timestamp = (Get-Date).ToString('o')
-    } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.statsFile -Force -ErrorAction SilentlyContinue
+    }
+    try { Write-AtomicJson -Path $s.statsFile -Data $statsSnapshot -Depth 3 } catch {}
 
     try {
-        @{ decisions = $s.decisions } | ConvertTo-Json -Depth 3 -Compress | Set-Content $s.decisionsFile -Force -ErrorAction SilentlyContinue
+        Write-AtomicJson -Path $s.decisionsFile -Data @{ decisions = $s.decisions } -Depth 3
     } catch {}
 }
 
@@ -309,7 +348,92 @@ function Clear-ExpiredSessions {
 $HandlerScript = {
     param($ClientSocket, $State)
 
+    function Read-HttpLine {
+        param([System.IO.Stream]$Stream)
+
+        $lineBytes = [System.Collections.Generic.List[byte]]::new()
+        $oneByte = New-Object byte[] 1
+        $sawCR = $false
+        while ($true) {
+            $read = $Stream.Read($oneByte, 0, 1)
+            if ($read -le 0) {
+                if ($lineBytes.Count -eq 0 -and -not $sawCR) { return $null }
+                break
+            }
+
+            $b = $oneByte[0]
+            if ($sawCR) {
+                if ($b -eq 10) { break }
+                [void]$lineBytes.Add(13)
+                $sawCR = $false
+            }
+
+            if ($b -eq 13) {
+                $sawCR = $true
+                continue
+            }
+
+            [void]$lineBytes.Add($b)
+        }
+
+        return [System.Text.Encoding]::ASCII.GetString($lineBytes.ToArray())
+    }
+
+    function Read-ExactBytes {
+        param(
+            [System.IO.Stream]$Stream,
+            [byte[]]$Buffer,
+            [int]$Count
+        )
+
+        $offset = 0
+        while ($offset -lt $Count) {
+            $read = $Stream.Read($Buffer, $offset, $Count - $offset)
+            if ($read -le 0) { break }
+            $offset += $read
+        }
+
+        return $offset
+    }
+
+    function Read-ChunkedRequestBody {
+        param([System.IO.Stream]$Stream)
+
+        $body = [System.Collections.Generic.List[byte]]::new()
+        while ($true) {
+            $sizeLine = Read-HttpLine -Stream $Stream
+            if ($null -eq $sizeLine) { throw "Unexpected end of stream while reading chunk size." }
+            if ([string]::IsNullOrWhiteSpace($sizeLine)) { continue }
+
+            $sizeToken = $sizeLine.Split(';')[0].Trim()
+            $chunkSize = [Convert]::ToInt32($sizeToken, 16)
+            if ($chunkSize -eq 0) {
+                while ($true) {
+                    $trailerLine = Read-HttpLine -Stream $Stream
+                    if ($null -eq $trailerLine -or $trailerLine -eq '') { break }
+                }
+                break
+            }
+
+            $chunkBuffer = New-Object byte[] $chunkSize
+            if ((Read-ExactBytes -Stream $Stream -Buffer $chunkBuffer -Count $chunkSize) -ne $chunkSize) {
+                throw "Unexpected end of stream while reading chunk body."
+            }
+            $body.AddRange($chunkBuffer)
+
+            $chunkTerminator = New-Object byte[] 2
+            if ((Read-ExactBytes -Stream $Stream -Buffer $chunkTerminator -Count 2) -ne 2) {
+                throw "Unexpected end of stream while reading chunk terminator."
+            }
+        }
+
+        return $body.ToArray()
+    }
+
     $connAdapter = $null  # track which adapter this connection uses
+    $hostKey = $null
+    $remoteClient = $null
+    $uri = $null
     try {
         # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
         $isSafeMode = $State.safeMode
@@ -317,18 +441,39 @@ $HandlerScript = {
         $clientStream = $ClientSocket.GetStream()
         $clientStream.ReadTimeout = 10000
 
-        # Read initial request
-        $buf = New-Object byte[] 16384
-        $n = $clientStream.Read($buf, 0, $buf.Length)
-        if ($n -le 0) { $ClientSocket.Close(); return }
-        $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-        $lines = $text -split "`r`n"
+        # Read request headers safely up to 64KB so large cookies or auth headers are not truncated.
+        $headerLines = [System.Collections.Generic.List[string]]::new()
+        $headerByteCount = 0
+        while ($true) {
+            $line = Read-HttpLine -Stream $clientStream
+            if ($null -eq $line) { $ClientSocket.Close(); return }
+
+            $headerByteCount += [System.Text.Encoding]::ASCII.GetByteCount($line) + 2
+            if ($headerByteCount -gt 65536) { $ClientSocket.Close(); return }
+
+            if ($line -eq '') { break }
+            [void]$headerLines.Add($line)
+        }
+
+        if ($headerLines.Count -lt 1) { $ClientSocket.Close(); return }
+        $lines = @($headerLines)
         $parts = $lines[0] -split ' '
-        $method = $parts[0].ToUpper()
+        if ($parts.Count -lt 2) { $ClientSocket.Close(); return }
+        $method = $parts[0].ToUpperInvariant()
+        $text = ($lines -join "`r`n") + "`r`n`r`n"
 
         # ===== v5.0: Health check endpoint for SafetyController =====
         if ($method -eq 'GET' -and $parts.Count -ge 2 -and $parts[1] -eq '/health') {
-            $resp = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 2`r`nConnection: close`r`n`r`nOK")
+            $remoteEndPoint = $ClientSocket.Client.RemoteEndPoint -as [System.Net.IPEndPoint]
+            $isLocalRequester = $remoteEndPoint -and (
+                $remoteEndPoint.Address.Equals([System.Net.IPAddress]::Loopback) -or
+                $remoteEndPoint.Address.Equals([System.Net.IPAddress]::IPv6Loopback)
+            )
+            $resp = if ($isLocalRequester) {
+                [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 2`r`nConnection: close`r`n`r`nOK")
+            } else {
+                [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 403 Forbidden`r`nContent-Type: text/plain`r`nContent-Length: 9`r`nConnection: close`r`n`r`nForbidden")
+            }
             $clientStream.Write($resp, 0, $resp.Length)
             $ClientSocket.Close()
             return
@@ -614,14 +759,15 @@ $HandlerScript = {
             }
             $usedNames += $adapter.Name
 
-            if ($method -ne 'CONNECT') {
-                try { $uri = [System.Uri]$parts[1] } catch { $ClientSocket.Close(); return }
-                $rHost = $uri.Host; $rPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port } else { 80 }
-            } else {
-                $rHost = $targetHost
-            }
+            $rHost = $targetHost
 
             try {
+                if (-not $adapter.IP -or $adapter.IP -match '^169\.254\.') {
+                    $State.failCounts[$adapter.Name]++
+                    $State.totalFails++
+                    continue
+                }
+
                 if ($connAdapter -ne $adapter.Name) {
                     if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
                         $State.activePerAdapter[$connAdapter] = [math]::Max(0, [int]$State.activePerAdapter[$connAdapter] - 1)
@@ -676,39 +822,50 @@ $HandlerScript = {
             try { [System.Threading.Tasks.Task]::WhenAll($c2r, $r2c).Wait(5000) } catch {}
         } else {
             $remoteStream.ReadTimeout = 15000
-            try { $uri = [System.Uri]$parts[1] } catch { $ClientSocket.Close(); return }
             $reqPath = $uri.PathAndQuery; if (-not $reqPath) { $reqPath = '/' }
             $req = "$method $reqPath HTTP/1.1`r`n"
-            $hasHost = $false; $contentLength = 0
+            $hasHost = $false; $contentLength = 0; $isChunked = $false
+            $forwardHeaders = [System.Collections.Generic.List[string]]::new()
             for ($i = 1; $i -lt $lines.Count; $i++) {
-                $l = $lines[$i]; if ($l -eq '' -or $l -eq "`r") { break }
+                $l = $lines[$i]
                 if ($l -match '^Proxy-') { continue }
                 if ($l -match '^Connection:') { continue }
                 if ($l -match '^Host:') { $hasHost = $true }
-                if ($l -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1] }
-                $req += "$l`r`n"
+                if ($l -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1]; continue }
+                if ($l -match '^Transfer-Encoding:\s*(.+)$') {
+                    if ($Matches[1] -match '(?i)\bchunked\b') { $isChunked = $true }
+                    continue
+                }
+                $forwardHeaders.Add($l)
+            }
+            foreach ($headerLine in $forwardHeaders) {
+                $req += "$headerLine`r`n"
             }
             if (-not $hasHost) { $req += "Host: $($uri.Host)`r`n" }
+
+            $chunkedBody = $null
+            if ($isChunked) {
+                $chunkedBody = Read-ChunkedRequestBody -Stream $clientStream
+                $req += "Content-Length: $($chunkedBody.Length)`r`n"
+            } elseif ($contentLength -gt 0) {
+                $req += "Content-Length: $contentLength`r`n"
+            }
             $req += "Connection: close`r`n`r`n"
             $reqBytes = [System.Text.Encoding]::ASCII.GetBytes($req)
             $remoteStream.Write($reqBytes, 0, $reqBytes.Length)
 
-            if ($contentLength -gt 0) {
-                $headerEnd = $text.IndexOf("`r`n`r`n")
-                if ($headerEnd -gt 0) {
-                    $bodyOffset = $headerEnd + 4
-                    $bodyInBuf = $n - [System.Text.Encoding]::ASCII.GetByteCount($text.Substring(0, $bodyOffset))
-                    if ($bodyInBuf -gt 0) {
-                        $remoteStream.Write($buf, ($n - $bodyInBuf), $bodyInBuf)
-                        $contentLength -= $bodyInBuf
-                    }
-                    while ($contentLength -gt 0) {
-                        $toRead = [math]::Min($contentLength, $buf.Length)
-                        $br = $clientStream.Read($buf, 0, $toRead)
-                        if ($br -le 0) { break }
-                        $remoteStream.Write($buf, 0, $br)
-                        $contentLength -= $br
-                    }
+            if ($isChunked) {
+                if ($chunkedBody.Length -gt 0) {
+                    $remoteStream.Write($chunkedBody, 0, $chunkedBody.Length)
+                }
+            } elseif ($contentLength -gt 0) {
+                $bodyBuffer = New-Object byte[] ([math]::Min($contentLength, 65536))
+                while ($contentLength -gt 0) {
+                    $toRead = [math]::Min($contentLength, $bodyBuffer.Length)
+                    $br = $clientStream.Read($bodyBuffer, 0, $toRead)
+                    if ($br -le 0) { break }
+                    $remoteStream.Write($bodyBuffer, 0, $br)
+                    $contentLength -= $br
                 }
             }
             $remoteStream.Flush()
@@ -748,7 +905,7 @@ $jobs = [System.Collections.Generic.List[object]]::new()
 # ===== Main =====
 Write-Host ""
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "    NETFUSION SMART PROXY v5.0                       " -ForegroundColor Cyan
+Write-Host "    NETFUSION SMART PROXY v6.2                       " -ForegroundColor Cyan
 Write-Host "    Production Connection Orchestration Engine        " -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -764,7 +921,7 @@ Write-Host "  HTTP Proxy:      127.0.0.1:${Port}" -ForegroundColor Green
 Write-Host "  Mode:            $($global:ProxyState.currentMode)" -ForegroundColor Green
 Write-Host "  Thread pool:     $minThreads-$maxThreads (adaptive)" -ForegroundColor Green
 Write-Host "  Session affinity: $($global:ProxyState.sessionTTL)s TTL" -ForegroundColor Green
-Write-Host "  Health endpoint: /health" -ForegroundColor Green
+Write-Host "  Health endpoint: /health (loopback only)" -ForegroundColor Green
 Write-Host "  Safety aware:    yes" -ForegroundColor Green
 Write-Host ""
 foreach ($a in $global:ProxyState.adapters) {
@@ -779,7 +936,7 @@ Write-Host ""
 Write-Host "  Configure apps: proxy 127.0.0.1 port ${Port}" -ForegroundColor Yellow
 Write-Host ""
 
-Write-ProxyEvent "Proxy v5.0 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
+Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
@@ -825,7 +982,7 @@ try {
             
             # [V5-FIX-8] Dynamic Thread Pool Scaling Policy
             $activeThreads = $activeCount
-            $queueDepth = if ($listener.Pending()) { 5 } else { 0 } # Estimate pending requests
+            $queueDepth = if ($listener.Pending()) { 1 } else { 0 } # Conservative estimate to avoid oversensitive scale-ups
             
             if ($queueDepth -gt 0 -and $activeThreads -ge ($currentMaxThreads - 8) -and $currentMaxThreads -lt $maxThreads) {
                 $targetThreads = [math]::Max($currentMaxThreads + 16, $activeThreads + 16)
@@ -891,7 +1048,7 @@ try {
 } finally {
     $listener.Stop()
     $rsPool.Close()
-    @{ running = $false } | ConvertTo-Json | Set-Content $global:ProxyState.statsFile -Force -ErrorAction SilentlyContinue
+    try { Write-AtomicJson -Path $global:ProxyState.statsFile -Data @{ running = $false } -Depth 3 } catch {}
     Write-ProxyEvent "Proxy stopped"
     Write-Host "`n  Proxy stopped." -ForegroundColor Yellow
 }

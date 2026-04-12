@@ -18,9 +18,74 @@ param()
 $Host.UI.RawUI.WindowTitle = 'NF-Engine'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $projectDir = Split-Path $scriptDir -Parent
+$script:NetFusionVersion = '6.2'
+$configPath = Join-Path $projectDir "config\config.json"
+$engineConfig = if (Test-Path $configPath) {
+    try { Get-Content $configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+} else {
+    $null
+}
+$proxyPort = if ($engineConfig -and $engineConfig.proxyPort) { [int]$engineConfig.proxyPort } else { 8080 }
+$maxProxyRestarts = if ($engineConfig -and $engineConfig.safety -and $engineConfig.safety.maxProxyRestarts) {
+    [int]$engineConfig.safety.maxProxyRestarts
+} else {
+    3
+}
+$proxyRestartCount = 0
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 5
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Start-SmartProxyProcess {
+    param([string]$ScriptPath)
+
+    return (Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$ScriptPath`"" -WindowStyle Hidden -PassThru)
+}
+
+function Wait-ProxyBind {
+    param(
+        [int]$Port,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $ar = $tcp.BeginConnect('127.0.0.1', $Port, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(500, $false)) {
+                $tcp.Close()
+                return $true
+            }
+            $tcp.Close()
+        } catch {}
+    }
+
+    return $false
+}
 
 Write-Host "=================================================" -ForegroundColor Cyan
-Write-Host " NetFusion Engine v6.0 SOLID Starting..." -ForegroundColor Cyan
+Write-Host " NetFusion Engine v$script:NetFusionVersion SOLID Starting..." -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
 
 # 1. Execute QUIC Blocker directly once
@@ -42,7 +107,7 @@ Write-Host "  [Engine] Loading Subsystems..." -ForegroundColor DarkGray
 Write-Host "  [Engine] Booting SmartProxy..." -ForegroundColor DarkGray
 try {
     $proxyScript = Join-Path $scriptDir "SmartProxy.ps1"
-    $proxyProc = Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$proxyScript`"" -WindowStyle Hidden -PassThru
+    $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript
     Write-Host "  [+] SmartProxy Process Started (PID: $($proxyProc.Id))." -ForegroundColor Green
 } catch {
     Write-Host "  [Engine] CRUCIAL FAILURE: SmartProxy could not start! $_" -ForegroundColor Red
@@ -50,25 +115,10 @@ try {
 }
 
 # 4. Wait for proxy to bind (retry loop, up to 10s)
-Write-Host "  [Engine] Waiting for SmartProxy to bind port 8080..." -ForegroundColor DarkGray
-$portOpen = $false
-$deadline = (Get-Date).AddSeconds(10)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 500
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar = $tcp.BeginConnect('127.0.0.1', 8080, $null, $null)
-        if ($ar.AsyncWaitHandle.WaitOne(500, $false)) {
-            $portOpen = $true
-            $tcp.Close()
-            break
-        }
-        $tcp.Close()
-    } catch {}
-}
+$portOpen = Wait-ProxyBind -Port $proxyPort -TimeoutSeconds 10
 
 if ($portOpen) {
-    Write-Host "  [+] Proxy Core Verified Online (Port 8080)." -ForegroundColor Green
+    Write-Host "  [+] Proxy Core Verified Online (Port $proxyPort)." -ForegroundColor Green
 } else {
     Write-Host "  [-] Proxy Core Failed to Bind after 10s. Aborting Engine." -ForegroundColor Red
     if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue }
@@ -83,11 +133,11 @@ $TargetMetric = 25
 $safetyFile = Join-Path $projectDir "config\safety-state.json"
 $engineStartTime = Get-Date
 $initSafety = @{
-    safeMode = $false; version = '6.0'; uptime = 0
+    safeMode = $false; version = $script:NetFusionVersion; uptime = 0
     lastEvent = 'Engine started'; circuitBreakerOpen = $false
     startTime = $engineStartTime.ToString('o')
 }
-$initSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+Write-AtomicJson -Path $safetyFile -Data $initSafety -Depth 3
 Write-Host "  [+] Safety state initialized." -ForegroundColor Green
 
 $loopCount = 0
@@ -126,9 +176,9 @@ function Repair-AdapterDHCP {
                             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
                         
                         # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
-                        $lastOctet = 147 + ($allAdapters | ForEach-Object { $_.ifIndex } | Sort-Object | 
-                            ForEach-Object -Begin { $i = 0 } -Process { if ($_ -eq $adapter.ifIndex) { return $i }; $i++ })
-                        $staticIP = "192.168.1.$lastOctet"
+                        $sortedIndexes = @($allAdapters | Select-Object -ExpandProperty ifIndex | Sort-Object)
+                        $adapterPosition = [Array]::IndexOf($sortedIndexes, $adapter.ifIndex)
+                        $lastOctet = if ($adapterPosition -ge 0) { 147 + $adapterPosition } else { 149 }
                         
                         # Apply static IP with same gateway as working adapter
                         $gwParts = $workingGW -split '\.'
@@ -171,8 +221,30 @@ while ($true) {
     try {
         # Check if proxy process crashed
         if ($proxyProc.HasExited) {
-            Write-Host "  [Engine] FATAL: SmartProxy process crashed (Exit: $($proxyProc.ExitCode))!" -ForegroundColor Red
-            exit 1
+            if ($proxyRestartCount -ge $maxProxyRestarts) {
+                Write-Host "  [Engine] FATAL: SmartProxy crashed $maxProxyRestarts times (last exit: $($proxyProc.ExitCode)). Giving up." -ForegroundColor Red
+                exit 1
+            }
+
+            $proxyRestartCount++
+            $backoffSeconds = [math]::Min(30, [math]::Pow(2, $proxyRestartCount))
+            Write-Host "  [Engine] SmartProxy crashed (Exit: $($proxyProc.ExitCode)). Restart $proxyRestartCount/$maxProxyRestarts in ${backoffSeconds}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $backoffSeconds
+
+            try {
+                $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript
+            } catch {
+                Write-Host "  [Engine] Failed to restart SmartProxy: $_" -ForegroundColor Red
+                exit 1
+            }
+
+            if (-not (Wait-ProxyBind -Port $proxyPort -TimeoutSeconds 10)) {
+                Write-Host "  [Engine] Restarted SmartProxy did not bind port $proxyPort in time." -ForegroundColor Red
+                exit 1
+            }
+
+            Write-Host "  [Engine] SmartProxy restart successful (PID: $($proxyProc.Id))." -ForegroundColor Green
+            continue
         }
         
         # 1. Update Hardware Mapping (Every ~6s)
@@ -207,7 +279,7 @@ while ($true) {
         try {
             $uptimeMin = [math]::Round(((Get-Date) - $engineStartTime).TotalMinutes, 1)
             $curSafety = @{
-                safeMode = $false; version = '6.1'; circuitBreakerOpen = $false
+                safeMode = $false; version = $script:NetFusionVersion; circuitBreakerOpen = $false
                 startTime = $engineStartTime.ToString('o')
             }
             if (Test-Path $safetyFile) {
@@ -220,7 +292,7 @@ while ($true) {
             }
             $curSafety.uptime = $uptimeMin
             $curSafety.lastEvent = 'Engine running normally'
-            $curSafety | ConvertTo-Json -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+            Write-AtomicJson -Path $safetyFile -Data $curSafety -Depth 3
         } catch {}
         
     } catch {

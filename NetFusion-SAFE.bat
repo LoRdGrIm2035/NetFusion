@@ -18,7 +18,7 @@ taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-LearningEngine*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-SafetyController*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-WatchdogSupervisor*" /F >nul 2>&1
-powershell -ExecutionPolicy Bypass -Command "Get-WmiObject Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(SmartProxy|NetworkManager|InterfaceMonitor|DashboardServer|RouteController|LearningEngine|SafetyController|WatchdogSupervisor)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(SmartProxy|NetworkManager|InterfaceMonitor|DashboardServer|RouteController|LearningEngine|SafetyController|WatchdogSupervisor)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
 timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----

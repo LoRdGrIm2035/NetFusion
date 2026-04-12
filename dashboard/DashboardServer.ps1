@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    DashboardServer v5.0 -- Production API server with safety controls and deep observability.
+    DashboardServer v6.2 -- Production API server with safety controls and deep observability.
 .DESCRIPTION
     TcpListener-based HTTP server with endpoints:
       /api/stats      -- unified stats (interfaces, health, proxy, config)
@@ -28,10 +28,35 @@ $configDir = Join-Path $projectDir "config"
 $logsDir = Join-Path $projectDir "logs"
 $tokenPath = Join-Path $configDir "dashboard-token.txt"
 $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
+$legacyDashboardTokens = @(
+    'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
+)
 
 function New-RandomSecret {
     param([int]$Length = 32)
     return (-join ((65..90) + (97..122) + (48..57) | Get-Random -Count $Length | ForEach-Object { [char]$_ }))
+}
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 5
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
 }
 
 function Read-JsonFile {
@@ -62,7 +87,7 @@ function Ensure-DashboardToken {
     if (Test-Path $tokenPath) {
         try { $existing = (Get-Content $tokenPath -Raw -ErrorAction Stop).Trim() } catch {}
     }
-    if ([string]::IsNullOrWhiteSpace($existing) -or $existing.Length -lt 24) {
+    if ([string]::IsNullOrWhiteSpace($existing) -or $existing.Length -lt 24 -or $existing -in $legacyDashboardTokens) {
         $existing = New-RandomSecret -Length 32
         Set-Content $tokenPath -Value $existing -NoNewline -Force -Encoding UTF8
     }
@@ -257,7 +282,7 @@ function Set-Mode {
     if (-not (Test-Path $cfgFile)) { return $null }
     $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
     $cfg.mode = $safeMode
-    $cfg | ConvertTo-Json -Depth 5 | Set-Content $cfgFile -Force -Encoding UTF8
+    Write-AtomicJson -Path $cfgFile -Data $cfg -Depth 5
     return $safeMode
 }
 
@@ -274,7 +299,7 @@ function Set-SafeMode {
         } catch {}
     }
     $state.safeMode = $Enabled
-    $state | ConvertTo-Json -Depth 3 -Compress | Set-Content $safetyFile -Force -Encoding UTF8
+    Write-AtomicJson -Path $safetyFile -Data $state -Depth 3
 }
 
 function Reset-LearningData {
@@ -287,7 +312,7 @@ function Reset-LearningData {
         recommendations = @{}
         patterns = @()
     }
-    $empty | ConvertTo-Json -Depth 3 -Compress | Set-Content $learningFile -Force -Encoding UTF8
+    Write-AtomicJson -Path $learningFile -Data $empty -Depth 3
 }
 
 function Send-TcpResponse {
@@ -375,7 +400,7 @@ try {
         $stream.ReadTimeout = 5000
 
         try {
-            $buffer = New-Object byte[] 16384
+            $buffer = New-Object byte[] 65536
             $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
             if ($bytesRead -le 0) { $stream.Close(); $client.Close(); continue }
             $requestText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)

@@ -20,6 +20,28 @@ $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyI
 $projectDir = Split-Path $scriptDir -Parent
 $OutputFile = Join-Path $projectDir "config\interfaces.json"
 
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 4
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
 function Get-AdapterCapabilityScore {
     <# Score an adapter based on its inherent capabilities (0-100). #>
     param([string]$Type, [double]$LinkSpeedMbps, [string]$Status, [int]$WiFiGen = 0)
@@ -218,7 +240,7 @@ function Update-NetworkState {
             count      = $interfaces.Count
             interfaces = $interfaces
         }
-        $data | ConvertTo-Json -Depth 4 | Set-Content $OutputFile -Force -Encoding UTF8
+        Write-AtomicJson -Path $OutputFile -Data $data -Depth 4
 
         # Optional UI debug
         # foreach ($iface in $interfaces) { ... }

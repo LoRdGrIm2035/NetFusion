@@ -38,7 +38,7 @@ while ($true) {
     Start-Sleep -Seconds 3
     
     # Check if NetFusionEngine is running
-    $engineProcs = @(Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | 
+    $engineProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | 
         Where-Object { $_.CommandLine -and $_.CommandLine -match 'NetFusionEngine' })
     
     # Check if proxy port is listening

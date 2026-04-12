@@ -39,6 +39,29 @@ $EventsFile = Join-Path $projectDir "logs\events.json"
 # Ensure logs dir
 $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+$script:LearningEngineLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 5
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
 
 # ===== Learning Data Model =====
 # Structure:
@@ -69,10 +92,17 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 
 function Write-LearningEvent {
     param([string]$Message)
+    $mutexTaken = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
         try {
-            $mutex.WaitOne(3000) | Out-Null
+            $mutexTaken = $script:LearningEngineLogMutex.WaitOne(3000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexTaken = $true
+        }
+
+        if (-not $mutexTaken) { return }
+
+        try {
             $events = @()
             if (Test-Path $EventsFile) {
                 $data = Get-Content $EventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -81,11 +111,12 @@ function Write-LearningEvent {
             $evt = @{ timestamp = (Get-Date).ToString('o'); type = 'learning'; adapter = ''; message = $Message }
             $events = @($evt) + $events
             if ($events.Count -gt 200) { $events = $events[0..199] }
-            $tmp = [System.IO.Path]::GetTempFileName()
-            @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction SilentlyContinue
-            Move-Item $tmp $EventsFile -Force -ErrorAction SilentlyContinue
+
+            Write-AtomicJson -Path $EventsFile -Data @{ events = $events } -Depth 3
         } finally {
-            $mutex.ReleaseMutex()
+            if ($mutexTaken) {
+                try { $script:LearningEngineLogMutex.ReleaseMutex() } catch {}
+            }
         }
     } catch {}
 }
@@ -145,7 +176,7 @@ function Save-LearningData {
     param($Data)
     $Data.lastUpdated = (Get-Date).ToString('o')
     try {
-        $Data | ConvertTo-Json -Depth 5 -Compress | Set-Content $learningFile -Force -Encoding UTF8
+        Write-AtomicJson -Path $learningFile -Data $Data -Depth 5
     } catch {
         Write-Host "  [Learning] Error saving data: $_" -ForegroundColor Red
     }

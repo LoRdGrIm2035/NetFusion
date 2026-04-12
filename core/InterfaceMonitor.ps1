@@ -43,7 +43,8 @@ $pingTarget2 = '1.1.1.1'
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
 
 # Intelligence config
-$script:ewmaAlpha = 0.30
+$script:defaultEwmaAlpha = 0.30
+$script:ewmaAlphaMap = @{}
 $jitterWindowSize = if ($config -and $config.intelligence -and $config.intelligence.jitterWindow) { $config.intelligence.jitterWindow } else { 30 }
 $healthTrendWindow = if ($config -and $config.intelligence -and $config.intelligence.healthTrendWindow) { $config.intelligence.healthTrendWindow } else { 20 }
 $degradationThreshold = if ($config -and $config.intelligence -and $config.intelligence.degradationThreshold) { $config.intelligence.degradationThreshold } else { -2.0 }
@@ -64,6 +65,74 @@ $script:healthTrend = @{}           # Rolling health scores for trend: @{ name =
 $script:successRates = @{}          # Success/fail tracking: @{ name = @{ success=N; fail=N; rate=0.0 } }
 $script:degradationWarnings = @{}   # Predictive warnings: @{ name = @{ warned=$bool; trend=$val; since=$time } }
 $script:stabilityScores = @{}       # Health variance tracking for stability: @{ name = [double] }
+$script:InterfaceMonitorLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 4
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Get-ConfiguredEwmaAlphaMap {
+    param($LiveConfig)
+
+    $map = @{
+        gaming     = 0.65
+        streaming  = 0.25
+        bulk       = 0.15
+        interactive = 0.45
+        default    = $script:defaultEwmaAlpha
+    }
+
+    if ($LiveConfig -and $LiveConfig.intelligence -and $LiveConfig.intelligence.ewmaAlphas) {
+        $LiveConfig.intelligence.ewmaAlphas.PSObject.Properties | ForEach-Object {
+            $value = 0.0
+            if ([double]::TryParse([string]$_.Value, [ref]$value) -and $value -gt 0 -and $value -lt 1) {
+                $map[$_.Name] = $value
+            }
+        }
+    }
+
+    return $map
+}
+
+function Get-EwmaAlphaForMode {
+    param([string]$Mode = 'default')
+
+    $normalizedMode = if ([string]::IsNullOrWhiteSpace($Mode)) { 'default' } else { $Mode.ToLowerInvariant() }
+    $modeKey = switch ($normalizedMode) {
+        'balanced' { 'interactive'; break }
+        'download' { 'bulk'; break }
+        'maxspeed' { 'bulk'; break }
+        default { $normalizedMode }
+    }
+
+    if ($script:ewmaAlphaMap.ContainsKey($modeKey)) {
+        return [double]$script:ewmaAlphaMap[$modeKey]
+    }
+    if ($script:ewmaAlphaMap.ContainsKey('default')) {
+        return [double]$script:ewmaAlphaMap['default']
+    }
+    return $script:defaultEwmaAlpha
+}
+
+$script:ewmaAlphaMap = Get-ConfiguredEwmaAlphaMap -LiveConfig $config
 
 function Write-Event {
     param([string]$Type, [string]$Adapter, [string]$Message)
@@ -74,10 +143,17 @@ function Write-Event {
         message   = $Message
     }
     
+    $mutexTaken = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
         try {
-            $mutex.WaitOne(3000) | Out-Null
+            $mutexTaken = $script:InterfaceMonitorLogMutex.WaitOne(3000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexTaken = $true
+        }
+
+        if (-not $mutexTaken) { return }
+
+        try {
             $fileEvents = @()
             if (Test-Path $EventsFile) {
                 $data = Get-Content $EventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -85,12 +161,12 @@ function Write-Event {
             }
             $fileEvents = @($evt) + $fileEvents
             if ($fileEvents.Count -gt 200) { $fileEvents = $fileEvents[0..199] }
-            
-            $tmp = [System.IO.Path]::GetTempFileName()
-            @{ events = $fileEvents } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction SilentlyContinue
-            Move-Item $tmp $EventsFile -Force -ErrorAction SilentlyContinue
+
+            Write-AtomicJson -Path $EventsFile -Data @{ events = $fileEvents } -Depth 3
         } finally {
-            $mutex.ReleaseMutex()
+            if ($mutexTaken) {
+                try { $script:InterfaceMonitorLogMutex.ReleaseMutex() } catch {}
+            }
         }
     } catch {}
 }
@@ -148,17 +224,18 @@ function Test-InternetLatency {
 
 function Update-EWMALatency {
     <# Smooth latency using Exponential Weighted Moving Average to prevent single spikes from causing routing changes. #>
-    param([string]$Name, [double]$RawLatency, [string]$Type)
+    param([string]$Name, [double]$RawLatency, [string]$Type, [string]$Mode = 'default')
 
     $store = if ($Type -eq 'gateway') { $script:ewmaGwLatency } else { $script:ewmaLatency }
+    $alpha = Get-EwmaAlphaForMode -Mode $Mode
 
     if ($store.ContainsKey($Name) -and $store[$Name] -lt 998) {
         $prev = $store[$Name]
         if ($RawLatency -ge 999) {
             # Timeout: don't fully switch, increase gradually
-            $store[$Name] = [math]::Min(999, $prev + ($script:ewmaAlpha * (999 - $prev)))
+            $store[$Name] = [math]::Min(999, $prev + ($alpha * (999 - $prev)))
         } else {
-            $store[$Name] = ($script:ewmaAlpha * $RawLatency) + ((1 - $script:ewmaAlpha) * $prev)
+            $store[$Name] = ($alpha * $RawLatency) + ((1 - $alpha) * $prev)
         }
     } else {
         $store[$Name] = $RawLatency
@@ -318,7 +395,7 @@ function Update-SuccessRate {
 # ===== Enhanced Health Measurement =====
 
 function Measure-InterfaceHealth {
-    param([hashtable]$Interface)
+    param([hashtable]$Interface, [string]$Mode = 'default')
 
     $ip = $Interface.IPAddress
     $gateway = $Interface.Gateway
@@ -326,7 +403,7 @@ function Measure-InterfaceHealth {
 
     # --- Gateway latency ---
     $gwLatencyRaw = Test-GatewayLatency -Gateway $gateway
-    $gwLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $gwLatencyRaw -Type 'gateway'
+    $gwLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $gwLatencyRaw -Type 'gateway' -Mode $Mode
 
     # --- Internet latency (try primary then secondary target) ---
     $inetLatencyRaw = 999
@@ -336,7 +413,7 @@ function Measure-InterfaceHealth {
             $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
         }
     }
-    $inetLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $inetLatencyRaw -Type 'internet'
+    $inetLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $inetLatencyRaw -Type 'internet' -Mode $Mode
 
     # --- Update latency history and measure jitter ---
     Update-LatencyHistory -Name $name -RawLatency $inetLatencyRaw
@@ -506,16 +583,7 @@ function Update-HealthState {
         try {
             $liveCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
             $activeMode = if ($liveCfg -and $liveCfg.mode) { $liveCfg.mode } else { 'maxspeed' }
-            
-            $alphaMap = @{ gaming = 0.65; streaming = 0.25; balanced = 0.45; download = 0.15; maxspeed = 0.15 }
-            if ($liveCfg -and $liveCfg.intelligence -and $liveCfg.intelligence.ewmaAlphas) {
-                $a = $liveCfg.intelligence.ewmaAlphas
-                if ($a.gaming) { $alphaMap.gaming = $a.gaming }
-                if ($a.streaming) { $alphaMap.streaming = $a.streaming }
-                if ($a.interactive) { $alphaMap.balanced = $a.interactive }
-                if ($a.bulk) { $alphaMap.download = $a.bulk; $alphaMap.maxspeed = $a.bulk }
-            }
-            $script:ewmaAlpha = if ($alphaMap.ContainsKey($activeMode)) { $alphaMap[$activeMode] } else { 0.30 }
+            $script:ewmaAlphaMap = Get-ConfiguredEwmaAlphaMap -LiveConfig $liveCfg
         } catch {}
 
         if (-not (Test-Path $InterfacesFile)) {
@@ -529,7 +597,7 @@ function Update-HealthState {
             $ifHash = @{}
             $iface.PSObject.Properties | ForEach-Object { $ifHash[$_.Name] = $_.Value }
 
-            $health = Measure-InterfaceHealth -Interface $ifHash
+            $health = Measure-InterfaceHealth -Interface $ifHash -Mode $activeMode
             $healthResults += $health
 
             # Optional UI Console Output
@@ -548,7 +616,7 @@ function Update-HealthState {
             adapters    = $healthResults
             degradation = $script:degradationWarnings
         }
-        $healthOutput | ConvertTo-Json -Depth 4 | Set-Content $HealthFile -Force -Encoding UTF8
+        Write-AtomicJson -Path $HealthFile -Data $healthOutput -Depth 4
 
         # Rotate CSV and Events log every 50 loops
         $script:loopCount++

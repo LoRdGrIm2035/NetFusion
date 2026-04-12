@@ -7,6 +7,29 @@ param()
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $configPath = Join-Path $projectDir "config\config.json"
+$script:configChanged = $false
+
+function Write-AtomicJson {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 5
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        $Data | ConvertTo-Json -Depth $Depth | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
+        Move-Item $tmp $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
 
 try {
     $rawText = Get-Content $configPath -Raw -ErrorAction Stop
@@ -18,6 +41,7 @@ try {
     if (Test-Path $defaultPath) {
         Copy-Item $defaultPath $configPath -Force
         $config = Get-Content $configPath -Raw | ConvertFrom-Json
+        $script:configChanged = $true
     } else {
         Write-Host "  [ConfigValidator] CRITICAL: config.default.json missing too. Cannot recover." -ForegroundColor Red
         exit 1
@@ -31,32 +55,37 @@ function Check-Number($obj, $prop, $min, $max, $default) {
     if ($null -eq $obj.$prop) {
         $obj | Add-Member -MemberType NoteProperty -Name $prop -Value $default -Force
         $script:warnings++
+        $script:configChanged = $true
         return
     }
     if ($obj.$prop -as [double] -isnot [double] -and $obj.$prop -as [int] -isnot [int]) {
         Write-Host "  [Config] WARNING: '$prop' must be a number. Using $default." -ForegroundColor Yellow
         $obj.$prop = $default
         $script:warnings++
+        $script:configChanged = $true
     } elseif ($obj.$prop -lt $min -or $obj.$prop -gt $max) {
         Write-Host "  [Config] WARNING: '$prop' ($($obj.$prop)) out of range [$min-$max]. Using $default." -ForegroundColor Yellow
         $obj.$prop = $default
         $script:warnings++
+        $script:configChanged = $true
     }
 }
 
 function Check-Bool($obj, $prop, $default) {
     if ($null -eq $obj.$prop) {
         $obj | Add-Member -MemberType NoteProperty -Name $prop -Value $default -Force
+        $script:configChanged = $true
         return
     }
     if ($obj.$prop -isnot [bool]) {
         $val = $obj.$prop.ToString().ToLower()
-        if ($val -eq "true" -or $val -eq "1") { $obj.$prop = $true }
-        elseif ($val -eq "false" -or $val -eq "0") { $obj.$prop = $false }
+        if ($val -eq "true" -or $val -eq "1") { $obj.$prop = $true; $script:configChanged = $true }
+        elseif ($val -eq "false" -or $val -eq "0") { $obj.$prop = $false; $script:configChanged = $true }
         else {
             Write-Host "  [Config] WARNING: '$prop' must be boolean. Using $default." -ForegroundColor Yellow
             $obj.$prop = $default
             $script:warnings++
+            $script:configChanged = $true
         }
     }
 }
@@ -64,18 +93,20 @@ function Check-Bool($obj, $prop, $default) {
 function Check-Enum($obj, $prop, $allowed, $default) {
     if ($null -eq $obj.$prop) {
         $obj | Add-Member -MemberType NoteProperty -Name $prop -Value $default -Force
+        $script:configChanged = $true
         return
     }
     if ($obj.$prop -notin $allowed) {
         Write-Host "  [Config] WARNING: '$prop' ($($obj.$prop)) invalid. Allowed: $($allowed -join ', '). Using $default." -ForegroundColor Yellow
         $obj.$prop = $default
         $script:warnings++
+        $script:configChanged = $true
     }
 }
 
 # Validate Core
-Check-Number $config 'proxyPort' 1024 65535 8888
-Check-Number $config 'dashboardPort' 1024 65535 8877
+Check-Number $config 'proxyPort' 1024 65535 8080
+Check-Number $config 'dashboardPort' 1024 65535 9090
 Check-Enum $config 'mode' $validModes 'maxspeed'
 Check-Bool $config 'dashboardAllowLAN' $false
 Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
@@ -92,7 +123,7 @@ if ($config.proxy) {
 # Validate circuit breaker
 if ($config.safety) {
     Check-Number $config.safety 'maxProxyRestarts' 1 10 3
-    Check-Number $config.safety 'memoryThresholdMB' 100 8000 800
+    Check-Number $config.safety 'memoryThresholdMB' 100 8000 2000
     if ($config.safety.circuitBreaker) {
         $cb = $config.safety.circuitBreaker
         Check-Number $cb 'proxyErrorRateThreshold' 0.01 1.0 0.15
@@ -110,10 +141,14 @@ if ($config.trafficRules) {
     }
 }
 
-if ($warnings -gt 0) {
+if ($warnings -gt 0 -or $script:configChanged) {
     try {
-        $config | ConvertTo-Json -Depth 5 | Set-Content $configPath -Force
-        Write-Host "  [ConfigValidator] Sanitized config.json ($warnings warnings fixed)." -ForegroundColor DarkGray
+        Write-AtomicJson -Path $configPath -Data $config -Depth 5
+        if ($warnings -gt 0) {
+            Write-Host "  [ConfigValidator] Sanitized config.json ($warnings warnings fixed)." -ForegroundColor DarkGray
+        } else {
+            Write-Host "  [ConfigValidator] Normalized config.json." -ForegroundColor DarkGray
+        }
     } catch {
         Write-Host "  [ConfigValidator] Failed to overwrite config.json!" -ForegroundColor Red
         exit 1
