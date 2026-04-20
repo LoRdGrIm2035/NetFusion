@@ -54,10 +54,15 @@ $enableDhcpAutoRepair = if ($engineConfig -and $engineConfig.selfHealing -and $n
 } else {
     $false
 }
+$engineMode = if ($engineConfig -and $engineConfig.mode) { ([string]$engineConfig.mode).ToLowerInvariant() } else { 'maxspeed' }
+$throughputMode = $engineMode -in @('maxspeed', 'download')
 $enableEcmpEnforcement = if ($engineConfig -and $engineConfig.routing -and $null -ne $engineConfig.routing.enforceECMP) {
     [bool]$engineConfig.routing.enforceECMP
 } else {
     $false
+}
+if ($throughputMode -and -not $enableEcmpEnforcement) {
+    $enableEcmpEnforcement = $true
 }
 $proxyRestartCount = 0
 
@@ -182,6 +187,25 @@ function Get-AvailableRecoveryIP {
     }
 
     return $null
+}
+
+function Test-GatewayReachability {
+    param([string]$Gateway)
+
+    if ([string]::IsNullOrWhiteSpace($Gateway)) { return $false }
+    try {
+        $ping = ping.exe -n 1 -w 500 $Gateway 2>$null
+        $joined = ($ping | Out-String)
+        if (
+            ($joined -match 'TTL=' -or $joined -match 'time[=<]\d+\s*ms') -and
+            $joined -notmatch '(?i)unreachable|timed out|general failure'
+        ) {
+            return $true
+        }
+        return $false
+    } catch {
+        return $false
+    }
 }
 
 Write-Host "=================================================" -ForegroundColor Cyan
@@ -318,18 +342,47 @@ function Repair-AdapterDHCP {
 # v6.1: ECMP Enforcement - keep both adapters' metrics equal
 function Enforce-ECMP {
     $targetMetric = if ($engineConfig -and $engineConfig.routing -and $engineConfig.routing.targetMetric) { [int]$engineConfig.routing.targetMetric } else { 25 }
-    $wifiAdapters = Get-NetAdapter | Where-Object { 
-        $_.Status -eq 'Up' -and $_.Name -match 'Wi-Fi' 
+    $candidateAdapters = Get-NetAdapter | Where-Object { 
+        $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier'
     }
     
-    if ($wifiAdapters.Count -ge 2) {
-        foreach ($wa in $wifiAdapters) {
+    if ($candidateAdapters.Count -ge 2) {
+        foreach ($wa in $candidateAdapters) {
             $currentMetric = (Get-NetIPInterface -InterfaceIndex $wa.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric
             if ($currentMetric -ne $targetMetric) {
-                try {
-                    Set-NetIPInterface -InterfaceIndex $wa.ifIndex -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
-                    Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
-                } catch {}
+                try { Set-NetIPInterface -InterfaceIndex $wa.ifIndex -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue } catch {}
+            }
+
+            $defaultRoutes = @(
+                Get-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Sort-Object RouteMetric
+            )
+            if ($defaultRoutes.Count -eq 0) { continue }
+
+            $reachable = @()
+            $unreachable = @()
+            foreach ($route in $defaultRoutes) {
+                if (Test-GatewayReachability -Gateway ([string]$route.NextHop)) {
+                    $reachable += $route
+                } else {
+                    $unreachable += $route
+                }
+            }
+
+            if ($reachable.Count -gt 0) {
+                $primary = $reachable | Sort-Object RouteMetric | Select-Object -First 1
+                foreach ($route in $reachable) {
+                    $desiredMetric = if ($route.NextHop -eq $primary.NextHop) { $targetMetric } else { [math]::Max($targetMetric + 5, [int]$route.RouteMetric) }
+                    if ([int]$route.RouteMetric -ne $desiredMetric) {
+                        try { Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -NextHop $route.NextHop -RouteMetric $desiredMetric -ErrorAction SilentlyContinue } catch {}
+                    }
+                }
+            }
+
+            foreach ($route in $unreachable) {
+                if ([int]$route.RouteMetric -lt 500) {
+                    try { Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -NextHop $route.NextHop -RouteMetric 500 -ErrorAction SilentlyContinue } catch {}
+                }
             }
         }
     }

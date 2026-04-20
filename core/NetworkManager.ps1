@@ -19,6 +19,7 @@ param(
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $OutputFile = Join-Path $projectDir "config\interfaces.json"
+$script:gatewayProbeCache = @{}
 
 function Write-AtomicJson {
     param(
@@ -88,6 +89,64 @@ function Get-AdapterFingerprint {
     return [BitConverter]::ToString($hash[0..7]).Replace('-', '').ToLower()
 }
 
+function Test-GatewayReachable {
+    param(
+        [string]$Gateway,
+        [int]$CacheTtlSec = 20
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Gateway)) { return $false }
+    $key = [string]$Gateway
+    $now = Get-Date
+    if ($script:gatewayProbeCache.ContainsKey($key)) {
+        $cached = $script:gatewayProbeCache[$key]
+        try {
+            if ($cached -and $cached.time -and (($now - [datetime]$cached.time).TotalSeconds -lt $CacheTtlSec)) {
+                return [bool]$cached.ok
+            }
+        } catch {}
+    }
+
+    $ok = $false
+    try {
+        $ping = ping.exe -n 1 -w 500 $Gateway 2>$null
+        $joined = ($ping | Out-String)
+        if (
+            ($joined -match 'TTL=' -or $joined -match 'time[=<]\d+\s*ms') -and
+            $joined -notmatch '(?i)unreachable|timed out|general failure'
+        ) {
+            $ok = $true
+        }
+    } catch {}
+
+    $script:gatewayProbeCache[$key] = @{
+        time = $now
+        ok = $ok
+    }
+    return $ok
+}
+
+function Get-PreferredDefaultRoute {
+    param([int]$InterfaceIndex)
+
+    $routes = @(
+        Get-NetRoute -InterfaceIndex $InterfaceIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Sort-Object RouteMetric
+    )
+    if ($routes.Count -eq 0) { return $null }
+
+    $reachableRoute = $null
+    foreach ($r in $routes) {
+        if (Test-GatewayReachable -Gateway ([string]$r.NextHop)) {
+            $reachableRoute = $r
+            break
+        }
+    }
+
+    if ($reachableRoute) { return $reachableRoute }
+    return ($routes | Select-Object -First 1)
+}
+
 function Get-AllNetworkInterfaces {
     <#
     .SYNOPSIS
@@ -153,8 +212,7 @@ function Get-AllNetworkInterfaces {
 
         # Get gateway once here so InterfaceMonitor can consume it from interfaces.json
         # instead of issuing duplicate Get-NetRoute queries every health cycle.
-        $routeInfo = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                     Sort-Object RouteMetric | Select-Object -First 1
+        $routeInfo = Get-PreferredDefaultRoute -InterfaceIndex $adapter.ifIndex
         $gateway = if ($routeInfo) { $routeInfo.NextHop } else { $null }
 
         # Get interface metric

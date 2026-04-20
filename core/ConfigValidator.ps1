@@ -128,6 +128,33 @@ if ($config.proxy) {
     Check-Number $config.proxy 'socketIoTimeout' 5000 300000 45000
     Check-Number $config.proxy 'listenerBacklog' 128 8192 2048
     Check-Number $config.proxy 'staleJobTimeoutSec' 0 86400 0
+    Check-Number $config.proxy 'httpsBulkPromotionHostThreshold' 1 32 1
+    Check-Number $config.proxy 'httpsBulkPromotionGlobalThreshold' 1 128 4
+    Check-Number $config.proxy 'retryWeightFloor' 0.1 3.0 0.25
+    Check-Number $config.proxy 'bulkHeadroomWeight' 0.0 1.0 0.35
+    Check-Number $config.proxy 'bulkPressureThreshold' 4 512 10
+    if ($null -eq $config.proxy.retryPolicy) {
+        $config.proxy | Add-Member -MemberType NoteProperty -Name retryPolicy -Value 'leastLoaded' -Force
+        $script:configChanged = $true
+    } else {
+        $retryPolicyNorm = ([string]$config.proxy.retryPolicy).Trim().ToLowerInvariant()
+        if ($retryPolicyNorm -eq 'leastloaded') {
+            if ($config.proxy.retryPolicy -ne 'leastLoaded') {
+                $config.proxy.retryPolicy = 'leastLoaded'
+                $script:configChanged = $true
+            }
+        } elseif ($retryPolicyNorm -eq 'weightedrandom') {
+            if ($config.proxy.retryPolicy -ne 'weightedRandom') {
+                $config.proxy.retryPolicy = 'weightedRandom'
+                $script:configChanged = $true
+            }
+        } else {
+            Write-Host "  [Config] WARNING: 'retryPolicy' ($($config.proxy.retryPolicy)) invalid. Using leastLoaded." -ForegroundColor Yellow
+            $config.proxy.retryPolicy = 'leastLoaded'
+            $script:warnings++
+            $script:configChanged = $true
+        }
+    }
     if ($config.proxy.maxThreads -lt $config.proxy.minThreads) {
         $config.proxy.maxThreads = $config.proxy.minThreads
         $script:configChanged = $true
@@ -143,6 +170,54 @@ if ($config.routing) {
 if ($config.selfHealing) {
     Check-Bool $config.selfHealing 'dhcpAutoRepair' $false
     Check-Number $config.selfHealing 'dhcpRepairIntervalSec' 30 600 120
+}
+
+# Throughput-profile guardrails: keep high-performance modes from inheriting
+# conservative thread and stickiness values that cap dual-link aggregation.
+$throughputMode = $config.mode -in @('maxspeed', 'download')
+if ($throughputMode -and $config.proxy) {
+    if ($config.proxy.maxThreads -lt 512) {
+        Write-Host "  [Config] WARNING: maxspeed/download requires higher thread headroom. Raising proxy.maxThreads to 512." -ForegroundColor Yellow
+        $config.proxy.maxThreads = 512
+        $script:warnings++
+        $script:configChanged = $true
+    }
+    if ($config.proxy.minThreads -lt 96) {
+        $config.proxy.minThreads = 96
+        $script:configChanged = $true
+    }
+    if ($config.proxy.sessionAffinityTTL -gt 120) {
+        $config.proxy.sessionAffinityTTL = 120
+        $script:configChanged = $true
+    }
+    if ($config.proxy.httpsBulkPromotionHostThreshold -gt 1) {
+        $config.proxy.httpsBulkPromotionHostThreshold = 1
+        $script:configChanged = $true
+    }
+    if ($config.proxy.httpsBulkPromotionGlobalThreshold -gt 4) {
+        $config.proxy.httpsBulkPromotionGlobalThreshold = 4
+        $script:configChanged = $true
+    }
+    if ($config.proxy.bulkPressureThreshold -gt 10) {
+        $config.proxy.bulkPressureThreshold = 10
+        $script:configChanged = $true
+    }
+    if ($config.proxy.maxThreads -lt $config.proxy.minThreads) {
+        $config.proxy.maxThreads = $config.proxy.minThreads
+        $script:configChanged = $true
+    }
+    if (-not $config.routing) {
+        $config | Add-Member -MemberType NoteProperty -Name routing -Value ([pscustomobject]@{}) -Force
+        $script:configChanged = $true
+    }
+    $routingEnforcePresent = $config.routing.PSObject.Properties['enforceECMP'] -ne $null
+    if (-not $routingEnforcePresent) {
+        $config.routing | Add-Member -MemberType NoteProperty -Name enforceECMP -Value $true -Force
+        $script:configChanged = $true
+    } elseif (-not [bool]$config.routing.enforceECMP) {
+        $config.routing.enforceECMP = $true
+        $script:configChanged = $true
+    }
 }
 
 # Validate circuit breaker

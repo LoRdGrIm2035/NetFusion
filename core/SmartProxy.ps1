@@ -35,6 +35,7 @@ $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
 $global:ActiveCounterLock = [object]::new()
+$global:HostCounterLock = [object]::new()
 $global:ConnectIpv6TargetRegex = [System.Text.RegularExpressions.Regex]::new(
     '^\[(?<host>.*)\]:(?<port>\d+)$',
     [System.Text.RegularExpressions.RegexOptions]::Compiled
@@ -55,6 +56,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     totalFails       = 0
     activeConnections = 0        # v5.1: live active connection count
     activeCounterLock = $global:ActiveCounterLock
+    hostCounterLock   = $global:HostCounterLock
     activePerAdapter  = [hashtable]::Synchronized(@{})      # v5.1: per-adapter active counts
     activePerHost     = [hashtable]::Synchronized(@{})      # v5.1: per-host active counts for dynamic bulk detection
     currentMode      = 'maxspeed'
@@ -63,6 +65,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     socketIoTimeout  = 45000
     listenerBacklog  = 2048
     staleJobTimeoutSec = 0
+    statsWriteIntervalSec = 2
     configFile       = $configFile
     healthFile       = $healthFile
     interfacesFile   = $interfacesFile
@@ -82,6 +85,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     uploadHostHints  = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
     uploadHintTTL    = 300
     activeConns      = @{}
+    adapterIpCache   = @{}
     connectIpv6Regex = $global:ConnectIpv6TargetRegex
     connectHostPortRegex = $global:ConnectHostPortRegex
     weightRefreshInterval = 2.0
@@ -93,12 +97,12 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     bulkPressureThreshold = 24
     maxConnectRetries = 3
     bufferSizes      = @{
-        'bulk'        = 524288   # 512KB for downloads (maximum throughput pipes)
+        'bulk'        = 4194304  # 4MB for high-BDP bulk transfers
         'interactive' = 32768    # 32KB for browsing
-        'streaming'   = 262144   # 256KB for streaming (smooth 4K playback)
+        'streaming'   = 1048576  # 1MB for streaming stability
         'gaming'      = 8192     # 8KB for gaming (low latency)
         'voice'       = 32768
-        'default'     = 131072   # 128KB default
+        'default'     = 524288   # 512KB default
     }
     # v5.0 Session Affinity
     sessionMap     = [hashtable]::Synchronized(@{})    # { "host:port" -> @{ adapter=Name; time=DateTime } }
@@ -180,9 +184,12 @@ function Repair-EventsFile {
 function Get-SafeBufferSize {
     param(
         [int]$RequestedSize,
-        [int]$MaxSize = 1048576
+        [int]$MaxSize = 0
     )
 
+    if ($MaxSize -le 0) {
+        $MaxSize = if ([IntPtr]::Size -le 4) { 262144 } else { 8388608 }
+    }
     $safe = [Math]::Max(8192, [Math]::Min($RequestedSize, $MaxSize))
     if ([IntPtr]::Size -le 4 -and $safe -gt 262144) {
         return 262144
@@ -231,7 +238,15 @@ function Get-ProxyAdapters {
     if ($data -and $data.interfaces) {
         foreach ($iface in $data.interfaces) {
             if ($iface.IPAddress -and $iface.Status -eq 'Up') {
-                $adapters += @{ Name = $iface.Name; IP = $iface.IPAddress; Type = $iface.Type; Speed = $iface.LinkSpeedMbps }
+                $parsedIp = $null
+                try { $parsedIp = [System.Net.IPAddress]::Parse([string]$iface.IPAddress) } catch {}
+                $adapters += @{
+                    Name = $iface.Name
+                    IP = $iface.IPAddress
+                    ParsedIP = $parsedIp
+                    Type = $iface.Type
+                    Speed = $iface.LinkSpeedMbps
+                }
             }
         }
     }
@@ -240,7 +255,15 @@ function Get-ProxyAdapters {
             $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
             if ($ip) {
                 $type = if ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11' -or $_.Name -match 'Wi-Fi') { if ($_.InterfaceDescription -match 'USB') { 'USB-WiFi' } else { 'WiFi' } } elseif ($_.InterfaceDescription -match 'Ethernet') { 'Ethernet' } else { 'Unknown' }
-                $adapters += @{ Name = $_.Name; IP = $ip; Type = $type; Speed = 100 }
+                $parsedIp = $null
+                try { $parsedIp = [System.Net.IPAddress]::Parse([string]$ip) } catch {}
+                $adapters += @{
+                    Name = $_.Name
+                    IP = $ip
+                    ParsedIP = $parsedIp
+                    Type = $type
+                    Speed = 100
+                }
             }
         }
     }
@@ -250,6 +273,12 @@ function Get-ProxyAdapters {
 function Update-AdaptersAndWeights {
     $s = $global:ProxyState
     $s.adapters = @(Get-ProxyAdapters)
+    $s.adapterIpCache = @{}
+    foreach ($adapter in $s.adapters) {
+        if ($adapter.Name -and $adapter.ParsedIP) {
+            $s.adapterIpCache[$adapter.Name] = $adapter.ParsedIP
+        }
+    }
 
     # v5.0: Check safe mode
     if (Test-Path $s.safetyFile) {
@@ -377,7 +406,21 @@ function Update-AdaptersAndWeights {
                     $s.bulkPressureThreshold = [int]$p.bulkPressureThreshold
                 }
             }
+            if ($cfg.telemetry -and $null -ne $cfg.telemetry.statsWriteIntervalSec -and [int]$cfg.telemetry.statsWriteIntervalSec -ge 1) {
+                $s.statsWriteIntervalSec = [int]$cfg.telemetry.statsWriteIntervalSec
+            }
         } catch {}
+    }
+
+    $throughputMode = $s.currentMode -in @('maxspeed', 'download')
+    if ($throughputMode) {
+        # Throughput-first guardrails: prevent sticky behavior and late balancing
+        # from reducing aggregate utilization in dual-link workloads.
+        if ($s.sessionTTL -gt 120) { $s.sessionTTL = 120 }
+        if ($s.httpsBulkPromotionHostThreshold -gt 1) { $s.httpsBulkPromotionHostThreshold = 1 }
+        if ($s.httpsBulkPromotionGlobalThreshold -gt 4) { $s.httpsBulkPromotionGlobalThreshold = 4 }
+        if ($s.bulkPressureThreshold -gt 10) { $s.bulkPressureThreshold = 10 }
+        if ($s.retryPolicy -ne 'leastloaded') { $s.retryPolicy = 'leastloaded' }
     }
 
     $weights = @()
@@ -466,20 +509,32 @@ function Update-ProxyStats {
         newestSessionAge = 0
         averageSessionAge = 0
     }
-    $sessionAges = @()
     $sessionNow = Get-Date
-    foreach ($sessionKey in @($s.sessionMap.Keys)) {
+    $sessionKeys = @($s.sessionMap.Keys)
+    if ($sessionKeys.Count -gt 512) {
+        $sessionKeys = $sessionKeys[0..511]
+    }
+    $sampleCount = 0
+    $sumAge = 0.0
+    $maxAge = 0.0
+    $minAge = [double]::MaxValue
+    foreach ($sessionKey in $sessionKeys) {
         $entry = $s.sessionMap[$sessionKey]
         try {
             if ($entry -and $entry.time) {
-                $sessionAges += ($sessionNow - [datetime]$entry.time).TotalSeconds
+                $age = [double](($sessionNow - [datetime]$entry.time).TotalSeconds)
+                if ($age -lt 0) { $age = 0 }
+                $sampleCount++
+                $sumAge += $age
+                if ($age -gt $maxAge) { $maxAge = $age }
+                if ($age -lt $minAge) { $minAge = $age }
             }
         } catch {}
     }
-    if ($sessionAges.Count -gt 0) {
-        $sessionStats.oldestSessionAge = [Math]::Round(($sessionAges | Measure-Object -Maximum).Maximum, 2)
-        $sessionStats.newestSessionAge = [Math]::Round(($sessionAges | Measure-Object -Minimum).Minimum, 2)
-        $sessionStats.averageSessionAge = [Math]::Round(($sessionAges | Measure-Object -Average).Average, 2)
+    if ($sampleCount -gt 0) {
+        $sessionStats.oldestSessionAge = [Math]::Round($maxAge, 2)
+        $sessionStats.newestSessionAge = [Math]::Round($minAge, 2)
+        $sessionStats.averageSessionAge = [Math]::Round(($sumAge / [double]$sampleCount), 2)
     }
     $statsSnapshot = @{
         running = $Running; port = $s.port; mode = $s.currentMode
@@ -1011,7 +1066,7 @@ $HandlerScript = {
         # v5.1: Track host concurrency for dynamic download manager detection
         $hostKey = $targetHost
         $activeHostCount = 0
-        $hostLockObj = if ($State.activeCounterLock) { $State.activeCounterLock } else { $global:ActiveCounterLock }
+        $hostLockObj = if ($State.hostCounterLock) { $State.hostCounterLock } elseif ($State.activeCounterLock) { $State.activeCounterLock } else { $global:HostCounterLock }
         [System.Threading.Monitor]::Enter($hostLockObj)
         try {
             if (-not $State.activePerHost.ContainsKey($hostKey)) { $State.activePerHost[$hostKey] = 0 }
@@ -1039,6 +1094,12 @@ $HandlerScript = {
             $globalConcurrency = Get-LockedActiveConnections -ProxyState $State
             $hostPromotionThreshold = if ($null -ne $State.httpsBulkPromotionHostThreshold -and [int]$State.httpsBulkPromotionHostThreshold -ge 1) { [int]$State.httpsBulkPromotionHostThreshold } else { 2 }
             $globalPromotionThreshold = if ($null -ne $State.httpsBulkPromotionGlobalThreshold -and [int]$State.httpsBulkPromotionGlobalThreshold -ge 1) { [int]$State.httpsBulkPromotionGlobalThreshold } else { 8 }
+            if ($aggressiveMode) {
+                # Max-throughput profiles should not wait long before promoting
+                # HTTPS/HTTP flows to bulk scheduling.
+                $hostPromotionThreshold = [math]::Min($hostPromotionThreshold, 1)
+                $globalPromotionThreshold = [math]::Min($globalPromotionThreshold, 4)
+            }
             if ($aggressiveMode -and ($activeHostCount -ge $hostPromotionThreshold -or $globalConcurrency -ge $globalPromotionThreshold)) {
                 # Promote HTTPS/HTTP flows to bulk earlier in throughput-first modes
                 # so multi-session workloads distribute across both links sooner.
@@ -1160,122 +1221,155 @@ $HandlerScript = {
                 # Bulk Traffic: capacity-aware least-busy scheduling.
                 # Health-only balancing can overload the slower adapter and reduce
                 # total throughput, so bias by link capability as well.
-                $bulkGlobalActive = Get-LockedActiveConnections -ProxyState $State
                 $bulkPressureThreshold = if ($null -ne $State.bulkPressureThreshold -and [int]$State.bulkPressureThreshold -ge 1) { [int]$State.bulkPressureThreshold } else { 24 }
+                $throughputMode = $State.currentMode -in @('maxspeed', 'download')
+                if ($throughputMode) {
+                    $bulkPressureThreshold = [math]::Min($bulkPressureThreshold, [math]::Max(6, $avail.Count * 4))
+                }
                 $bulkHeadroomWeight = if ($null -ne $State.bulkHeadroomWeight) { [double]$State.bulkHeadroomWeight } else { 0.35 }
                 $bulkHeadroomWeight = [math]::Max(0.0, [math]::Min(1.0, $bulkHeadroomWeight))
-                $trackedActive = 0
-                foreach ($ta in $avail) {
-                    $trackedActive += if ($State.activePerAdapter.ContainsKey($ta.Name)) { [int]$State.activePerAdapter[$ta.Name] } else { 0 }
+
+                # Throughput mode: serialize bulk selection + reservation so concurrent bursts
+                # cannot herd to one adapter before active counters update.
+                $bulkLockObj = if ($State.activeCounterLock) { $State.activeCounterLock } else { $global:ActiveCounterLock }
+                $bulkLockTaken = $false
+                if ($throughputMode) {
+                    [System.Threading.Monitor]::Enter($bulkLockObj)
+                    $bulkLockTaken = $true
                 }
-                if ($trackedActive -gt 0) { $bulkGlobalActive = $trackedActive }
+                try {
+                    $bulkGlobalActive = Get-LockedActiveConnections -ProxyState $State
+                    $trackedActive = 0
+                    foreach ($ta in $avail) {
+                        $trackedActive += if ($State.activePerAdapter.ContainsKey($ta.Name)) { [int]$State.activePerAdapter[$ta.Name] } else { 0 }
+                    }
+                    if ($trackedActive -gt 0) { $bulkGlobalActive = $trackedActive }
 
-                $bestBulkIdx = 0
-                $bestBulkScore = [double]::MaxValue
-                for ($bi = 0; $bi -lt $avail.Count; $bi++) {
-                    $aName  = $avail[$bi].Name
-                    $active = if ($State.activePerAdapter.ContainsKey($aName)) { [int]($State.activePerAdapter[$aName]) } else { 0 }
-                    $aHealth = $State.adapterHealth[$aName]
-                    $linkMbps = 100.0
-                    if ($null -ne $avail[$bi].Speed -and [double]$avail[$bi].Speed -gt 0) {
-                        $linkMbps = [double]$avail[$bi].Speed
-                    }
-                    if ($aHealth -and $null -ne $aHealth.LinkSpeedMbps -and [double]$aHealth.LinkSpeedMbps -gt 0) {
-                        $linkMbps = [double]$aHealth.LinkSpeedMbps
-                    }
-
-                    # Bulk flows can be upload-heavy or download-heavy. Use the strongest
-                    # observed direction so scheduling is not biased by download-only telemetry.
-                    $observedMbps = 0.0
-                    if ($aHealth -and $null -ne $aHealth.EstimatedDownMbps -and [double]$aHealth.EstimatedDownMbps -gt $observedMbps) {
-                        $observedMbps = [double]$aHealth.EstimatedDownMbps
-                    }
-                    if ($aHealth -and $null -ne $aHealth.EstimatedUpMbps -and [double]$aHealth.EstimatedUpMbps -gt $observedMbps) {
-                        $observedMbps = [double]$aHealth.EstimatedUpMbps
-                    }
-                    if ($aHealth -and $null -ne $aHealth.DownloadMbps -and [double]$aHealth.DownloadMbps -gt $observedMbps) {
-                        $observedMbps = [double]$aHealth.DownloadMbps
-                    }
-                    if ($aHealth -and $null -ne $aHealth.UploadMbps -and [double]$aHealth.UploadMbps -gt $observedMbps) {
-                        $observedMbps = [double]$aHealth.UploadMbps
-                    }
-
-                    if ($observedMbps -gt 0) {
-                        $speedFactor = [math]::Max(1.0, [math]::Min(12.0, $observedMbps / 5.0))
-                    } else {
-                        $speedFactor = [math]::Max(1.0, [math]::Min(6.0, [math]::Sqrt([math]::Max(50.0, $linkMbps) / 50.0)))
-                    }
-
-                    $healthFactor = 0.6
-                    $successFactor = 1.0
-                    $stabilityFactor = 0.8
-                    $latencyPenalty = 1.0
-                    if ($aHealth) {
-                        if ($null -ne $aHealth.Score -and [double]$aHealth.Score -gt 0) {
-                            $healthFactor = [math]::Max(0.35, [double]$aHealth.Score / 100.0)
+                    $bestBulkIdx = 0
+                    $bestBulkScore = [double]::MaxValue
+                    for ($bi = 0; $bi -lt $avail.Count; $bi++) {
+                        $aName  = $avail[$bi].Name
+                        $active = if ($State.activePerAdapter.ContainsKey($aName)) { [int]($State.activePerAdapter[$aName]) } else { 0 }
+                        $aHealth = $State.adapterHealth[$aName]
+                        $linkMbps = 100.0
+                        if ($null -ne $avail[$bi].Speed -and [double]$avail[$bi].Speed -gt 0) {
+                            $linkMbps = [double]$avail[$bi].Speed
                         }
-                        if ($null -ne $aHealth.SuccessRate -and [double]$aHealth.SuccessRate -gt 0) {
-                            $successFactor = [math]::Max(0.4, [double]$aHealth.SuccessRate / 100.0)
-                        }
-                        if ($null -ne $aHealth.Stability -and [double]$aHealth.Stability -gt 0) {
-                            $stabilityFactor = [math]::Max(0.5, [double]$aHealth.Stability / 100.0)
+                        if ($aHealth -and $null -ne $aHealth.LinkSpeedMbps -and [double]$aHealth.LinkSpeedMbps -gt 0) {
+                            $linkMbps = [double]$aHealth.LinkSpeedMbps
                         }
 
-                        $lat = if ($null -ne $aHealth.LatencyEWMA) { [double]$aHealth.LatencyEWMA } else { 999.0 }
-                        if ($lat -gt 150) {
-                            $latencyPenalty = 0.55
-                        } elseif ($lat -gt 80) {
-                            $latencyPenalty = 0.75
-                        } elseif ($lat -gt 40) {
-                            $latencyPenalty = 0.9
+                        # Bulk flows can be upload-heavy or download-heavy. Use the strongest
+                        # observed direction so scheduling is not biased by download-only telemetry.
+                        $observedMbps = 0.0
+                        if ($aHealth -and $null -ne $aHealth.EstimatedDownMbps -and [double]$aHealth.EstimatedDownMbps -gt $observedMbps) {
+                            $observedMbps = [double]$aHealth.EstimatedDownMbps
+                        }
+                        if ($aHealth -and $null -ne $aHealth.EstimatedUpMbps -and [double]$aHealth.EstimatedUpMbps -gt $observedMbps) {
+                            $observedMbps = [double]$aHealth.EstimatedUpMbps
+                        }
+                        if ($aHealth -and $null -ne $aHealth.DownloadMbps -and [double]$aHealth.DownloadMbps -gt $observedMbps) {
+                            $observedMbps = [double]$aHealth.DownloadMbps
+                        }
+                        if ($aHealth -and $null -ne $aHealth.UploadMbps -and [double]$aHealth.UploadMbps -gt $observedMbps) {
+                            $observedMbps = [double]$aHealth.UploadMbps
                         }
 
-                        if ($aHealth.IsDegrading) { $latencyPenalty *= 0.5 }
-                    }
-
-                    $capacity = [math]::Max(0.25, ($speedFactor * $healthFactor * $successFactor * $stabilityFactor * $latencyPenalty))
-
-                    # Headroom feedback: bias toward adapters with available observed throughput room.
-                    $capacityEstimateMbps = 0.0
-                    if ($linkMbps -gt 0 -and $linkMbps -lt 10000) {
-                        $capacityEstimateMbps = [math]::Max(50.0, $linkMbps * 0.35)
-                    }
-                    if ($observedMbps -gt 0) {
-                        $observedCeiling = [math]::Max(50.0, $observedMbps * 1.6)
-                        if ($capacityEstimateMbps -gt 0) {
-                            $capacityEstimateMbps = [math]::Min([math]::Max($capacityEstimateMbps, $observedCeiling), [math]::Max($linkMbps, $observedCeiling))
+                        $linkSpeedFactor = [math]::Max(1.0, [math]::Min(6.0, [math]::Sqrt([math]::Max(50.0, $linkMbps) / 50.0)))
+                        # Do not treat tiny/idle observed throughput as hard capacity; it causes
+                        # starvation loops where an underused adapter never gets enough new flows.
+                        $observedEligibleMbps = if ($observedMbps -ge 15.0) { $observedMbps } else { 0.0 }
+                        if ($observedEligibleMbps -gt 0) {
+                            $speedFactor = [math]::Max(1.0, [math]::Min(12.0, $observedEligibleMbps / 5.0))
+                            $speedFactor = [math]::Max($linkSpeedFactor, $speedFactor)
                         } else {
-                            $capacityEstimateMbps = $observedCeiling
+                            $speedFactor = $linkSpeedFactor
                         }
-                    }
-                    if ($capacityEstimateMbps -le 0) { $capacityEstimateMbps = 120.0 }
 
-                    $utilization = if ($capacityEstimateMbps -gt 0) { [math]::Min(1.0, [math]::Max(0.0, $observedMbps / $capacityEstimateMbps)) } else { 0.0 }
-                    $headroom = [math]::Max(0.1, [math]::Min(1.0, 1.0 - $utilization))
-                    $headroomFactor = 1.0 + (($headroom - 0.5) * 2.0 * $bulkHeadroomWeight)
-                    $headroomFactor = [math]::Max(0.6, [math]::Min(1.6, $headroomFactor))
-                    $capacity *= $headroomFactor
+                        $healthFactor = 0.6
+                        $successFactor = 1.0
+                        $stabilityFactor = 0.8
+                        $latencyPenalty = 1.0
+                        if ($aHealth) {
+                            if ($null -ne $aHealth.Score -and [double]$aHealth.Score -gt 0) {
+                                $healthFactor = [math]::Max(0.35, [double]$aHealth.Score / 100.0)
+                            }
+                            if ($null -ne $aHealth.SuccessRate -and [double]$aHealth.SuccessRate -gt 0) {
+                                $successFactor = [math]::Max(0.4, [double]$aHealth.SuccessRate / 100.0)
+                            }
+                            if ($null -ne $aHealth.Stability -and [double]$aHealth.Stability -gt 0) {
+                                $stabilityFactor = [math]::Max(0.5, [double]$aHealth.Stability / 100.0)
+                            }
 
-                    # High-pressure fairness boost: discourage over-concentrating bulk flows on one adapter
-                    # during sustained multi-flow workloads.
-                    if ($bulkGlobalActive -ge $bulkPressureThreshold -and $avail.Count -gt 1) {
-                        $targetShare = 1.0 / [double]$avail.Count
-                        $activeShare = if ($bulkGlobalActive -gt 0) { [double]$active / [double]$bulkGlobalActive } else { 0.0 }
-                        if ($activeShare -gt $targetShare) {
-                            $excessRatio = [math]::Min(1.0, ($activeShare - $targetShare) / [math]::Max(0.01, $targetShare))
-                            $capacity *= [math]::Max(0.6, 1.0 - (0.35 * $excessRatio))
-                        } else {
-                            $spareRatio = [math]::Min(1.0, ($targetShare - $activeShare) / [math]::Max(0.01, $targetShare))
-                            $capacity *= [math]::Min(1.25, 1.0 + (0.15 * $spareRatio))
+                            $lat = if ($null -ne $aHealth.LatencyEWMA) { [double]$aHealth.LatencyEWMA } else { 999.0 }
+                            if ($lat -gt 150) {
+                                $latencyPenalty = 0.55
+                            } elseif ($lat -gt 80) {
+                                $latencyPenalty = 0.75
+                            } elseif ($lat -gt 40) {
+                                $latencyPenalty = 0.9
+                            }
+
+                            if ($aHealth.IsDegrading) { $latencyPenalty *= 0.5 }
                         }
-                    }
 
-                    # Score = active connections / capacity. Lower = better candidate.
-                    $score = [double]$active / [math]::Max(1.0, $capacity)
-                    if ($score -lt $bestBulkScore) { $bestBulkScore = $score; $bestBulkIdx = $bi }
+                        $capacity = [math]::Max(0.25, ($speedFactor * $healthFactor * $successFactor * $stabilityFactor * $latencyPenalty))
+
+                        # Headroom feedback: bias toward adapters with available observed throughput room.
+                        $capacityEstimateMbps = 0.0
+                        if ($linkMbps -gt 0 -and $linkMbps -lt 10000) {
+                            $capacityEstimateMbps = [math]::Max(50.0, $linkMbps * 0.35)
+                        }
+                        if ($observedEligibleMbps -gt 0) {
+                            $observedCeiling = [math]::Max(50.0, $observedEligibleMbps * 1.6)
+                            if ($capacityEstimateMbps -gt 0) {
+                                $capacityEstimateMbps = [math]::Min([math]::Max($capacityEstimateMbps, $observedCeiling), [math]::Max($linkMbps, $observedCeiling))
+                            } else {
+                                $capacityEstimateMbps = $observedCeiling
+                            }
+                        }
+                        if ($capacityEstimateMbps -le 0) { $capacityEstimateMbps = 120.0 }
+
+                        $utilizationBasis = if ($observedEligibleMbps -gt 0) { $observedEligibleMbps } else { 0.0 }
+                        $utilization = if ($capacityEstimateMbps -gt 0) { [math]::Min(1.0, [math]::Max(0.0, $utilizationBasis / $capacityEstimateMbps)) } else { 0.0 }
+                        $headroom = [math]::Max(0.1, [math]::Min(1.0, 1.0 - $utilization))
+                        $headroomFactor = 1.0 + (($headroom - 0.5) * 2.0 * $bulkHeadroomWeight)
+                        $headroomFactor = [math]::Max(0.6, [math]::Min(1.6, $headroomFactor))
+                        $capacity *= $headroomFactor
+
+                        # High-pressure fairness boost: discourage over-concentrating bulk flows on one adapter
+                        # during sustained multi-flow workloads.
+                        if ($bulkGlobalActive -ge $bulkPressureThreshold -and $avail.Count -gt 1) {
+                            $targetShare = 1.0 / [double]$avail.Count
+                            $activeShare = if ($bulkGlobalActive -gt 0) { [double]$active / [double]$bulkGlobalActive } else { 0.0 }
+                            $penaltyStrength = if ($throughputMode) { 0.55 } else { 0.35 }
+                            $boostStrength = if ($throughputMode) { 0.25 } else { 0.15 }
+                            if ($activeShare -gt $targetShare) {
+                                $excessRatio = [math]::Min(1.0, ($activeShare - $targetShare) / [math]::Max(0.01, $targetShare))
+                                $capacity *= [math]::Max(0.55, 1.0 - ($penaltyStrength * $excessRatio))
+                            } else {
+                                $spareRatio = [math]::Min(1.0, ($targetShare - $activeShare) / [math]::Max(0.01, $targetShare))
+                                $capacity *= [math]::Min(1.35, 1.0 + ($boostStrength * $spareRatio))
+                            }
+                        }
+
+                        # Score = active connections / capacity. Lower = better candidate.
+                        # Add a small constant so zero-active ties are still resolved by capacity.
+                        $score = ([double]$active + 0.25) / [math]::Max(1.0, $capacity)
+                        if ($score -lt $bestBulkScore) { $bestBulkScore = $score; $bestBulkIdx = $bi }
+                    }
+                    $adapter = $avail[$bestBulkIdx]
+                    if ($throughputMode) {
+                        if (-not $State.activePerAdapter.ContainsKey($adapter.Name)) { $State.activePerAdapter[$adapter.Name] = 0 }
+                        $State.activePerAdapter[$adapter.Name] = [int]$State.activePerAdapter[$adapter.Name] + 1
+                        $connAdapter = $adapter.Name
+                    }
+                    $selectionReason = "active-load-balanced-bulk"
+                } finally {
+                    if ($bulkLockTaken) {
+                        [System.Threading.Monitor]::Exit($bulkLockObj)
+                    }
                 }
-                $adapter = $avail[$bestBulkIdx]
-                $selectionReason = "active-load-balanced-bulk"
             }
 
             if (-not $skipAffinity -and $State.sessionMap.Count -le 2000) {
@@ -1368,7 +1462,15 @@ $HandlerScript = {
                 $remoteClient.Client.NoDelay = $true
                 $remoteClient.SendBufferSize = $bufSize
                 $remoteClient.ReceiveBufferSize = $bufSize
-                $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($adapter.IP), 0)
+                $bindIp = $null
+                if ($adapter.ParsedIP) {
+                    $bindIp = $adapter.ParsedIP
+                } elseif ($State.adapterIpCache.ContainsKey($adapter.Name)) {
+                    $bindIp = $State.adapterIpCache[$adapter.Name]
+                } else {
+                    $bindIp = [System.Net.IPAddress]::Parse($adapter.IP)
+                }
+                $localEP = New-Object System.Net.IPEndPoint($bindIp, 0)
                 $remoteClient.Client.Bind($localEP)
                 $remoteClient.SendTimeout = $ioTimeout
                 $remoteClient.ReceiveTimeout = $ioTimeout
@@ -1491,7 +1593,7 @@ $HandlerScript = {
             }
         }
         if ($hostKey) {
-            $hostLockObj = if ($State.activeCounterLock) { $State.activeCounterLock } else { $global:ActiveCounterLock }
+            $hostLockObj = if ($State.hostCounterLock) { $State.hostCounterLock } elseif ($State.activeCounterLock) { $State.activeCounterLock } else { $global:HostCounterLock }
             [System.Threading.Monitor]::Enter($hostLockObj)
             try {
                 if ($State.activePerHost.ContainsKey($hostKey)) {
@@ -1512,17 +1614,30 @@ $HandlerScript = {
 
 # ===== Dynamic Adaptive Runspace Pool =====
 $cfgProxy = $null
+$startupMode = 'maxspeed'
 if (Test-Path $configFile) {
     try {
         $cfgData = Read-JsonFile -Path $configFile -DefaultValue $null
-        if ($cfgData) { $cfgProxy = $cfgData.proxy }
+        if ($cfgData) {
+            $cfgProxy = $cfgData.proxy
+            if ($cfgData.mode) { $startupMode = [string]$cfgData.mode }
+        }
     } catch {}
 }
 $minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 64 }
 $maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 768 }
 $listenerBacklog = if ($cfgProxy -and $cfgProxy.listenerBacklog -gt 0) { [int]$cfgProxy.listenerBacklog } else { 2048 }
 $staleJobTimeoutSec = if ($cfgProxy -and $null -ne $cfgProxy.staleJobTimeoutSec -and [int]$cfgProxy.staleJobTimeoutSec -ge 0) { [int]$cfgProxy.staleJobTimeoutSec } else { 0 }
-$currentMaxThreads = [math]::Min($maxThreads, [math]::Max($minThreads, 96))
+$throughputStartup = $startupMode -in @('maxspeed', 'download')
+if ($throughputStartup) {
+    $minThreads = [math]::Max($minThreads, 96)
+    $maxThreads = [math]::Max($maxThreads, 512)
+}
+$currentMaxThreads = if ($throughputStartup) {
+    [math]::Min($maxThreads, [math]::Max($minThreads, 192))
+} else {
+    [math]::Min($maxThreads, [math]::Max($minThreads, 96))
+}
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
 $global:ProxyState.listenerBacklog = $listenerBacklog
 $global:ProxyState.staleJobTimeoutSec = $staleJobTimeoutSec
@@ -1572,6 +1687,7 @@ try { $listener.Start($listenerBacklog) } catch { Write-Host "  [ERROR] Port ${P
 
 Update-ProxyStats
 $lastRefresh = Get-Date
+$lastStatsWrite = Get-Date
 $lastLog = Get-Date
 $lastCleanup = Get-Date
 $lastSessionClean = Get-Date
@@ -1586,8 +1702,12 @@ try {
         $refreshInterval = if ($global:ProxyState.weightRefreshInterval -gt 0) { [double]$global:ProxyState.weightRefreshInterval } else { 2.0 }
         if (($now - $lastRefresh).TotalSeconds -gt $refreshInterval) {
             Update-AdaptersAndWeights
-            Update-ProxyStats
             $lastRefresh = $now
+        }
+        $statsWriteInterval = if ($global:ProxyState.statsWriteIntervalSec -gt 0) { [double]$global:ProxyState.statsWriteIntervalSec } else { 2.0 }
+        if (($now - $lastStatsWrite).TotalSeconds -gt $statsWriteInterval) {
+            Update-ProxyStats
+            $lastStatsWrite = $now
         }
 
         # Clean completed jobs and evaluate scaling twice per second so short speed bursts can expand quickly.
@@ -1614,10 +1734,13 @@ try {
             # [V5-FIX-8] Dynamic Thread Pool Scaling Policy
             $activeThreads = $activeCount
             $activeConnectionsForScale = Get-ActiveConnectionCount -ProxyState $global:ProxyState
-            $nearCapacity = ($activeThreads -ge ($currentMaxThreads - 8)) -or ($activeConnectionsForScale -ge ($currentMaxThreads - 8))
+            $throughputRuntime = $global:ProxyState.currentMode -in @('maxspeed', 'download')
+            $headroomTrigger = if ($throughputRuntime) { 20 } else { 8 }
+            $scaleStep = if ($throughputRuntime) { 32 } else { 16 }
+            $nearCapacity = ($activeThreads -ge ($currentMaxThreads - $headroomTrigger)) -or ($activeConnectionsForScale -ge ($currentMaxThreads - $headroomTrigger))
              
             if ($nearCapacity -and $currentMaxThreads -lt $maxThreads) {
-                $targetThreads = [math]::Max($currentMaxThreads + 16, $activeThreads + 16)
+                $targetThreads = [math]::Max($currentMaxThreads + $scaleStep, $activeThreads + $scaleStep, $activeConnectionsForScale + $scaleStep)
                 $currentMaxThreads = [math]::Min($maxThreads, $targetThreads)
                 $rsPool.SetMaxRunspaces($currentMaxThreads)
                 $global:ProxyState.currentMaxThreads = $currentMaxThreads

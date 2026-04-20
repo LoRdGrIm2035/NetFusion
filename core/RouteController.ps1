@@ -37,6 +37,7 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $configPath = Join-Path $projectDir "config\config.json"
 $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
 $ethernetPriority = if ($config -and $config.routing -and $config.routing.ethernetPriority) { $config.routing.ethernetPriority } else { $true }
+$script:throughputMode = if ($config -and $config.mode -and ([string]$config.mode).ToLowerInvariant() -in @('maxspeed', 'download')) { $true } else { $false }
 
 $script:prevAdapterSet = @()
 $script:routesActive = $false
@@ -199,11 +200,15 @@ function Set-DynamicMetrics {
         $health = Get-AdapterHealthScore -Name $name
         $metric = $BaseMetric
 
-        # Type-based adjustment: Ethernet gets lower metric (higher priority)
-        if ($ethernetPriority -and $type -eq 'Ethernet') {
-            $metric = [math]::Max(5, $BaseMetric - 15)
-        } elseif ($type -eq 'USB-WiFi') {
-            $metric = $BaseMetric + 5  # Slight penalty for USB overhead
+        # Throughput-first mode keeps adapters close in metric so multi-flow
+        # workloads can exploit both links. Outside throughput mode, preserve
+        # legacy type-based preference.
+        if (-not $script:throughputMode) {
+            if ($ethernetPriority -and $type -eq 'Ethernet') {
+                $metric = [math]::Max(5, $BaseMetric - 15)
+            } elseif ($type -eq 'USB-WiFi') {
+                $metric = $BaseMetric + 5  # Slight penalty for USB overhead
+            }
         }
 
         # Health-based adjustment: degrading adapters get higher metric
