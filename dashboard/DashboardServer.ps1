@@ -32,6 +32,11 @@ $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
 $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
+$script:AuthFailureByIp = [hashtable]::Synchronized(@{})
+$script:AuthRateLock = [object]::new()
+$script:AuthFailWindowSeconds = 60
+$script:AuthFailLimit = 10
+$script:AuthBlockSeconds = 300
 
 function Write-AtomicJson {
     param(
@@ -125,18 +130,92 @@ function Compare-FixedToken {
     return ($diff -eq 0)
 }
 
+function Get-Utf8NoBomEncoding {
+    return [System.Text.UTF8Encoding]::new($false)
+}
+
+function Write-DashboardTokenFilesAtomically {
+    param(
+        [string]$Token,
+        [string]$Hash
+    )
+
+    $enc = Get-Utf8NoBomEncoding
+    $tokenTemp = Join-Path $configDir ([System.IO.Path]::GetRandomFileName())
+    $hashTemp = Join-Path $configDir ([System.IO.Path]::GetRandomFileName())
+
+    $tokenExisted = Test-Path $tokenPath
+    $hashExisted = Test-Path $tokenHashPath
+    $tokenOriginal = $null
+    $hashOriginal = $null
+
+    if ($tokenExisted) {
+        try { $tokenOriginal = [System.IO.File]::ReadAllText($tokenPath, $enc) } catch {}
+    }
+    if ($hashExisted) {
+        try { $hashOriginal = [System.IO.File]::ReadAllText($tokenHashPath, $enc) } catch {}
+    }
+
+    try {
+        [System.IO.File]::WriteAllText($tokenTemp, $Token, $enc)
+        [System.IO.File]::WriteAllText($hashTemp, $Hash, $enc)
+
+        if ($tokenExisted) {
+            [System.IO.File]::Replace($tokenTemp, $tokenPath, $null, $true)
+        } else {
+            [System.IO.File]::Move($tokenTemp, $tokenPath)
+        }
+
+        if ($hashExisted) {
+            [System.IO.File]::Replace($hashTemp, $tokenHashPath, $null, $true)
+        } else {
+            [System.IO.File]::Move($hashTemp, $tokenHashPath)
+        }
+    } catch {
+        # Roll back to original state if either replacement fails.
+        try {
+            if ($tokenExisted) {
+                [System.IO.File]::WriteAllText($tokenPath, [string]$tokenOriginal, $enc)
+            } else {
+                Remove-Item $tokenPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+
+        try {
+            if ($hashExisted) {
+                [System.IO.File]::WriteAllText($tokenHashPath, [string]$hashOriginal, $enc)
+            } else {
+                Remove-Item $tokenHashPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+
+        throw
+    } finally {
+        Remove-Item $tokenTemp -Force -ErrorAction SilentlyContinue
+        Remove-Item $hashTemp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Ensure-DashboardToken {
     $existing = ''
     if (Test-Path $tokenPath) {
         try { $existing = (Get-Content $tokenPath -Raw -ErrorAction Stop).Trim() } catch {}
     }
+    $tokenRegenerated = $false
     if ([string]::IsNullOrWhiteSpace($existing) -or $existing.Length -lt 24 -or $existing -in $legacyDashboardTokens) {
         $existing = New-RandomSecret -Length 32
-        Set-Content $tokenPath -Value $existing -NoNewline -Force -Encoding UTF8
+        $tokenRegenerated = $true
     }
 
     $hash = Get-TokenHash -Token $existing
-    Set-Content $tokenHashPath -Value $hash -NoNewline -Force -Encoding UTF8
+    $storedHash = ''
+    if (Test-Path $tokenHashPath) {
+        try { $storedHash = (Get-Content $tokenHashPath -Raw -ErrorAction Stop).Trim() } catch {}
+    }
+    $needsWrite = $tokenRegenerated -or [string]::IsNullOrWhiteSpace($storedHash) -or -not (Compare-FixedToken -Left $storedHash -Right $hash)
+    if ($needsWrite) {
+        Write-DashboardTokenFilesAtomically -Token $existing -Hash $hash
+    }
     return $existing
 }
 
@@ -189,7 +268,7 @@ function Test-DashboardTokenValue {
     }
     if ([string]::IsNullOrWhiteSpace($storedHash)) {
         $storedHash = Get-TokenHash -Token $global:DashToken
-        try { Set-Content $tokenHashPath -Value $storedHash -NoNewline -Force -Encoding UTF8 } catch {}
+        try { Write-DashboardTokenFilesAtomically -Token $global:DashToken -Hash $storedHash } catch {}
     }
 
     return (Compare-FixedToken -Left (Get-TokenHash -Token $Token) -Right $storedHash)
@@ -227,6 +306,103 @@ function Get-RequestAuthContext {
         Source = $source
         HeaderTokenPresent = -not [string]::IsNullOrWhiteSpace($headerToken)
         QueryTokenPresent = -not [string]::IsNullOrWhiteSpace($queryToken)
+    }
+}
+
+function Get-ClientIpAddress {
+    param([System.Net.Sockets.TcpClient]$Client)
+    try {
+        $remote = $Client.Client.RemoteEndPoint -as [System.Net.IPEndPoint]
+        if ($remote) { return $remote.Address.ToString() }
+    } catch {}
+    return 'unknown'
+}
+
+function Test-AuthRateLimited {
+    param([string]$ClientIP)
+
+    if ([string]::IsNullOrWhiteSpace($ClientIP)) { $ClientIP = 'unknown' }
+    $now = Get-Date
+
+    [System.Threading.Monitor]::Enter($script:AuthRateLock)
+    try {
+        if (-not $script:AuthFailureByIp.ContainsKey($ClientIP)) {
+            $script:AuthFailureByIp[$ClientIP] = @{
+                failures = [System.Collections.Generic.List[datetime]]::new()
+                blockedUntil = [datetime]::MinValue
+            }
+        }
+
+        $entry = $script:AuthFailureByIp[$ClientIP]
+        $cutoff = $now.AddSeconds(-$script:AuthFailWindowSeconds)
+        for ($i = $entry.failures.Count - 1; $i -ge 0; $i--) {
+            if ($entry.failures[$i] -lt $cutoff) { $entry.failures.RemoveAt($i) }
+        }
+
+        if ($entry.blockedUntil -gt $now) {
+            return @{
+                IsBlocked = $true
+                RetryAfterSec = [int][math]::Max(1, [math]::Ceiling(($entry.blockedUntil - $now).TotalSeconds))
+            }
+        }
+
+        if ($entry.blockedUntil -ne [datetime]::MinValue) {
+            $entry.blockedUntil = [datetime]::MinValue
+            $entry.failures.Clear()
+        }
+
+        return @{
+            IsBlocked = $false
+            RetryAfterSec = 0
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($script:AuthRateLock)
+    }
+}
+
+function Register-AuthFailure {
+    param([string]$ClientIP)
+
+    if ([string]::IsNullOrWhiteSpace($ClientIP)) { $ClientIP = 'unknown' }
+    $now = Get-Date
+
+    [System.Threading.Monitor]::Enter($script:AuthRateLock)
+    try {
+        if (-not $script:AuthFailureByIp.ContainsKey($ClientIP)) {
+            $script:AuthFailureByIp[$ClientIP] = @{
+                failures = [System.Collections.Generic.List[datetime]]::new()
+                blockedUntil = [datetime]::MinValue
+            }
+        }
+
+        $entry = $script:AuthFailureByIp[$ClientIP]
+        $cutoff = $now.AddSeconds(-$script:AuthFailWindowSeconds)
+        for ($i = $entry.failures.Count - 1; $i -ge 0; $i--) {
+            if ($entry.failures[$i] -lt $cutoff) { $entry.failures.RemoveAt($i) }
+        }
+
+        $entry.failures.Add($now)
+        if ($entry.failures.Count -ge $script:AuthFailLimit) {
+            $entry.blockedUntil = $now.AddSeconds($script:AuthBlockSeconds)
+            $entry.failures.Clear()
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($script:AuthRateLock)
+    }
+}
+
+function Clear-AuthFailureHistory {
+    param([string]$ClientIP)
+
+    if ([string]::IsNullOrWhiteSpace($ClientIP)) { return }
+
+    [System.Threading.Monitor]::Enter($script:AuthRateLock)
+    try {
+        if ($script:AuthFailureByIp.ContainsKey($ClientIP)) {
+            [void]$script:AuthFailureByIp.Remove($ClientIP)
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($script:AuthRateLock)
     }
 }
 
@@ -635,6 +811,7 @@ try {
             $headers = Parse-Headers -RequestText $requestText
             $queryParams = Parse-QueryParams -Path $path
             $authContext = Get-RequestAuthContext -Headers $headers -QueryParams $queryParams
+            $clientIp = Get-ClientIpAddress -Client $client
             $bodyText = Get-RequestBody -RequestText $requestText
             $autoLoginCookie = Get-AutoLoginCookie
 
@@ -659,10 +836,23 @@ try {
                 continue
             }
 
+            if ($authContext.IsAuthenticated) {
+                Clear-AuthFailureHistory -ClientIP $clientIp
+            } else {
+                $rateLimit = Test-AuthRateLimited -ClientIP $clientIp
+                if ($rateLimit.IsBlocked) {
+                    $retryAfter = [int][math]::Max(1, $rateLimit.RetryAfterSec)
+                    $body = [System.Text.Encoding]::UTF8.GetBytes("{""error"":""rate_limited"",""retryAfterSec"":$retryAfter}")
+                    Send-TcpResponse -Stream $stream -StatusCode 429 -StatusText 'Too Many Requests' -ContentType 'application/json; charset=utf-8' -Body $body -ExtraHeaders @{ 'Retry-After' = $retryAfter }
+                    continue
+                }
+            }
+
             if (-not $authContext.IsAuthenticated) {
                 if ($parsedPath -eq '/favicon.ico') {
                     Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
                 } else {
+                    Register-AuthFailure -ClientIP $clientIp
                     Send-AuthenticationChallenge -Stream $stream
                 }
                 continue

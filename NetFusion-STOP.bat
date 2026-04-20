@@ -55,6 +55,7 @@ echo        Done
 echo  [4/6] Removing SYSTEM intercept...
 powershell -ExecutionPolicy Bypass -Command "$inetKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; Set-ItemProperty $inetKey 'ProxyEnable' 0 -Type DWord -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyServer' -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyOverride' -Force -ErrorAction SilentlyContinue; Write-Host '       System proxy cleared' -ForegroundColor Green"
 powershell -ExecutionPolicy Bypass -Command "$k = 'HKCU:\Software\DownloadManager'; if (Test-Path $k) { Set-ItemProperty $k 'nProxyMode' 1 -Type DWord -Force; Set-ItemProperty $k 'UseHttpProxy' 0 -Type DWord -Force; Set-ItemProperty $k 'nHttpPrChbSt' 0 -Type DWord -Force; Set-ItemProperty $k 'UseHttpsProxy' 0 -Type DWord -Force; Set-ItemProperty $k 'nHttpsPrChbSt' 0 -Type DWord -Force; Write-Host '       IDM restored to direct' -ForegroundColor Green } else { Write-Host '       IDM not installed' -ForegroundColor DarkGray }"
+powershell -Command "Start-Sleep 1; $port=8080; $listening = (netstat -ano | Select-String \":$port.*LISTENING\"); if($listening){ Write-Warning 'Proxy port still bound!' } else { Write-Host 'Port clear.' }"
 
 :: =========================================================
 :: STEP 5: Clean state files

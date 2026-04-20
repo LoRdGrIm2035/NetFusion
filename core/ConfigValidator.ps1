@@ -49,7 +49,7 @@ try {
 }
 
 $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
-$warnings = 0
+$script:warnings = 0
 
 function Check-Number($obj, $prop, $min, $max, $default) {
     if ($null -eq $obj.$prop) {
@@ -119,11 +119,30 @@ if ($config.proxyPort -eq $config.dashboardPort) {
 
 # Validate proxy settings
 if ($config.proxy) {
-    Check-Number $config.proxy 'minThreads' 4 128 64
-    Check-Number $config.proxy 'maxThreads' 8 256 256
+    Check-Number $config.proxy 'minThreads' 8 512 64
+    Check-Number $config.proxy 'maxThreads' 16 1024 768
     Check-Number $config.proxy 'bufferSize' 8192 1048576 65536
-    Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
+    Check-Number $config.proxy 'jobTimeoutSec' 10 86400 120
     Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 300
+    Check-Number $config.proxy 'connectTimeout' 1000 30000 7000
+    Check-Number $config.proxy 'socketIoTimeout' 5000 300000 45000
+    Check-Number $config.proxy 'listenerBacklog' 128 8192 2048
+    Check-Number $config.proxy 'staleJobTimeoutSec' 0 86400 0
+    if ($config.proxy.maxThreads -lt $config.proxy.minThreads) {
+        $config.proxy.maxThreads = $config.proxy.minThreads
+        $script:configChanged = $true
+    }
+}
+
+if ($config.routing) {
+    Check-Bool $config.routing 'enforceECMP' $false
+    Check-Number $config.routing 'metricRefreshSec' 6 300 30
+    Check-Number $config.routing 'ecmpRefreshSec' 30 600 60
+}
+
+if ($config.selfHealing) {
+    Check-Bool $config.selfHealing 'dhcpAutoRepair' $false
+    Check-Number $config.selfHealing 'dhcpRepairIntervalSec' 30 600 120
 }
 
 # Validate circuit breaker
@@ -147,11 +166,11 @@ if ($config.trafficRules) {
     }
 }
 
-if ($warnings -gt 0 -or $script:configChanged) {
+if ($script:warnings -gt 0 -or $script:configChanged) {
     try {
         Write-AtomicJson -Path $configPath -Data $config -Depth 5
-        if ($warnings -gt 0) {
-            Write-Host "  [ConfigValidator] Sanitized config.json ($warnings warnings fixed)." -ForegroundColor DarkGray
+        if ($script:warnings -gt 0) {
+            Write-Host "  [ConfigValidator] Sanitized config.json ($script:warnings warnings fixed)." -ForegroundColor DarkGray
         } else {
             Write-Host "  [ConfigValidator] Normalized config.json." -ForegroundColor DarkGray
         }

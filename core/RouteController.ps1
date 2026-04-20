@@ -182,6 +182,15 @@ function Set-DynamicMetrics {
     <# v4.0: Set metrics based on adapter type and real-time health. Lower metric = higher priority. #>
     param([array]$Interfaces, [int]$BaseMetric)
 
+    $liveAdapterCache = @{}
+    try {
+        foreach ($adapter in @(Get-NetworkAdapters)) {
+            if ($adapter -and $adapter.Name -and -not $liveAdapterCache.ContainsKey($adapter.Name)) {
+                $liveAdapterCache[$adapter.Name] = $adapter
+            }
+        }
+    } catch {}
+
     foreach ($iface in $Interfaces) {
         $idx = $iface.InterfaceIndex
         $name = $iface.Name
@@ -209,8 +218,8 @@ function Set-DynamicMetrics {
 
         $liveIdx = $null
         try {
-            # Always fetch the extreme live OS index in case the caching is desynced
-            $liveAdapter = Get-NetworkAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+            # Resolve from a single per-pass adapter cache to avoid repeated OS queries.
+            $liveAdapter = if ($liveAdapterCache.ContainsKey($name)) { $liveAdapterCache[$name] } else { $null }
             if (-not $liveAdapter) {
                 Write-Host "    - $name -> waiting for adapter to initialize..." -ForegroundColor DarkGray
                 continue
@@ -221,6 +230,14 @@ function Set-DynamicMetrics {
             $ipif = Get-NetIPInterface -InterfaceIndex $liveIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue
             if (-not $ipif) {
                 Write-Host "    - $name (index $liveIdx) -> waiting for IPv4 to bind..." -ForegroundColor DarkGray
+                continue
+            }
+
+            $currentMetric = if ($null -ne $ipif.InterfaceMetric) { [int]$ipif.InterfaceMetric } else { -1 }
+            $autoMetricState = [string]$ipif.AutomaticMetric
+            $autoDisabled = $autoMetricState -match 'Disabled|False|0'
+            if ($autoDisabled -and $currentMetric -eq $metric) {
+                Write-Host "    - $name (index $liveIdx) -> metric unchanged ($metric)" -ForegroundColor DarkGray
                 continue
             }
 

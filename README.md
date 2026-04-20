@@ -215,6 +215,9 @@ http://localhost:9090
 
 The local browser session signs in automatically on first visit. The dashboard token file is still kept for local automation and scripted access.
 
+> [!NOTE]
+> `config/dashboard-token.txt` and `config/dashboard-token-hash.txt` are local secrets. They are auto-generated on first local setup/run (`Setup-NetFusion.ps1` + first dashboard startup) and should remain untracked in git.
+
 ### Step 4: Point supported apps to the proxy
 
 Configure:
@@ -268,6 +271,13 @@ Configure:
 
 [`config/config.default.json`](./config/config.default.json) defines the shipped defaults. Runtime-generated state such as `config/health.json`, `config/interfaces.json`, and `config/proxy-stats.json` is intentionally excluded from version control.
 
+`config/config.default.json` and `config/config.json` intentionally differ for `safety.circuitBreaker.memoryThresholdMB`:
+
+- `config/config.default.json`: `800` (conservative shared default)
+- `config/config.json`: `2500` (local runtime headroom for high-throughput sessions)
+
+`config/config.json` is gitignored and should be treated as machine-local runtime config generated from `config/config.default.json` on first setup, so local tuning is not accidentally committed.
+
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `mode` | `maxspeed` | Primary strategy profile |
@@ -277,6 +287,13 @@ Configure:
 | `routing.splitRoutesEnabled` | `false` | Split routes are optional and secondary to proxy-based steering |
 | `proxy.maxRetries` | `3` | Connection establishment retry count |
 | `proxy.sessionAffinityTTL` | `300` | Keeps related traffic stable for a short window |
+| `startupTimeoutSec` | `20` | Startup proxy bind timeout used by `NetFusion-START.bat` |
+| `proxy.httpsBulkPromotionHostThreshold` | `2` | Promotes HTTP/HTTPS flows to bulk earlier in throughput modes when same-host concurrency rises |
+| `proxy.httpsBulkPromotionGlobalThreshold` | `8` | Global active connection threshold that triggers earlier bulk promotion |
+| `proxy.retryPolicy` | `leastLoaded` | Retry adapter selection policy (`leastLoaded` or `weightedRandom`) |
+| `proxy.retryWeightFloor` | `0.25` | Lower bound used in least-loaded retry score normalization |
+| `proxy.bulkHeadroomWeight` | `0.35` | Strength of observed-throughput headroom bias in bulk scheduler |
+| `proxy.bulkPressureThreshold` | `24` | Active-connection level where anti-concentration pressure balancing activates |
 | `telemetry.enabled` | `true` | Enables local decision and health visibility |
 
 ## Traffic Profiles

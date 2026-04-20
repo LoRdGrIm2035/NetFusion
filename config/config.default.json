@@ -4,6 +4,7 @@
     "dashboardAllowLAN": false,
     "blockQUICOnSecondaryAdapters": true,
     "mode":  "maxspeed",
+    "startupTimeoutSec": 20,
     "monitorInterval":  2000,
     "healthCheck":  {
                         "pingTarget":  "8.8.8.8",
@@ -12,19 +13,31 @@
                         "failThreshold":  3
                     },
     "proxy":  {
-                  "connectTimeout":  5000,
+                  "connectTimeout":  7000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
                   "minThreads":  64,
-                  "maxThreads":  256,
+                  "maxThreads":  768,
                   "jobTimeoutSec":  120,
+                  "socketIoTimeout": 45000,
+                  "listenerBacklog": 2048,
+                  "staleJobTimeoutSec": 0,
                   "sessionAffinityTTL":  300,
+                  "httpsBulkPromotionHostThreshold": 2,
+                  "httpsBulkPromotionGlobalThreshold": 8,
+                  "retryPolicy": "leastLoaded",
+                  "retryWeightFloor": 0.25,
+                  "bulkHeadroomWeight": 0.35,
+                  "bulkPressureThreshold": 24,
                   "healthEndpoint":  true
               },
     "routing":  {
                     "targetMetric":  25,
                     "watchInterval":  15,
                     "ethernetPriority":  true,
+                    "enforceECMP": false,
+                    "metricRefreshSec": 30,
+                    "ecmpRefreshSec": 60,
                     "splitRoutesEnabled":  false
                 },
     "safety":  {
@@ -42,12 +55,14 @@
                    }
                },
     "selfHealing":  {
-                        "enabled":  true,
-                        "routeCheckInterval":  15,
-                        "adapterRecoveryDelay":  5,
-                        "dnsVerification":  true,
-                        "gatewayChangeDetection":  true
-                    },
+                         "enabled":  true,
+                         "routeCheckInterval":  15,
+                         "adapterRecoveryDelay":  5,
+                         "dhcpAutoRepair": false,
+                         "dhcpRepairIntervalSec": 120,
+                         "dnsVerification":  true,
+                         "gatewayChangeDetection":  true
+                     },
     "intelligence":  {
                          "ewmaAlphas": {
                              "gaming": 0.65,

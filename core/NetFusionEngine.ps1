@@ -31,6 +31,34 @@ $maxProxyRestarts = if ($engineConfig -and $engineConfig.safety -and $engineConf
 } else {
     3
 }
+$metricRefreshSec = if ($engineConfig -and $engineConfig.routing -and $engineConfig.routing.metricRefreshSec) {
+    [int]$engineConfig.routing.metricRefreshSec
+} else {
+    30
+}
+$metricRefreshLoops = [math]::Max(3, [int][math]::Ceiling([math]::Max(6, $metricRefreshSec) / 2.0))
+$dhcpRepairSec = if ($engineConfig -and $engineConfig.selfHealing -and $engineConfig.selfHealing.dhcpRepairIntervalSec) {
+    [int]$engineConfig.selfHealing.dhcpRepairIntervalSec
+} else {
+    120
+}
+$dhcpRepairLoops = [math]::Max(5, [int][math]::Ceiling([math]::Max(30, $dhcpRepairSec) / 2.0))
+$ecmpEnforceSec = if ($engineConfig -and $engineConfig.routing -and $engineConfig.routing.ecmpRefreshSec) {
+    [int]$engineConfig.routing.ecmpRefreshSec
+} else {
+    60
+}
+$ecmpEnforceLoops = [math]::Max(10, [int][math]::Ceiling([math]::Max(30, $ecmpEnforceSec) / 2.0))
+$enableDhcpAutoRepair = if ($engineConfig -and $engineConfig.selfHealing -and $null -ne $engineConfig.selfHealing.dhcpAutoRepair) {
+    [bool]$engineConfig.selfHealing.dhcpAutoRepair
+} else {
+    $false
+}
+$enableEcmpEnforcement = if ($engineConfig -and $engineConfig.routing -and $null -ne $engineConfig.routing.enforceECMP) {
+    [bool]$engineConfig.routing.enforceECMP
+} else {
+    $false
+}
 $proxyRestartCount = 0
 
 function Test-ProxyProcessHealth {
@@ -199,7 +227,8 @@ if ($portOpen) {
 
 # Enable Route Watchdog mode flag implicitly
 $script:routesActive = $false
-$TargetMetric = 25
+$TargetMetric = if ($engineConfig -and $engineConfig.routing -and $engineConfig.routing.targetMetric) { [int]$engineConfig.routing.targetMetric } else { 25 }
+$script:lastRepairAttempt = @{}
 
 # v6.2: Initialize safety-state.json so dashboard never shows "NO DATA"
 $safetyFile = Join-Path $projectDir "config\safety-state.json"
@@ -211,6 +240,7 @@ $initSafety = @{
 }
 Write-AtomicJson -Path $safetyFile -Data $initSafety -Depth 3
 Write-Host "  [+] Safety state initialized." -ForegroundColor Green
+Write-Host ("  [Engine] Metric refresh: {0}s | DHCP auto-repair: {1} | ECMP enforcement: {2}" -f $metricRefreshSec, ($(if ($enableDhcpAutoRepair) { 'enabled' } else { 'disabled' })), ($(if ($enableEcmpEnforcement) { 'enabled' } else { 'disabled' }))) -ForegroundColor DarkGray
 
 $loopCount = 0
 $lastECMP = Get-Date
@@ -229,6 +259,7 @@ function Repair-AdapterDHCP {
     }
     
     foreach ($adapter in $allAdapters) {
+        $repairKey = [string]$adapter.Name
         $ip = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
         $hasRoute = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
         
@@ -236,11 +267,21 @@ function Repair-AdapterDHCP {
         if ($ip -match '^169\.254\.' -or (-not $hasRoute -and $ip)) {
             $alreadyKnown = $Interfaces | Where-Object { $_.Name -eq $adapter.Name }
             if (-not $alreadyKnown) {
+                if ($script:lastRepairAttempt.ContainsKey($repairKey)) {
+                    try {
+                        $lastAttempt = [datetime]$script:lastRepairAttempt[$repairKey]
+                        if (((Get-Date) - $lastAttempt).TotalSeconds -lt 120) {
+                            continue
+                        }
+                    } catch {}
+                }
+
                 Write-Host "  [REPAIR] $($adapter.Name) has APIPA ($ip) or no route - attempting fix..." -ForegroundColor Yellow
                 
                 # Try to find gateway from a working adapter on same subnet
                 $workingGW = ($Interfaces | Where-Object { $_.Gateway } | Select-Object -First 1).Gateway
                 if ($workingGW) {
+                    $script:lastRepairAttempt[$repairKey] = Get-Date
                     try {
                         # Remove APIPA address
                         Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
@@ -276,7 +317,7 @@ function Repair-AdapterDHCP {
 
 # v6.1: ECMP Enforcement - keep both adapters' metrics equal
 function Enforce-ECMP {
-    $targetMetric = 15
+    $targetMetric = if ($engineConfig -and $engineConfig.routing -and $engineConfig.routing.targetMetric) { [int]$engineConfig.routing.targetMetric } else { 25 }
     $wifiAdapters = Get-NetAdapter | Where-Object { 
         $_.Status -eq 'Up' -and $_.Name -match 'Wi-Fi' 
     }
@@ -342,8 +383,8 @@ while ($true) {
         # 2. Ping Health Monitor (Every ~2s)
         $health = Update-HealthState
         
-        # 3. Route Controller Dynamic Update (Every ~10s)
-        if ($loopCount % 5 -eq 0 -and $interfaces.Count -ge 2) {
+        # 3. Route Controller Dynamic Update (config-driven cadence)
+        if ($loopCount % $metricRefreshLoops -eq 0 -and $interfaces.Count -ge 2) {
             Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
         }
         
@@ -352,13 +393,13 @@ while ($true) {
             Update-LearningState
         }
         
-        # 5. v6.1: DHCP Auto-Recovery (Every ~30s)
-        if ($loopCount % 15 -eq 0) {
+        # 5. DHCP Auto-Recovery (opt-in only; disabled by default for safety)
+        if ($enableDhcpAutoRepair -and ($loopCount % $dhcpRepairLoops -eq 0)) {
             Repair-AdapterDHCP -Interfaces $interfaces
         }
-        
-        # 6. v6.1: ECMP Enforcement (Every ~30s)
-        if ($loopCount % 15 -eq 0) {
+
+        # 6. ECMP Enforcement (opt-in only to avoid metric flapping with dynamic metrics)
+        if ($enableEcmpEnforcement -and ($loopCount % $ecmpEnforceLoops -eq 0)) {
             Enforce-ECMP
         }
         

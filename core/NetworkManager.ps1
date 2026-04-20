@@ -151,7 +151,8 @@ function Get-AllNetworkInterfaces {
         $ipInfo = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
         $ipAddr = if ($ipInfo) { $ipInfo.IPAddress } else { $null }
 
-        # Get gateway
+        # Get gateway once here so InterfaceMonitor can consume it from interfaces.json
+        # instead of issuing duplicate Get-NetRoute queries every health cycle.
         $routeInfo = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
                      Sort-Object RouteMetric | Select-Object -First 1
         $gateway = if ($routeInfo) { $routeInfo.NextHop } else { $null }

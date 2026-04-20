@@ -18,7 +18,7 @@ try {
             $data = Get-Content $eventsFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($data -and $data.events -and $data.events.Count -gt 500) {
                 $events = @($data.events)[0..499]
-                $tmp = [System.IO.Path]::GetTempFileName()
+                $tmp = Join-Path (Split-Path $eventsFile -Parent) ([System.IO.Path]::GetRandomFileName())
                 @{ events = $events } | ConvertTo-Json -Depth 3 -Compress | Set-Content $tmp -Force -ErrorAction Stop
                 Move-Item $tmp $eventsFile -Force -ErrorAction Stop
                 Write-Host "  [LogRotation] Clipped events.json to 500 entries." -ForegroundColor DarkGray

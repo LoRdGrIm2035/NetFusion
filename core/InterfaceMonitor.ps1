@@ -39,7 +39,7 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $configPath = Join-Path $projectDir "config\config.json"
 $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
 $pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
-$pingTarget2 = '1.1.1.1'
+$pingTarget2 = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget2) { $config.healthCheck.pingTarget2 } else { '1.1.1.1' }
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
 
 # Intelligence config
@@ -65,6 +65,7 @@ $script:healthTrend = @{}           # Rolling health scores for trend: @{ name =
 $script:successRates = @{}          # Success/fail tracking: @{ name = @{ success=N; fail=N; rate=0.0 } }
 $script:degradationWarnings = @{}   # Predictive warnings: @{ name = @{ warned=$bool; trend=$val; since=$time } }
 $script:stabilityScores = @{}       # Health variance tracking for stability: @{ name = [double] }
+$script:loopCount = 0
 $script:InterfaceMonitorLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
 
 function Write-AtomicJson {
@@ -207,6 +208,8 @@ function Test-GatewayLatency {
 
 function Test-InternetLatency {
     param([string]$SourceIP, [string]$Target, [int]$Timeout)
+    if (-not $SourceIP) { return 999 }
+
     # Method 1: ping with source binding
     try {
         $result = ping.exe -S $SourceIP -n 1 -w $Timeout $Target 2>$null
@@ -216,21 +219,17 @@ function Test-InternetLatency {
         if ($joined -match 'Reply from') { return 1 }
     } catch {}
 
-    # Method 2: plain ping (no source binding)
+    # Method 2: source-bound TCP connect fallback
     try {
-        $result = ping.exe -n 1 -w $Timeout $Target 2>$null
-        $joined = $result -join "`n"
-        if ($joined -match 'time[=<](\d+)\s*ms') { return [int]$Matches[1] }
-        if ($joined -match 'time[=<](\d+)') { return [int]$Matches[1] }
-        if ($joined -match 'Reply from') { return 1 }
-    } catch {}
-
-    # Method 3: TCP connect test to DNS port
-    try {
+        $localEndpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SourceIP), 0)
         $tcp = New-Object System.Net.Sockets.TcpClient
-        $asyncResult = $tcp.BeginConnect($Target, 53, $null, $null)
+        $tcp.Client.Bind($localEndpoint)
+        $asyncResult = $tcp.BeginConnect($Target, 443, $null, $null)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
+        if ($connected -and $tcp.Connected) {
+            try { $tcp.EndConnect($asyncResult) } catch {}
+        }
         $sw.Stop()
         $tcp.Close()
         if ($connected) { return [math]::Max(1, [int]$sw.ElapsedMilliseconds) }
@@ -286,14 +285,14 @@ function Measure-Jitter {
 
     if (-not $script:latencyHistory.ContainsKey($Name)) { return 0.0 }
     $samples = $script:latencyHistory[$Name]
-    if ($samples.Count -lt 3) { return 0.0 }
+    if ($samples.Count -lt 2) { return 0.0 }
 
     $avg = ($samples | Measure-Object -Average).Average
     $variance = 0.0
     foreach ($s in $samples) {
         $variance += ($s - $avg) * ($s - $avg)
     }
-    $variance /= $samples.Count
+    $variance /= ($samples.Count - 1)
     $jitter = [math]::Round([math]::Sqrt($variance), 2)
     $script:jitterValues[$Name] = $jitter
     return $jitter
@@ -417,6 +416,7 @@ function Measure-InterfaceHealth {
     param([hashtable]$Interface, [string]$Mode = 'default')
 
     $ip = $Interface.IPAddress
+    # Gateway comes from interfaces.json (NetworkManager), avoiding extra Get-NetRoute calls here.
     $gateway = $Interface.Gateway
     $name = $Interface.Name
 
@@ -430,6 +430,8 @@ function Measure-InterfaceHealth {
         $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget -Timeout $pingTimeout
         if ($inetLatencyRaw -ge 999) {
             $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
+        } elseif ($inetLatencyRaw -lt 50) {
+            # Fast success: skip fallback ping to reduce redundant probe overhead.
         }
     }
     $inetLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $inetLatencyRaw -Type 'internet' -Mode $Mode

@@ -9,7 +9,7 @@ echo  =====================================================
 echo.
 
 :: ---- Kill ALL NetFusion processes ----
-echo  [1/6] Killing all NetFusion services...
+echo  [1/7] Killing all NetFusion services...
 taskkill /FI "WINDOWTITLE eq NF-NetworkManager*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-InterfaceMonitor*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-RouteController*" /F >nul 2>&1
@@ -22,12 +22,12 @@ powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filt
 timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----
-echo  [2/6] Releasing network ports...
+echo  [2/7] Releasing network ports...
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":9090" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":8080" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 
 :: ---- Restore IDM ----
-echo  [3/6] Restoring IDM to direct connection...
+echo  [3/7] Restoring IDM to direct connection...
 reg query "HKCU\Software\DownloadManager" >nul 2>&1
 if not errorlevel 1 (
     reg add "HKCU\Software\DownloadManager" /v nProxyMode /t REG_DWORD /d 1 /f >nul 2>&1

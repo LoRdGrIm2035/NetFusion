@@ -32,7 +32,6 @@ function Write-AdapterLog {
 }
 
 function Get-NetworkAdapters {
-    Write-AdapterLog "Querying OS network adapters..." "debug"
     if ($global:RouteAdapterDryRun) {
         Write-Output @()
     } else {

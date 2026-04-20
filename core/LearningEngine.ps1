@@ -394,6 +394,7 @@ $script:learningData.totalSessions++
 Write-LearningEvent "Learning engine started (session #$($script:learningData.totalSessions))"
 $script:sessionStart = Get-Date
 $script:lastSave = Get-Date
+$script:lastDecay = Get-Date
 
 function Update-LearningState {
     try {
@@ -428,9 +429,10 @@ function Update-LearningState {
                 Detect-Patterns -LearningData $script:learningData
             }
 
-            # Apply decay periodically
-            if (((Get-Date) - $script:sessionStart).TotalMinutes -gt 30) {
+            # Apply decay every 60 minutes by wall-clock time.
+            if (((Get-Date) - $script:lastDecay).TotalMinutes -ge 60) {
                 Apply-Decay -LearningData $script:learningData
+                $script:lastDecay = Get-Date
             }
 
             # Display learning summary silently (or UI debug)
