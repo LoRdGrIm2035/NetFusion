@@ -612,6 +612,9 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
+        $client.NoDelay = $true
+        $client.ReceiveBufferSize = 524288
+        $client.SendBufferSize = 524288
         $stream = $client.GetStream()
         $stream.ReadTimeout = 5000
 

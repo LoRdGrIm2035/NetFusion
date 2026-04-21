@@ -51,7 +51,7 @@ start "" /min powershell -WindowStyle Hidden -ExecutionPolicy Bypass -NoExit -Co
 
 :: Force Gateway safety check BEFORE enabling internet proxy
 echo        ...Waiting for Core Engine proxy thread binding (Port 8080)...
-powershell -Command "$d=(Get-Date).AddSeconds(15); while($true) { if((Get-Date) -gt $d){ Write-Host '  [!] TIMEOUT: Engine Proxy Binding Failed' -ForegroundColor Red; Start-Process '%~dp0NetFusion-STOP.bat'; exit 1 }; try { $t=New-Object Net.Sockets.TcpClient; $a=$t.BeginConnect('127.0.0.1',8080,$null,$null); if($a.AsyncWaitHandle.WaitOne(500,$false)){ $t.Close(); break } } catch{}; Start-Sleep -Milliseconds 500 }"
+powershell -Command "$d=(Get-Date).AddSeconds(15); while($true) { if((Get-Date) -gt $d){ Write-Host '  [!] TIMEOUT: Engine Proxy Binding Failed' -ForegroundColor Red; Start-Process '%~dp0NetFusion-STOP.bat'; exit 1 }; try { $t=New-Object Net.Sockets.TcpClient; $t.NoDelay=$true; $t.ReceiveBufferSize=524288; $t.SendBufferSize=524288; $a=$t.BeginConnect('127.0.0.1',8080,$null,$null); if($a.AsyncWaitHandle.WaitOne(500,$false)){ $t.Close(); break } } catch{}; Start-Sleep -Milliseconds 500 }"
 if errorlevel 1 exit /b
 
 :: [3] Watchdog & Proxy Application

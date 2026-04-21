@@ -114,6 +114,9 @@ function Wait-ProxyBind {
         Start-Sleep -Milliseconds 500
         try {
             $tcp = New-Object System.Net.Sockets.TcpClient
+            $tcp.NoDelay = $true
+            $tcp.ReceiveBufferSize = 524288
+            $tcp.SendBufferSize = 524288
             $ar = $tcp.BeginConnect('127.0.0.1', $Port, $null, $null)
             if ($ar.AsyncWaitHandle.WaitOne(500, $false)) {
                 $tcp.Close()

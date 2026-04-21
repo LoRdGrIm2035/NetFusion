@@ -34,6 +34,112 @@ $safetyFile = Join-Path $projectDir "config\safety-state.json"
 $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
+if (-not ('NetFusion.StreamCopier' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace NetFusion
+{
+    public static class StreamCopier
+    {
+        public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
+        {
+            CopyStream(source, dest, -1, ref bytesTransferred);
+        }
+
+        public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
+        {
+            byte[] buffer = new byte[262144];
+            int read;
+
+            if (bytesToCopy < 0)
+            {
+                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    dest.Write(buffer, 0, read);
+                    Interlocked.Add(ref bytesTransferred, read);
+                }
+
+                return;
+            }
+
+            long remaining = bytesToCopy;
+            while (remaining > 0)
+            {
+                int toRead = (int)Math.Min(buffer.Length, remaining);
+                read = source.Read(buffer, 0, toRead);
+                if (read <= 0)
+                {
+                    break;
+                }
+
+                dest.Write(buffer, 0, read);
+                Interlocked.Add(ref bytesTransferred, read);
+                remaining -= read;
+            }
+        }
+
+        public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes)
+        {
+            long c2r = 0;
+            long r2c = 0;
+
+            var t1 = Task.Run(() => CopyStream(client, remote, ref c2r));
+            var t2 = Task.Run(() => CopyStream(remote, client, ref r2c));
+
+            try
+            {
+                Task.WaitAny(new Task[] { t1, t2 }, 85000);
+                try
+                {
+                    Task.WaitAll(new Task[] { t1, t2 }, 5000);
+                }
+                catch
+                {
+                }
+
+                if (!t1.IsCompleted || !t2.IsCompleted)
+                {
+                    try
+                    {
+                        client.Close();
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        remote.Close();
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        Task.WaitAll(new Task[] { t1, t2 }, 1000);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            Interlocked.Add(ref clientToRemoteBytes, c2r);
+            Interlocked.Add(ref remoteToClientBytes, r2c);
+        }
+    }
+}
+"@ -Language CSharp
+}
+
 # ===== Thread-safe state =====
 $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
@@ -77,7 +183,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'default'     = 131072   # 128KB default
     }
     # v5.0 Session Affinity
-    sessionMap     = [hashtable]::Synchronized(@{})    # { "host:port" -> @{ adapter=Name; time=DateTime } }
+    sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()    # { "host:port" -> @{ adapter=Name; time=DateTime } }
     sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
     # v5.0 Safety
     safeMode       = $false
@@ -368,12 +474,17 @@ function Update-ProxyStats {
         averageSessionAge = 0
     }
     $sessionAges = @()
-    $sessionNow = Get-Date
+    $sessionNowTicks = [System.DateTimeOffset]::UtcNow.Ticks
     foreach ($sessionKey in @($s.sessionMap.Keys)) {
         $entry = $s.sessionMap[$sessionKey]
         try {
             if ($entry -and $entry.time) {
-                $sessionAges += ($sessionNow - [datetime]$entry.time).TotalSeconds
+                $entryTicks = if ($entry.time -is [long] -or $entry.time -is [int64]) {
+                    [int64]$entry.time
+                } else {
+                    ([System.DateTimeOffset][datetime]$entry.time).Ticks
+                }
+                $sessionAges += ($sessionNowTicks - $entryTicks) / [double][System.TimeSpan]::TicksPerSecond
             }
         } catch {}
     }
@@ -394,7 +505,7 @@ function Update-ProxyStats {
         uploadHintHostCount = $s.uploadHostHints.Count
         sessionStats = $sessionStats
         currentMaxThreads = $s.currentMaxThreads
-        timestamp = (Get-Date).ToString('o')
+        timestamp = [System.DateTimeOffset]::UtcNow.ToString('o')
     }
     try { Write-AtomicJson -Path $s.statsFile -Data $statsSnapshot -Depth 3 } catch {}
 
@@ -406,7 +517,7 @@ function Update-ProxyStats {
 # v5.0: Clean expired session affinity entries
 function Clear-ExpiredSessions {
     $s = $global:ProxyState
-    $now = Get-Date
+    $nowTicks = [System.DateTimeOffset]::UtcNow.Ticks
     $expired = [System.Collections.Generic.List[string]]::new()
     $snapshot = @{}
 
@@ -422,7 +533,13 @@ function Clear-ExpiredSessions {
         }
 
         try {
-            if (($now - [datetime]$entry.time).TotalSeconds -gt $s.sessionTTL) {
+            $entryTicks = if ($entry.time -is [long] -or $entry.time -is [int64]) {
+                [int64]$entry.time
+            } else {
+                ([System.DateTimeOffset][datetime]$entry.time).Ticks
+            }
+            $ageSeconds = ($nowTicks - $entryTicks) / [double][System.TimeSpan]::TicksPerSecond
+            if ($ageSeconds -gt $s.sessionTTL) {
                 $expired.Add($key)
             }
         } catch {
@@ -431,7 +548,10 @@ function Clear-ExpiredSessions {
     }
 
     foreach ($key in @($expired)) {
-        try { [void]$s.sessionMap.Remove($key) } catch {}
+        try {
+            $removedEntry = $null
+            [void]$s.sessionMap.TryRemove($key, [ref]$removedEntry)
+        } catch {}
     }
 
     $purgedCount = $expired.Count
@@ -449,7 +569,7 @@ function Clear-ExpiredSessions {
         $removedForCap = [Math]::Max(0, $orderedSessions.Count - $keepers.Count)
         $s.sessionMap.Clear()
         foreach ($item in $keepers) {
-            $s.sessionMap[$item.Key] = $item.Entry
+            $s.sessionMap.TryAdd($item.Key, $item.Entry) | Out-Null
         }
         $purgedCount += $removedForCap
     }
@@ -603,6 +723,8 @@ $HandlerScript = {
     $remoteClient = $null
     $clientStream = $null
     $remoteStream = $null
+    $clientToRemoteBytes = [long]0
+    $remoteToClientBytes = [long]0
     $uri = $null
     try {
         # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
@@ -811,8 +933,6 @@ $HandlerScript = {
         $State.totalConnections++
         $State.activeConnections++
 
-        $bufSize = if ($State.bufferSizes.ContainsKey($connType)) { $State.bufferSizes[$connType] } else { $State.bufferSizes['default'] }
-
         $adapter = $avail[0]
         $selectionReason = 'default'
         $affinityMode = 'none'
@@ -844,7 +964,7 @@ $HandlerScript = {
 
         # Log decision
         $decision = @{
-            time = (Get-Date).ToString('HH:mm:ss')
+            time = [System.DateTimeOffset]::Now.ToString('HH:mm:ss')
             host = $targetHost
             type = $connType
             adapter = $adapter.Name
@@ -893,20 +1013,19 @@ $HandlerScript = {
                 }
 
                 $remoteClient = New-Object System.Net.Sockets.TcpClient
+                $remoteClient.NoDelay = $true
                 $remoteClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Linger, (New-Object System.Net.Sockets.LingerOption($true, 1)))
-                $remoteClient.SendBufferSize = $bufSize
-                $remoteClient.ReceiveBufferSize = $bufSize
+                $remoteClient.ReceiveBufferSize = 524288
+                $remoteClient.SendBufferSize = 524288
                 $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($adapter.IP), 0)
                 $remoteClient.Client.Bind($localEP)
                 $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
                 if ($ifIndex -gt 0) {
                     try {
-                        # Windows IP_UNICAST_IF expects interface index in network byte order.
-                        $ifIndexNetworkOrder = [System.Net.IPAddress]::HostToNetworkOrder($ifIndex)
                         $remoteClient.Client.SetSocketOption(
                             [System.Net.Sockets.SocketOptionLevel]::IP,
                             [System.Net.Sockets.SocketOptionName]::(31), # IP_UNICAST_IF
-                            [int]$ifIndexNetworkOrder
+                            [uint32]$ifIndex
                         )
                     } catch {
                         # Fail open: preserve connectivity if this option is unsupported by stack/driver.
@@ -945,14 +1064,16 @@ $HandlerScript = {
             
             $ok = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 Connection Established`r`n`r`n")
             $clientStream.Write($ok, 0, $ok.Length)
-            # Bidirectional TCP relay -- correct teardown pattern:
-            # 1. WhenAny: wait until the FIRST direction closes (server sends full response -> r2c done)
-            # 2. WhenAll (8s grace): drain any remaining bytes in the other direction before closing
-            # This prevents thread starvation (WhenAll alone held threads for 90s per tunnel)
-            $c2r = $clientStream.CopyToAsync($remoteStream, $bufSize)
-            $r2c = $remoteStream.CopyToAsync($clientStream, $bufSize)
-            try { [System.Threading.Tasks.Task]::WhenAny($c2r, $r2c).Wait(85000) } catch {}
-            try { [System.Threading.Tasks.Task]::WhenAll($c2r, $r2c).Wait(5000) } catch {}
+            $clientStream.ReadTimeout = [System.Threading.Timeout]::Infinite
+            $clientStream.WriteTimeout = [System.Threading.Timeout]::Infinite
+            $remoteStream.ReadTimeout = [System.Threading.Timeout]::Infinite
+            $remoteStream.WriteTimeout = [System.Threading.Timeout]::Infinite
+            [NetFusion.StreamCopier]::CopyStreamBidirectional(
+                $clientStream,
+                $remoteStream,
+                [ref]$clientToRemoteBytes,
+                [ref]$remoteToClientBytes
+            )
         } else {
             $remoteStream.ReadTimeout = 15000
             $reqPath = $uri.PathAndQuery; if (-not $reqPath) { $reqPath = '/' }
@@ -990,20 +1111,13 @@ $HandlerScript = {
             if ($isChunked) {
                 if ($chunkedBody.Length -gt 0) {
                     $remoteStream.Write($chunkedBody, 0, $chunkedBody.Length)
+                    $clientToRemoteBytes += [long]$chunkedBody.Length
                 }
             } elseif ($contentLength -gt 0) {
-                $bodyBuffer = New-Object byte[] ([math]::Min($contentLength, 262144))
-                while ($contentLength -gt 0) {
-                    $toRead = [math]::Min($contentLength, $bodyBuffer.Length)
-                    $br = $clientStream.Read($bodyBuffer, 0, $toRead)
-                    if ($br -le 0) { break }
-                    $remoteStream.Write($bodyBuffer, 0, $br)
-                    $contentLength -= $br
-                }
+                [NetFusion.StreamCopier]::CopyStream($clientStream, $remoteStream, [int64]$contentLength, [ref]$clientToRemoteBytes)
             }
 
-            # v6.2 SPEED BOOST: Use optimized async pipeline instead of slow string loop
-            try { $remoteStream.CopyToAsync($clientStream, $bufSize).Wait(120000) } catch {}
+            [NetFusion.StreamCopier]::CopyStream($remoteStream, $clientStream, [ref]$remoteToClientBytes)
         }
 
     } catch {} finally {
@@ -1034,7 +1148,8 @@ if (Test-Path $configFile) {
 }
 $minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 64 }
 $maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
-$currentMaxThreads = [math]::Min($maxThreads, [math]::Max($minThreads, 96))
+$maxThreads = [math]::Max(50, [math]::Max($minThreads, $maxThreads))
+$currentMaxThreads = [math]::Max(50, [math]::Min($maxThreads, [math]::Max($minThreads, 96)))
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
 
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
@@ -1081,25 +1196,32 @@ $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Lo
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
 
 Update-ProxyStats
-$lastRefresh = Get-Date
-$lastLog = Get-Date
-$lastCleanup = Get-Date
-$lastSessionClean = Get-Date
+$lastRefreshTicks = [System.DateTimeOffset]::UtcNow.Ticks
+$lastLogTicks = $lastRefreshTicks
+$lastCleanupTicks = $lastRefreshTicks
+$lastSessionCleanTicks = $lastRefreshTicks
+$cleanupIntervalTicks = [System.TimeSpan]::FromMilliseconds(500).Ticks
+$sessionCleanIntervalTicks = [System.TimeSpan]::FromSeconds(60).Ticks
+$logIntervalTicks = [System.TimeSpan]::FromSeconds(1).Ticks
+$staleJobTicks = [System.TimeSpan]::FromSeconds(180).Ticks
+$lowThreadHoldTicks = [System.TimeSpan]::FromSeconds(120).Ticks
+$lowThreadTicks = $null
 
 try {
     while ($true) {
-        $now = Get-Date
+        $nowTicks = [System.DateTimeOffset]::UtcNow.Ticks
 
         # Refresh adapter data and weights every 5 seconds
         $refreshInterval = if ($global:ProxyState.weightRefreshInterval -gt 0) { [double]$global:ProxyState.weightRefreshInterval } else { 2.0 }
-        if (($now - $lastRefresh).TotalSeconds -gt $refreshInterval) {
+        $refreshIntervalTicks = [int64]($refreshInterval * [System.TimeSpan]::TicksPerSecond)
+        if (($nowTicks - $lastRefreshTicks) -gt $refreshIntervalTicks) {
             Update-AdaptersAndWeights
             Update-ProxyStats
-            $lastRefresh = $now
+            $lastRefreshTicks = $nowTicks
         }
 
         # Clean completed jobs and evaluate scaling twice per second so short speed bursts can expand quickly.
-        if (($now - $lastCleanup).TotalMilliseconds -gt 500) {
+        if (($nowTicks - $lastCleanupTicks) -gt $cleanupIntervalTicks) {
             $toRemove = @()
             $activeCount = 0
             foreach ($j in $jobs) {
@@ -1107,7 +1229,7 @@ try {
                     $toRemove += $j
                 } else {
                     $activeCount++
-                    if ($j.StartTime -and (($now - $j.StartTime).TotalSeconds -gt 180)) {
+                    if ($j.StartTicks -and (($nowTicks - [int64]$j.StartTicks) -gt $staleJobTicks)) {
                         # Stale job -- force dispose (180s timeout, reduced from 600s)
                         try { $j.PS.Stop() } catch {}
                         $toRemove += $j
@@ -1130,27 +1252,27 @@ try {
                 $global:ProxyState.currentMaxThreads = $currentMaxThreads
                 Write-ProxyEvent "Pool scaled UP: $currentMaxThreads (queue pending, active=$activeThreads)"
                 Write-Host "  [Scale UP] Thread pool expanded to $currentMaxThreads" -ForegroundColor Cyan
-                $lowThreadTimestamp = $null
+                $lowThreadTicks = $null
             } elseif ($activeThreads -lt [math]::Floor($currentMaxThreads * 0.4) -and $currentMaxThreads -gt $minThreads) {
-                if ($null -eq $lowThreadTimestamp) {
-                    $lowThreadTimestamp = $now
-                } elseif (($now - $lowThreadTimestamp).TotalSeconds -gt 120) {
+                if ($null -eq $lowThreadTicks) {
+                    $lowThreadTicks = $nowTicks
+                } elseif (($nowTicks - [int64]$lowThreadTicks) -gt $lowThreadHoldTicks) {
                     $currentMaxThreads = [math]::Max($minThreads, $currentMaxThreads - 8)
                     $rsPool.SetMaxRunspaces($currentMaxThreads)
                     $global:ProxyState.currentMaxThreads = $currentMaxThreads
                     Write-ProxyEvent "Pool scaled DOWN: $currentMaxThreads (low usage for 120s, active=$activeThreads)"
                     Write-Host "  [Scale DOWN] Thread pool reduced to $currentMaxThreads" -ForegroundColor Cyan
-                    $lowThreadTimestamp = $null
+                    $lowThreadTicks = $null
                 }
             } else {
-                $lowThreadTimestamp = $null
+                $lowThreadTicks = $null
             }
 
-            $lastCleanup = $now
+            $lastCleanupTicks = $nowTicks
         }
 
         # v5.0: Clean expired session affinity entries every 60s
-        if (($now - $lastSessionClean).TotalSeconds -gt 60) {
+        if (($nowTicks - $lastSessionCleanTicks) -gt $sessionCleanIntervalTicks) {
             $removedSessions = Clear-ExpiredSessions
             if ($removedSessions -gt 0) {
                 Write-ProxyEvent "Cleared $removedSessions expired or invalid session affinity entr$(if($removedSessions -eq 1){'y'}else{'ies'})"
@@ -1159,7 +1281,7 @@ try {
             if ($removedUploadHints -gt 0) {
                 Write-ProxyEvent "Cleared $removedUploadHints expired upload-host hint$(if($removedUploadHints -eq 1){''}else{'s'})"
             }
-            $lastSessionClean = $now
+            $lastSessionCleanTicks = $nowTicks
         }
 
         if (-not $listener.Pending()) {
@@ -1168,16 +1290,19 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
+        $client.NoDelay = $true
+        $client.ReceiveBufferSize = 524288
+        $client.SendBufferSize = 524288
 
         # Spawn handler in runspace
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $rsPool
         $ps.AddScript($HandlerScript).AddArgument($client).AddArgument($global:ProxyState) | Out-Null
         $handle = $ps.BeginInvoke()
-        $jobs.Add(@{ PS = $ps; Handle = $handle; StartTime = $now })
+        $jobs.Add(@{ PS = $ps; Handle = $handle; StartTicks = $nowTicks })
 
         # Log connection activity
-        if (($now - $lastLog).TotalSeconds -gt 1) {
+        if (($nowTicks - $lastLogTicks) -gt $logIntervalTicks) {
             $s = $global:ProxyState
             $connParts = @()
             foreach ($a in $s.adapters) { $connParts += "$($a.Name):$($s.connectionCounts[$a.Name])" }
@@ -1186,9 +1311,9 @@ try {
                 if ($s.connectionTypes.ContainsKey($k)) { $typeStr += "$k=$($s.connectionTypes[$k])" }
             }
             $safeFlag = if ($s.safeMode) { ' [SAFE]' } else { '' }
-            $ts = Get-Date -Format 'HH:mm:ss'
+            $ts = [System.DateTimeOffset]::Now.ToString('HH:mm:ss')
             Write-Host "  [$ts] conns=$($s.totalConnections) | $($connParts -join ' | ') | threads=$($jobs.Count) | sessions=$($s.sessionMap.Count)$safeFlag | $($typeStr -join ' ')" -ForegroundColor DarkGray
-            $lastLog = $now
+            $lastLogTicks = $nowTicks
         }
     }
 } finally {

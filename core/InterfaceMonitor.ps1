@@ -228,6 +228,9 @@ function Test-InternetLatency {
     # Method 3: TCP connect test to DNS port
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
+        $tcp.NoDelay = $true
+        $tcp.ReceiveBufferSize = 524288
+        $tcp.SendBufferSize = 524288
         $asyncResult = $tcp.BeginConnect($Target, 53, $null, $null)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
