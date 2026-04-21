@@ -89,7 +89,7 @@ function Repair-EventsFile {
 #   "totalSessions": N,
 #   "adapterProfiles": {
 #     "fingerprint": {
-#       "name": "Wi-Fi 3",
+#       "name": "Adapter Name",
 #       "type": "WiFi",
 #       "totalSamples": N,
 #       "avgHealth": N,

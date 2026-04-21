@@ -46,7 +46,7 @@ This project is designed for real aggregate throughput on workloads that already
 > The best proof of value is a segmented downloader, torrent client, or any workload that opens many concurrent TCP sessions. A single browser download is usually the wrong benchmark.
 
 > [!NOTE]
-> The documented target right now is multi-adapter operation with at least two active links. Mixed pairs such as `Wi-Fi + Ethernet` or `2 Wi-Fi` are valid current use cases. Three-adapter layouts should be treated as exploratory unless they are explicitly validated and documented in a future update.
+> NetFusion is designed for dynamic multi-adapter operation and does not impose a two-adapter limit. Any number of active, healthy, routable adapters can participate.
 
 <table>
   <tr>
@@ -79,19 +79,17 @@ This project is designed for real aggregate throughput on workloads that already
 
 ## Multi-Adapter Support
 
-NetFusion is designed around multi-adapter traffic steering, but this README should only claim configurations that are intentionally documented today.
+NetFusion is designed around multi-adapter traffic steering with dynamic N-adapter handling.
 
 Currently documented use cases:
 
-- `Wi-Fi + Ethernet`
-- `2 Wi-Fi adapters`
-- Other two-adapter combinations that Windows exposes cleanly with valid IPv4 addresses and gateways
+- Mixed media: `Wi-Fi`, `Ethernet`, `USB-Wi-Fi`, `USB-Ethernet`, `Cellular`
+- Any adapter count where Windows exposes usable addresses and routes
 
 Scope notes:
 
-- Some backend components are adapter-count aware beyond two interfaces, but that should be treated as an implementation detail, not a documented feature promise.
-- The current dashboard throughput chart and legend are still tuned for the first two adapters.
-- If three-adapter layouts such as `2 USB Wi-Fi + 1 Ethernet` or `2 Ethernet + 1 Wi-Fi` are validated later, they should be added back as explicit support statements at that time.
+- NetFusion schedules per connection; one TCP stream still maps to one adapter at a time.
+- Combined speed depends on workload concurrency and upstream path diversity.
 
 > [!IMPORTANT]
 > NetFusion does per-connection steering, not packet bonding. Even in multi-adapter scenarios, it does not turn one TCP download into a true summed link.
@@ -103,7 +101,7 @@ Before expecting useful results, make sure the environment actually supports mul
 - Windows 10 or Windows 11
 - PowerShell 5.1 or newer
 - Administrator privileges
-- At least two active adapters with valid IPv4 addresses
+- At least one active adapter with valid IP routing (multiple adapters recommended for aggregation)
 - A working gateway on each adapter you expect NetFusion to use
 - `curl.exe` available for adapter-bound diagnostics
 
@@ -112,13 +110,13 @@ Recommended:
 - Separate upstream paths when possible
 - A downloader that supports many parallel connections
 - Verify real adapter traffic counters instead of trusting app-level speed numbers
-- Keep adapter chipsets and drivers stable if you plan to run three active links at once
+- Keep adapter chipsets and drivers stable when running many active links simultaneously
 
 > [!WARNING]
 > If all active adapters ultimately feed the same router and the same constrained WAN uplink, NetFusion cannot manufacture more internet bandwidth than that upstream bottleneck allows.
 
 > [!WARNING]
-> Two USB Wi-Fi adapters can work, but USB bus contention, driver quality, and RF interference can make them less stable than one internal radio plus Ethernet.
+> Multiple USB adapters can work, but USB bus contention, driver quality, and RF interference may reduce stability versus mixed media paths.
 
 ## Fit Matrix
 
@@ -252,7 +250,7 @@ Configure:
 
 - `WiFi` usually represents the internal wireless card.
 - `USB-WiFi` is detected separately and scored with a small stability penalty because USB radios are often less consistent under load.
-- `Ethernet` usually gets the highest capability score because it is the most predictable path.
+- Capability scoring is telemetry-driven; no static type preference is forced at runtime.
 
 <details>
 <summary><strong>Repository map</strong></summary>
@@ -283,7 +281,7 @@ Configure:
 | `mode` | `maxspeed` | Primary strategy profile |
 | `proxyPort` | `8080` | Local proxy listen port |
 | `dashboardPort` | `9090` | Dashboard server port |
-| `blockQUICOnSecondaryAdapters` | `true` | Pushes browser traffic toward TCP paths the proxy can observe |
+| `blockQUICForUnproxiedTraffic` | `true` | Pushes browser traffic toward TCP paths the proxy can observe |
 | `routing.splitRoutesEnabled` | `false` | Split routes are optional and secondary to proxy-based steering |
 | `proxy.maxRetries` | `3` | Connection establishment retry count |
 | `proxy.sessionAffinityTTL` | `300` | Keeps related traffic stable for a short window |
@@ -317,8 +315,9 @@ The default profile is `maxspeed`.
 Do not rely on application-level speed displays alone. Confirm that the adapters you expect to use are moving traffic:
 
 ```powershell
-Get-NetAdapterStatistics -Name 'Wi-Fi 3'
-Get-NetAdapterStatistics -Name 'Wi-Fi 4'
+Get-NetAdapter |
+Where-Object Status -eq 'Up' |
+ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
 ```
 
 ### Run the combined-speed test
@@ -343,7 +342,7 @@ Use these files as ground truth:
 - `config/decisions.json`
 - `logs/events.json`
 
-If you are testing three active links, compare all three adapters instead of only the two shown in the dashboard throughput chart.
+When validating, compare all active adapters shown in telemetry and OS counters.
 
 ## Troubleshooting
 
@@ -355,7 +354,7 @@ Use the list below when NetFusion does not behave the way you expect. Each issue
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 |
-Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
+Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\\.254\\.' } |
 Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
 ```
 
@@ -363,7 +362,7 @@ Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
 
 ```powershell
 Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
-Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
+Where-Object { $_.InterfaceAlias } |
 Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
 ```
 
@@ -384,8 +383,9 @@ Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
 4. Verify real adapter counters instead of relying only on the browser speed display.
 
 ```powershell
-Get-NetAdapterStatistics -Name 'Wi-Fi 3'
-Get-NetAdapterStatistics -Name 'Wi-Fi 4'
+Get-NetAdapter |
+Where-Object Status -eq 'Up' |
+ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
 ```
 
 ### 3. Browser traffic is not balancing well
@@ -399,135 +399,83 @@ Get-NetAdapterStatistics -Name 'Wi-Fi 4'
 4. Compare adapter counters while the workload is running.
 
 ```powershell
-Get-NetAdapterStatistics -Name 'Wi-Fi 3'
-Get-NetAdapterStatistics -Name 'Wi-Fi 4'
+Get-NetAdapter |
+Where-Object Status -eq 'Up' |
+ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
 ```
 
 ### 4. An adapter has no gateway or falls back to APIPA
 
-1. Check the adapter IP and route state.
+1. Identify affected adapters dynamically.
 
 ```powershell
-Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
-Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
+Get-NetAdapter |
+Where-Object Status -eq 'Up' |
+ForEach-Object {
+  [pscustomobject]@{
+    Name = $_.Name
+    IPv4 = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object IPAddress -notlike '169.254.*' |
+      Select-Object -ExpandProperty IPAddress -First 1)
+    Gateway = (Get-NetRoute -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+      Sort-Object RouteMetric |
+      Select-Object -ExpandProperty NextHop -First 1)
+  }
+} | Format-Table -AutoSize
 ```
 
-2. If the adapter has no valid address or no usable route, run one of the recovery helpers as Administrator.
+2. Run recovery helpers as Administrator when an adapter has no usable IPv4 or gateway.
 
 - `test-wifi4-fix.ps1`
 - `fix-wifi4.ps1`
 - `fix-wifi4-arp.ps1`
 
-3. Re-check the adapter after the recovery script finishes.
+3. Re-check adapter IP and route state after the helper finishes.
 
-```powershell
-Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
-Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
-```
+4. If an adapter still has no valid gateway, repair DHCP/static settings for that adapter and reconnect it before retrying NetFusion.
 
-4. If the adapter still has no working gateway, inspect the DHCP state and renew or reconnect the adapter before retrying NetFusion.
+### 5. Adjust per-adapter default route metrics safely
 
-### 5. Override a Wi-Fi adapter default gateway manually
-
-Use this when Windows received a gateway from DHCP, but you still want to force a different default route for one specific adapter.
+Use this when you need deterministic routing preference for specific interfaces without deleting existing routes.
 
 1. Open PowerShell as Administrator.
-   If Windows returns `Access is denied`, the shell is not elevated.
 
-2. List the available adapters and confirm the exact adapter name.
+2. Select the target adapter.
 
 ```powershell
-Get-NetAdapter | Format-Table Name,InterfaceDescription,Status,MacAddress,LinkSpeed -AutoSize
+$adapterAlias = 'YOUR_ADAPTER_NAME'
+$if = Get-NetIPInterface -InterfaceAlias $adapterAlias -AddressFamily IPv4 -ErrorAction Stop
 ```
 
-3. Check the current IPv4 address, DHCP state, interface index, and default gateway for the adapter you want to change.
+3. Inspect current route and metric state.
 
 ```powershell
-Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 |
-Format-Table InterfaceAlias,InterfaceIndex,Dhcp,ConnectionState -AutoSize
+Get-NetIPInterface -InterfaceAlias $adapterAlias -AddressFamily IPv4 |
+Format-Table InterfaceAlias,InterfaceIndex,Dhcp,AutomaticMetric,InterfaceMetric,ConnectionState -AutoSize
 
-Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 |
-Format-Table IPAddress,PrefixLength,PrefixOrigin,AddressState -AutoSize
-
-Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
-Format-Table ifIndex,InterfaceAlias,NextHop,RouteMetric,PolicyStore -AutoSize
-```
-
-4. Store the interface index in a variable.
-
-```powershell
-$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4).InterfaceIndex
-```
-
-5. Remove the current default route from that adapter.
-
-```powershell
-Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
-```
-
-6. Add the new default route.
-
-```powershell
-New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
-```
-
-7. Verify that the new gateway is now active for that adapter.
-
-```powershell
-Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+Get-NetRoute -InterfaceAlias $adapterAlias -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
 Sort-Object RouteMetric |
 Format-Table ifIndex,InterfaceAlias,NextHop,RouteMetric,PolicyStore -AutoSize
 ```
 
-8. Repeat the same process for each adapter you want to override.
-   Replace the adapter name, old gateway, and new gateway with the values for that specific device.
-
-Per-device examples:
-
-For `Wi-Fi 2`:
+4. Set interface metric (adapter-specific, no default route deletion).
 
 ```powershell
-$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4).InterfaceIndex
-Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
-New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
-Get-NetRoute -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
+Set-NetIPInterface -InterfaceIndex $if.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 20
 ```
 
-For `Wi-Fi 3`:
+5. Verify applied state.
 
 ```powershell
-$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4).InterfaceIndex
-Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
-New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
-Get-NetRoute -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
-```
-
-For `Wi-Fi 4`:
-
-```powershell
-$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4).InterfaceIndex
-Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
-New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
-Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
+Get-NetIPInterface -InterfaceIndex $if.InterfaceIndex -AddressFamily IPv4 |
+Format-Table InterfaceAlias,InterfaceIndex,AutomaticMetric,InterfaceMetric -AutoSize
 ```
 
 Important notes:
 
-- This is a manual route override, not a DHCP lease change.
-- If the adapter is still on DHCP, the old gateway can come back after reconnecting, rebooting, or renewing the lease.
-- If the new gateway IP is not reachable on that subnet, the adapter can lose connectivity.
-- Test the replacement gateway before changing routes if you are not sure it is alive.
-
-```powershell
-Test-NetConnection 192.168.1.253
-```
-
-- If you prefer adapter names instead of interface indexes, this also works:
-
-```powershell
-Remove-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
-New-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
-```
+- This changes route preference only; it does not change DHCP lease contents.
+- Avoid deleting default routes unless you are doing controlled manual recovery.
+- Verify gateway reachability before lowering metrics aggressively.
 
 ## Known Limits
 

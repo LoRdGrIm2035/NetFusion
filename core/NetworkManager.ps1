@@ -1,13 +1,12 @@
 <#
 .SYNOPSIS
-    NetworkManager v4.0 — Intelligent auto-detection and scoring of network interfaces.
+    NetworkManager v5.0 -- Robust multi-interface discovery and classification.
 .DESCRIPTION
-    Central orchestrator that discovers Wi-Fi, Ethernet, and USB network adapters.
-    v4.0 enhancements:
-      - Adapter capability scoring (link speed, type bonus, historical reliability)
-      - Adapter fingerprinting for cross-session identification
-      - Extended metadata for intelligence engine consumption
-    Writes interface data to a shared JSON file for other components.
+    Discovers and classifies all usable adapters using multiple data sources:
+      - Get-NetAdapter / Get-NetIPAddress / Get-NetIPInterface
+      - Win32_NetworkAdapter (WMI/CIM)
+      - ifType + media type + bus hints
+    Produces N-adapter metadata for downstream health, routing, and proxy engines.
 #>
 
 [CmdletBinding()]
@@ -15,7 +14,6 @@ param(
     [int]$PollInterval = 3
 )
 
-# Resolve paths
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $OutputFile = Join-Path $projectDir "config\interfaces.json"
@@ -25,7 +23,7 @@ function Write-AtomicJson {
     param(
         [string]$Path,
         [object]$Data,
-        [int]$Depth = 4
+        [int]$Depth = 6
     )
 
     $directory = Split-Path -Parent $Path
@@ -43,50 +41,34 @@ function Write-AtomicJson {
     }
 }
 
-function Get-AdapterCapabilityScore {
-    <# Score an adapter based on its inherent capabilities (0-100). #>
-    param([string]$Type, [double]$LinkSpeedMbps, [string]$Status, [int]$WiFiGen = 0)
+function Convert-LinkSpeedToMbps {
+    param([object]$LinkSpeed)
 
-    if ($Status -ne 'Up') { return 0 }
-    $score = 30  # Base score for being active
-
-    # Type bonus
-    switch ($Type) {
-        'Ethernet'  { $score += 30 }   # Most reliable
-        'WiFi'      { $score += 20 }   # Good, internal
-        'USB-WiFi'  { $score += 15 }   # USB overhead penalty
-        default     { $score += 10 }
+    $raw = [string]$LinkSpeed
+    if ([string]::IsNullOrWhiteSpace($raw)) { return 0.0 }
+    if ($raw -match '([\d.]+)\s*(Gbps|Mbps|Kbps)') {
+        $val = [double]$Matches[1]
+        switch ($Matches[2]) {
+            'Gbps' { return [math]::Round($val * 1000.0, 2) }
+            'Mbps' { return [math]::Round($val, 2) }
+            'Kbps' { return [math]::Round($val / 1000.0, 2) }
+        }
     }
-
-    # Speed bonus (normalized to 1000 Mbps scale)
-    $speedBonus = [math]::Min(30, [math]::Round(($LinkSpeedMbps / 1000) * 30))
-    $score += $speedBonus
-
-    # Link speed quality tiers
-    if ($LinkSpeedMbps -ge 1000) { $score += 10 }
-    elseif ($LinkSpeedMbps -ge 300) { $score += 5 }
-
-    # Wi-Fi generation bonus (newer = better radios, MU-MIMO, OFDMA)
-    switch ($WiFiGen) {
-        8 { $score += 18 }  # Wi-Fi 8 (802.11bn, future)
-        7 { $score += 15 }  # Wi-Fi 7 (802.11be, MLO, 320MHz, 4096-QAM)
-        { $_ -eq 6.1 } { $score += 12 }  # Wi-Fi 6E (6GHz band)
-        6 { $score += 10 }  # Wi-Fi 6 (802.11ax, OFDMA, MU-MIMO)
-        5 { $score += 5 }   # Wi-Fi 5 (802.11ac, 5GHz)
-        4 { $score += 2 }   # Wi-Fi 4 (802.11n)
-    }
-
-    return [math]::Min(100, $score)
+    return 0.0
 }
 
 function Get-AdapterFingerprint {
-    <# Generate a stable fingerprint for cross-session adapter identification. #>
-    param([string]$MacAddress, [string]$Description)
-    $raw = "$MacAddress|$Description"
+    param([string]$MacAddress, [string]$Description, [int]$InterfaceIndex)
+
+    $raw = "$MacAddress|$Description|$InterfaceIndex"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    $hash = $sha.ComputeHash($bytes)
-    return [BitConverter]::ToString($hash[0..7]).Replace('-', '').ToLower()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+        return [BitConverter]::ToString($hash[0..7]).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 function Test-GatewayReachable {
@@ -98,6 +80,7 @@ function Test-GatewayReachable {
     if ([string]::IsNullOrWhiteSpace($Gateway)) { return $false }
     $key = [string]$Gateway
     $now = Get-Date
+
     if ($script:gatewayProbeCache.ContainsKey($key)) {
         $cached = $script:gatewayProbeCache[$key]
         try {
@@ -109,202 +92,430 @@ function Test-GatewayReachable {
 
     $ok = $false
     try {
-        $ping = ping.exe -n 1 -w 500 $Gateway 2>$null
-        $joined = ($ping | Out-String)
-        if (
-            ($joined -match 'TTL=' -or $joined -match 'time[=<]\d+\s*ms') -and
-            $joined -notmatch '(?i)unreachable|timed out|general failure'
-        ) {
-            $ok = $true
+        $pinger = New-Object System.Net.NetworkInformation.Ping
+        try {
+            $reply = $pinger.Send($Gateway, 500)
+            if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $ok = $true
+            }
+        } finally {
+            $pinger.Dispose()
         }
     } catch {}
 
-    $script:gatewayProbeCache[$key] = @{
-        time = $now
-        ok = $ok
-    }
+    $script:gatewayProbeCache[$key] = @{ time = $now; ok = $ok }
     return $ok
 }
 
 function Get-PreferredDefaultRoute {
-    param([int]$InterfaceIndex)
+    param(
+        [int]$InterfaceIndex,
+        [ValidateSet('IPv4','IPv6')]
+        [string]$AddressFamily = 'IPv4'
+    )
 
+    $prefix = if ($AddressFamily -eq 'IPv6') { '::/0' } else { '0.0.0.0/0' }
     $routes = @(
-        Get-NetRoute -InterfaceIndex $InterfaceIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Get-NetRoute -InterfaceIndex $InterfaceIndex -AddressFamily $AddressFamily -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
             Sort-Object RouteMetric
     )
     if ($routes.Count -eq 0) { return $null }
 
-    $reachableRoute = $null
-    foreach ($r in $routes) {
-        if (Test-GatewayReachable -Gateway ([string]$r.NextHop)) {
-            $reachableRoute = $r
-            break
+    foreach ($route in $routes) {
+        if ($AddressFamily -eq 'IPv4') {
+            if (Test-GatewayReachable -Gateway ([string]$route.NextHop)) {
+                return $route
+            }
+        } else {
+            return $route
         }
     }
 
-    if ($reachableRoute) { return $reachableRoute }
     return ($routes | Select-Object -First 1)
 }
 
-function Get-AllNetworkInterfaces {
-    <#
-    .SYNOPSIS
-        Discovers all usable network adapters with full metadata and capability scoring.
-    #>
-    $adapters = Get-NetAdapter | Where-Object {
-        $_.Status -eq 'Up' -and
-        $_.InterfaceDescription -notmatch 'TAP-Windows|OpenVPN|WireGuard|Cisco|Tailscale|ZeroTier|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel'
+function Get-WifiRuntimeMap {
+    $map = @{}
+    try {
+        $netshOutput = netsh wlan show interfaces 2>$null
+        if (-not $netshOutput) { return $map }
+
+        $current = $null
+        foreach ($line in @($netshOutput -split "`r?`n")) {
+            if ($line -match '^\s*Name\s*:\s*(.+)$') {
+                $current = $Matches[1].Trim()
+                if (-not $map.ContainsKey($current)) {
+                    $map[$current] = @{ SSID = ''; Signal = 0; RadioType = '' }
+                }
+                continue
+            }
+
+            if (-not $current) { continue }
+
+            if ($line -match '^\s*SSID\s*:\s*(.+)$') {
+                $map[$current].SSID = $Matches[1].Trim()
+            } elseif ($line -match '^\s*Signal\s*:\s*(\d+)%') {
+                $map[$current].Signal = [int]$Matches[1]
+            } elseif ($line -match '^\s*Radio\s+type\s*:\s*(.+)$') {
+                $map[$current].RadioType = $Matches[1].Trim()
+            }
+        }
+    } catch {}
+
+    return $map
+}
+
+function Get-WmiAdapterMap {
+    $map = @{}
+    try {
+        $items = Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue
+        foreach ($item in @($items)) {
+            if ($null -eq $item.InterfaceIndex) { continue }
+            $map[[int]$item.InterfaceIndex] = $item
+        }
+    } catch {}
+    return $map
+}
+
+function Get-IfTypeLabel {
+    param([int]$IfType)
+
+    switch ($IfType) {
+        6 { 'Ethernet'; break }
+        23 { 'PPP'; break }
+        24 { 'Loopback'; break }
+        71 { 'WiFi'; break }
+        131 { 'Tunnel'; break }
+        144 { 'IEEE1394'; break }
+        243 { 'WWAN'; break }
+        244 { 'WWAN'; break }
+        default { 'Unknown' }
     }
+}
+
+function Test-IsVirtualAdapter {
+    param(
+        [object]$Adapter,
+        [object]$WmiAdapter
+    )
+
+    $wmiName = ''
+    $wmiPnp = ''
+    $wmiType = ''
+    if ($WmiAdapter) {
+        $wmiName = [string]$WmiAdapter.Name
+        $wmiPnp = [string]$WmiAdapter.PNPDeviceID
+        $wmiType = [string]$WmiAdapter.AdapterType
+    }
+
+    $candidates = @(
+        [string]$Adapter.Name,
+        [string]$Adapter.InterfaceDescription,
+        $wmiName,
+        $wmiPnp,
+        $wmiType
+    )
+
+    $joined = ($candidates -join ' | ')
+    return [bool]($joined -match '(?i)Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN|OpenVPN|WireGuard|Tailscale|ZeroTier|Npcap|vEthernet|VMware|VirtualBox|Software Loopback')
+}
+
+function Get-WiFiGeneration {
+    param(
+        [string]$Description,
+        [string]$RadioType,
+        [double]$LinkSpeedMbps
+    )
+
+    $desc = [string]$Description
+    $radio = [string]$RadioType
+
+    if ($radio -match '(?i)802\.11be' -or $desc -match '(?i)802\.11be|Wi-?Fi\s*7|\bBE\d{3}\b|QCN9274|MT7925') {
+        return @{ Gen = 7; Label = 'Wi-Fi 7 (802.11be)' }
+    }
+    if ($radio -match '(?i)802\.11ax' -or $desc -match '(?i)802\.11ax|Wi-?Fi\s*6E?|\bAX\d{3}\b|MT7921|MT7922|RTL8852') {
+        if ($desc -match '(?i)6E|6\s*GHz') {
+            return @{ Gen = 6.1; Label = 'Wi-Fi 6E (6GHz)' }
+        }
+        return @{ Gen = 6; Label = 'Wi-Fi 6 (802.11ax)' }
+    }
+    if ($radio -match '(?i)802\.11ac' -or $desc -match '(?i)802\.11ac|Wi-?Fi\s*5|Wireless-AC|\bAC\d{3,4}\b') {
+        return @{ Gen = 5; Label = 'Wi-Fi 5 (802.11ac)' }
+    }
+    if ($radio -match '(?i)802\.11n' -or $desc -match '(?i)802\.11n|Wi-?Fi\s*4|Wireless-N') {
+        return @{ Gen = 4; Label = 'Wi-Fi 4 (802.11n)' }
+    }
+
+    if ($LinkSpeedMbps -ge 1376) { return @{ Gen = 7; Label = 'Wi-Fi 7 (speed heuristic)' } }
+    if ($LinkSpeedMbps -ge 574) { return @{ Gen = 6; Label = 'Wi-Fi 6/6E (speed heuristic)' } }
+    if ($LinkSpeedMbps -ge 433) { return @{ Gen = 5; Label = 'Wi-Fi 5 (speed heuristic)' } }
+    if ($LinkSpeedMbps -ge 72) { return @{ Gen = 4; Label = 'Wi-Fi 4 (speed heuristic)' } }
+
+    return @{ Gen = 0; Label = '' }
+}
+
+function Get-AdapterType {
+    param(
+        [object]$Adapter,
+        [object]$WmiAdapter,
+        [int]$IfType,
+        [string]$MediaType,
+        [string]$PhysicalMediaType
+    )
+
+    $desc = [string]$Adapter.InterfaceDescription
+    $name = [string]$Adapter.Name
+    $pnp = if ($WmiAdapter) { [string]$WmiAdapter.PNPDeviceID } else { '' }
+
+    $isWifi = $IfType -eq 71 -or $desc -match '(?i)Wi-Fi|Wireless|802\.11|WLAN' -or $MediaType -match '(?i)Native802_11|Wireless' -or $PhysicalMediaType -match '(?i)Native802_11|Wireless'
+    $isEthernet = $IfType -eq 6 -or $desc -match '(?i)Ethernet|GbE|RJ45' -or $MediaType -match '(?i)802\.3|Ethernet'
+    $isWwan = $IfType -in @(243, 244) -or $desc -match '(?i)WWAN|Cellular|Mobile'
+    $isUsb = $pnp -match '(?i)^USB' -or $desc -match '(?i)USB'
+
+    if ($isWifi -and $isUsb) { return 'USB-WiFi' }
+    if ($isWifi) { return 'WiFi' }
+    if ($isEthernet -and $isUsb) { return 'USB-Ethernet' }
+    if ($isEthernet) { return 'Ethernet' }
+    if ($isWwan) { return 'Cellular' }
+    if ($name -match '(?i)Ethernet') { return 'Ethernet' }
+    if ($name -match '(?i)Wi-?Fi|Wireless') { return 'WiFi' }
+    return 'Unknown'
+}
+
+function Get-EstimatedCapacityMbps {
+    param(
+        [string]$Type,
+        [double]$LinkSpeedMbps,
+        [double]$WiFiGeneration
+    )
+
+    if ($LinkSpeedMbps -le 0) { return 50.0 }
+
+    if ($Type -match 'WiFi') {
+        $efficiency = 0.58
+        if ($WiFiGeneration -ge 7) { $efficiency = 0.65 }
+        elseif ($WiFiGeneration -ge 6) { $efficiency = 0.62 }
+        elseif ($WiFiGeneration -ge 5) { $efficiency = 0.58 }
+        elseif ($WiFiGeneration -gt 0) { $efficiency = 0.52 }
+        return [math]::Round([math]::Max(20.0, $LinkSpeedMbps * $efficiency), 2)
+    }
+
+    if ($Type -match 'Ethernet') {
+        return [math]::Round([math]::Max(50.0, $LinkSpeedMbps * 0.92), 2)
+    }
+
+    if ($Type -eq 'Cellular') {
+        return [math]::Round([math]::Max(10.0, $LinkSpeedMbps * 0.45), 2)
+    }
+
+    return [math]::Round([math]::Max(20.0, $LinkSpeedMbps * 0.60), 2)
+}
+
+function Get-AdapterCapabilityScore {
+    param(
+        [string]$Type,
+        [double]$LinkSpeedMbps,
+        [string]$Status,
+        [double]$WiFiGeneration = 0,
+        [double]$SignalQuality = 0
+    )
+
+    if ($Status -ne 'Up') { return 0 }
+    $score = 20
+
+    # Keep capability scoring type-agnostic by default and derive most weight
+    # from observed/advertised link capacity plus Wi-Fi PHY/signal detail.
+    if ($LinkSpeedMbps -gt 0) {
+        $score += [math]::Min(55, [math]::Round([math]::Sqrt([math]::Max(1.0, $LinkSpeedMbps)) * 2.5))
+    } else {
+        $score += 8
+    }
+
+    if ($Type -match 'WiFi') {
+        switch ($WiFiGeneration) {
+            { $_ -ge 7 } { $score += 12; break }
+            { $_ -ge 6 } { $score += 9; break }
+            5 { $score += 6; break }
+            4 { $score += 3; break }
+            default { $score += 1 }
+        }
+        if ($SignalQuality -gt 0) {
+            $score += [math]::Round([math]::Min(8, $SignalQuality / 12.5))
+        }
+    }
+
+    return [math]::Min(100, [math]::Max(0, [math]::Round($score)))
+}
+
+function Get-AllNetworkInterfaces {
+    $wmiMap = Get-WmiAdapterMap
+    $wifiRuntimeMap = Get-WifiRuntimeMap
+
+    $netAdapters = @(
+        Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Up' }
+    )
 
     $results = @()
 
-    foreach ($adapter in $adapters) {
-        # Determine adapter type
-        $type = 'Unknown'
-        if ($adapter.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11|WLAN' -or $adapter.Name -match 'Wi-Fi|Wireless') {
-            if ($adapter.InterfaceDescription -match 'USB|TP-Link|Realtek.*USB|Ralink.*USB|MediaTek.*USB') {
-                $type = 'USB-WiFi'
-            } else {
-                $type = 'WiFi'
-            }
-        } elseif ($adapter.InterfaceDescription -match 'Ethernet|Realtek.*GbE|Intel.*Ethernet|Killer.*Ethernet' -or $adapter.Name -match 'Ethernet') {
-            $type = 'Ethernet'
+    foreach ($adapter in $netAdapters) {
+        $ifIndex = [int]$adapter.ifIndex
+        $wmi = if ($wmiMap.ContainsKey($ifIndex)) { $wmiMap[$ifIndex] } else { $null }
+
+        if (Test-IsVirtualAdapter -Adapter $adapter -WmiAdapter $wmi) {
+            continue
         }
 
-        # Detect Wi-Fi generation from adapter description
-        # Supports: Wi-Fi 4 (802.11n), 5 (802.11ac), 6 (802.11ax), 6E (6GHz), 7 (802.11be), 8+ (802.11bn+)
-        $wifiGen = 0
-        $wifiGenLabel = ''
-        $desc = $adapter.InterfaceDescription
-        if ($type -match 'WiFi') {
-            if ($desc -match '802\.11bn|Wi-?Fi\s*8') {
-                $wifiGen = 8; $wifiGenLabel = 'Wi-Fi 8 (802.11bn)'
-            } elseif ($desc -match '802\.11be|Wi-?Fi\s*7|BE200|BE202|KILLER.*BE|QCA6698|QCN9274|MT7925|RTL8922') {
-                $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (802.11be)'
-            } elseif ($desc -match '6\s*GHz|Wi-?Fi\s*6E|AX2[01]1|AX411|AX1690|KILLER.*AX.*6E') {
-                $wifiGen = 6.1; $wifiGenLabel = 'Wi-Fi 6E (6GHz)'
-            } elseif ($desc -match '802\.11ax|Wi-?Fi\s*6|AX200|AX201|AX210|AX211|MT7921|MT7922|Killer.*AX|RTL8852') {
-                $wifiGen = 6; $wifiGenLabel = 'Wi-Fi 6 (802.11ax)'
-            } elseif ($desc -match '802\.11ac|Wi-?Fi\s*5|Wireless-AC|Dual Band.*AC|AC[\s-]?\d{4}|RTL8812|RTL8821') {
-                $wifiGen = 5; $wifiGenLabel = 'Wi-Fi 5 (802.11ac)'
-            } elseif ($desc -match '802\.11n|Wi-?Fi\s*4|Wireless-N|RTL8188|RT3572|AR9271|AR9462') {
-                $wifiGen = 4; $wifiGenLabel = 'Wi-Fi 4 (802.11n)'
-            } elseif ($desc -match '802\.11[abg]\b') {
-                $wifiGen = 3; $wifiGenLabel = 'Legacy (802.11a/b/g)'
-            } else {
-                # Fallback: guess from link speed if description doesn't match
-                if ($adapter.LinkSpeed -match '[\d.]+') {
-                    $rawSpeed = 0
-                    if ($adapter.LinkSpeed -match '([\d.]+)\s*Gbps') { $rawSpeed = [double]$Matches[1] * 1000 }
-                    elseif ($adapter.LinkSpeed -match '([\d.]+)\s*Mbps') { $rawSpeed = [double]$Matches[1] }
-                    if ($rawSpeed -ge 5000) { $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (speed-detected)' }
-                    elseif ($rawSpeed -ge 2400) { $wifiGen = 6; $wifiGenLabel = 'Wi-Fi 6 (speed-detected)' }
-                    elseif ($rawSpeed -ge 866) { $wifiGen = 5; $wifiGenLabel = 'Wi-Fi 5 (speed-detected)' }
-                    elseif ($rawSpeed -ge 72) { $wifiGen = 4; $wifiGenLabel = 'Wi-Fi 4 (speed-detected)' }
-                }
+        $ipInterface4 = Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipInterface6 = Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue
+
+        $ifType = 0
+        if ($ipInterface4 -and $null -ne $ipInterface4.InterfaceType) {
+            $ifType = [int]$ipInterface4.InterfaceType
+        } elseif ($ipInterface6 -and $null -ne $ipInterface6.InterfaceType) {
+            $ifType = [int]$ipInterface6.InterfaceType
+        } elseif ($wmi -and $null -ne $wmi.AdapterTypeID) {
+            # WMI AdapterTypeID is not identical to IF_TYPE, but this is safer than
+            # incorrectly using InterfaceIndex as a type code.
+            switch ([int]$wmi.AdapterTypeID) {
+                0 { $ifType = 6; break }   # Ethernet 802.3
+                9 { $ifType = 71; break }  # Wireless
+                default { $ifType = 0 }
             }
         }
 
-        # Get IP address
-        $ipInfo = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        $ipAddr = if ($ipInfo) { $ipInfo.IPAddress } else { $null }
+        $mediaType = if ($null -ne $adapter.MediaType) { [string]$adapter.MediaType } else { '' }
+        $physicalMediaType = if ($null -ne $adapter.PhysicalMediaType) { [string]$adapter.PhysicalMediaType } else { '' }
 
-        # Get gateway once here so InterfaceMonitor can consume it from interfaces.json
-        # instead of issuing duplicate Get-NetRoute queries every health cycle.
-        $routeInfo = Get-PreferredDefaultRoute -InterfaceIndex $adapter.ifIndex
-        $gateway = if ($routeInfo) { $routeInfo.NextHop } else { $null }
+        if ($ifType -in @(24, 131)) { continue }
 
-        # Get interface metric
-        $metricInfo = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        $metric = if ($metricInfo) { $metricInfo.InterfaceMetric } else { 9999 }
-        $autoMetric = if ($metricInfo) { [string]$metricInfo.AutomaticMetric } else { 'Unknown' }
+        $type = Get-AdapterType -Adapter $adapter -WmiAdapter $wmi -IfType $ifType -MediaType $mediaType -PhysicalMediaType $physicalMediaType
+        if ($type -eq 'Unknown' -and $ifType -in @(24, 131)) { continue }
 
-        # Get SSID for Wi-Fi adapters
-        $ssid = ''
-        if ($type -match 'WiFi') {
-            try {
-                $netshOutput = netsh wlan show interfaces
-                $currentAdapter = $null
-                foreach ($line in ($netshOutput -split "`n")) {
-                    if ($line -match '^\s*Name\s*:\s*(.+)$') {
-                        $currentAdapter = $Matches[1].Trim()
-                    }
-                    if ($currentAdapter -eq $adapter.Name -and $line -match '^\s*SSID\s*:\s*(.+)$') {
-                        $ssid = $Matches[1].Trim()
-                        break
-                    }
-                }
-            } catch {}
+        $ipv4List = @(
+            Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } |
+                Sort-Object SkipAsSource, PrefixOrigin |
+                Select-Object -ExpandProperty IPAddress
+        )
+        $ipv6List = @(
+            Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^fe80:' } |
+                Sort-Object SkipAsSource, PrefixOrigin |
+                Select-Object -ExpandProperty IPAddress
+        )
+
+        if ($ipv4List.Count -eq 0 -and $ipv6List.Count -eq 0) {
+            continue
         }
 
-        # Get DNS servers
-        $dnsServers = @()
+        $route4 = Get-PreferredDefaultRoute -InterfaceIndex $ifIndex -AddressFamily IPv4
+        $route6 = Get-PreferredDefaultRoute -InterfaceIndex $ifIndex -AddressFamily IPv6
+
+        $gateway4 = if ($route4) { [string]$route4.NextHop } else { '' }
+        $gateway6 = if ($route6) { [string]$route6.NextHop } else { '' }
+
+        $dns4 = @()
+        $dns6 = @()
         try {
-            $dnsInfo = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-            if ($dnsInfo -and $dnsInfo.ServerAddresses) { $dnsServers = @($dnsInfo.ServerAddresses) }
+            $dnsInfo4 = Get-DnsClientServerAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            if ($dnsInfo4 -and $dnsInfo4.ServerAddresses) { $dns4 = @($dnsInfo4.ServerAddresses) }
+        } catch {}
+        try {
+            $dnsInfo6 = Get-DnsClientServerAddress -InterfaceIndex $ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue
+            if ($dnsInfo6 -and $dnsInfo6.ServerAddresses) { $dns6 = @($dnsInfo6.ServerAddresses) }
         } catch {}
 
-        # Get adapter statistics
         $stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
+        $linkSpeedMbps = Convert-LinkSpeedToMbps -LinkSpeed $adapter.LinkSpeed
 
-        # Parse link speed to Mbps
-        $linkSpeedMbps = 0
-        if ($adapter.LinkSpeed -match '([\d.]+)\s*(Gbps|Mbps|Kbps)') {
-            $val = [double]$Matches[1]
-            switch ($Matches[2]) {
-                'Gbps' { $linkSpeedMbps = $val * 1000 }
-                'Mbps' { $linkSpeedMbps = $val }
-                'Kbps' { $linkSpeedMbps = $val / 1000 }
-            }
+        if ($linkSpeedMbps -le 0 -and $adapter.ReceiveLinkSpeed -gt 0) {
+            $linkSpeedMbps = [math]::Round([double]$adapter.ReceiveLinkSpeed / 1MB, 2)
         }
 
-        # v5.2: Capability score with Wi-Fi generation awareness
-        $capScore = Get-AdapterCapabilityScore -Type $type -LinkSpeedMbps $linkSpeedMbps -Status ([string]$adapter.Status) -WiFiGen ([int]$wifiGen)
-        $fingerprint = Get-AdapterFingerprint -MacAddress $adapter.MacAddress -Description $adapter.InterfaceDescription
+        $wifiRuntime = if ($wifiRuntimeMap.ContainsKey($adapter.Name)) { $wifiRuntimeMap[$adapter.Name] } else { @{ SSID = ''; Signal = 0; RadioType = '' } }
+        $wifiMeta = Get-WiFiGeneration -Description ([string]$adapter.InterfaceDescription) -RadioType ([string]$wifiRuntime.RadioType) -LinkSpeedMbps $linkSpeedMbps
 
-        $results += @{
-            Name            = $adapter.Name
-            Description     = $adapter.InterfaceDescription
-            Type            = $type
-            Status          = [string]$adapter.Status
-            InterfaceIndex  = $adapter.ifIndex
-            MacAddress      = $adapter.MacAddress
-            LinkSpeed       = $adapter.LinkSpeed
-            LinkSpeedMbps   = $linkSpeedMbps
-            IPAddress       = $ipAddr
-            Gateway         = $gateway
-            SSID            = $ssid
-            Metric          = $metric
-            AutomaticMetric = $autoMetric
-            DNSServers      = $dnsServers
-            SentBytes       = if ($stats) { $stats.SentBytes } else { 0 }
-            ReceivedBytes   = if ($stats) { $stats.ReceivedBytes } else { 0 }
-            CapabilityScore = $capScore
-            Fingerprint     = $fingerprint
-            WiFiGeneration  = $wifiGen
-            WiFiGenerationLabel = $wifiGenLabel
+        $signalQuality = 0
+        if ($type -match 'WiFi' -and $wifiRuntime.Signal -gt 0) {
+            $signalQuality = [int]$wifiRuntime.Signal
+        }
+
+        $capabilityScore = Get-AdapterCapabilityScore -Type $type -LinkSpeedMbps $linkSpeedMbps -Status ([string]$adapter.Status) -WiFiGeneration ([double]$wifiMeta.Gen) -SignalQuality $signalQuality
+        $estimatedCapacity = Get-EstimatedCapacityMbps -Type $type -LinkSpeedMbps $linkSpeedMbps -WiFiGeneration ([double]$wifiMeta.Gen)
+
+        $mac = if ($adapter.MacAddress) { [string]$adapter.MacAddress } elseif ($wmi -and $wmi.MACAddress) { [string]$wmi.MACAddress } else { '' }
+        $fingerprint = Get-AdapterFingerprint -MacAddress $mac -Description ([string]$adapter.InterfaceDescription) -InterfaceIndex $ifIndex
+
+        $busType = if ($wmi -and $wmi.PNPDeviceID -match '(?i)^USB') { 'USB' } elseif ($wmi -and $wmi.PNPDeviceID) { ([string]$wmi.PNPDeviceID -split '\\')[0] } else { 'Unknown' }
+
+        $metric4 = if ($ipInterface4 -and $null -ne $ipInterface4.InterfaceMetric) { [int]$ipInterface4.InterfaceMetric } else { 9999 }
+        $metric6 = if ($ipInterface6 -and $null -ne $ipInterface6.InterfaceMetric) { [int]$ipInterface6.InterfaceMetric } else { 9999 }
+
+        $primary4 = if ($ipv4List.Count -gt 0) { [string]$ipv4List[0] } else { '' }
+        $primary6 = if ($ipv6List.Count -gt 0) { [string]$ipv6List[0] } else { '' }
+        $primaryIp = if ($primary4) { $primary4 } else { $primary6 }
+
+        $results += [pscustomobject]@{
+            Name               = [string]$adapter.Name
+            Description        = [string]$adapter.InterfaceDescription
+            Type               = $type
+            Status             = [string]$adapter.Status
+            InterfaceIndex     = $ifIndex
+            IfType             = $ifType
+            IfTypeLabel        = (Get-IfTypeLabel -IfType $ifType)
+            MediaType          = $mediaType
+            PhysicalMediaType  = $physicalMediaType
+            BusType            = $busType
+            IsVirtual          = $false
+            IsUSB              = [bool]($busType -eq 'USB' -or [string]$adapter.InterfaceDescription -match '(?i)USB')
+            MacAddress         = $mac
+            Fingerprint        = $fingerprint
+            LinkSpeed          = [string]$adapter.LinkSpeed
+            LinkSpeedMbps      = [double]$linkSpeedMbps
+            EstimatedCapacityMbps = [double]$estimatedCapacity
+            CapabilityScore    = [int]$capabilityScore
+            SignalQuality      = [int]$signalQuality
+            RadioType          = if ($type -match 'WiFi') { [string]$wifiRuntime.RadioType } else { '' }
+            WiFiGeneration     = [double]$wifiMeta.Gen
+            WiFiGenerationLabel = [string]$wifiMeta.Label
+            SSID               = if ($type -match 'WiFi') { [string]$wifiRuntime.SSID } else { '' }
+            IPAddress          = $primaryIp
+            PrimaryIPv4        = $primary4
+            PrimaryIPv6        = $primary6
+            IPAddresses        = $ipv4List
+            IPv6Addresses      = $ipv6List
+            Gateway            = $gateway4
+            GatewayIPv6        = $gateway6
+            Metric             = $metric4
+            MetricIPv6         = $metric6
+            AutomaticMetric    = if ($ipInterface4) { [string]$ipInterface4.AutomaticMetric } else { 'Unknown' }
+            AutomaticMetricIPv6 = if ($ipInterface6) { [string]$ipInterface6.AutomaticMetric } else { 'Unknown' }
+            DNSServers         = $dns4
+            DNSServersIPv6     = $dns6
+            SentBytes          = if ($stats) { [long]$stats.SentBytes } else { 0 }
+            ReceivedBytes      = if ($stats) { [long]$stats.ReceivedBytes } else { 0 }
+            DefaultRouteMetric = if ($route4 -and $null -ne $route4.RouteMetric) { [int]$route4.RouteMetric } else { 0 }
+            DefaultRouteMetricIPv6 = if ($route6 -and $null -ne $route6.RouteMetric) { [int]$route6.RouteMetric } else { 0 }
+            Timestamp          = (Get-Date).ToString('o')
         }
     }
 
-    return $results
+    return @($results | Sort-Object -Property @{ Expression = 'CapabilityScore'; Descending = $true }, @{ Expression = 'Name'; Descending = $false })
 }
 
 function Update-NetworkState {
     try {
         $interfaces = Get-AllNetworkInterfaces
+        $interfacesArray = @($interfaces)
         $data = @{
-            timestamp  = (Get-Date).ToString('o')
-            version    = '4.0'
-            count      = $interfaces.Count
-            interfaces = $interfaces
+            timestamp = (Get-Date).ToString('o')
+            version = '5.0'
+            count = $interfacesArray.Count
+            interfaces = $interfacesArray
         }
-        Write-AtomicJson -Path $OutputFile -Data $data -Depth 4
-
-        # Optional UI debug
-        # foreach ($iface in $interfaces) { ... }
-        
-        return $interfaces
+        Write-AtomicJson -Path $OutputFile -Data $data -Depth 6
+        return $interfacesArray
     } catch {
         Write-Host "  [NetworkManager] Error: $_" -ForegroundColor Red
         return @()

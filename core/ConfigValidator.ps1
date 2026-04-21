@@ -109,7 +109,17 @@ Check-Number $config 'proxyPort' 1024 65535 8080
 Check-Number $config 'dashboardPort' 1024 65535 9090
 Check-Enum $config 'mode' $validModes 'maxspeed'
 Check-Bool $config 'dashboardAllowLAN' $false
-Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
+$legacyQuic = $config.PSObject.Properties['blockQUICOnSecondaryAdapters']
+$newQuic = $config.PSObject.Properties['blockQUICForUnproxiedTraffic']
+if (-not $newQuic -and $legacyQuic) {
+    $config | Add-Member -MemberType NoteProperty -Name 'blockQUICForUnproxiedTraffic' -Value ([bool]$legacyQuic.Value) -Force
+    $script:configChanged = $true
+}
+Check-Bool $config 'blockQUICForUnproxiedTraffic' $true
+if ($legacyQuic) {
+    [void]$config.PSObject.Properties.Remove('blockQUICOnSecondaryAdapters')
+    $script:configChanged = $true
+}
 if ($config.proxyPort -eq $config.dashboardPort) {
     Write-Host "  [Config] WARNING: 'dashboardPort' cannot match 'proxyPort'. Using 9090." -ForegroundColor Yellow
     $config.dashboardPort = 9090
@@ -165,6 +175,20 @@ if ($config.routing) {
     Check-Bool $config.routing 'enforceECMP' $false
     Check-Number $config.routing 'metricRefreshSec' 6 300 30
     Check-Number $config.routing 'ecmpRefreshSec' 30 600 60
+    if ($config.routing.PSObject.Properties['ethernetPriority']) {
+        [void]$config.routing.PSObject.Properties.Remove('ethernetPriority')
+        $script:configChanged = $true
+    }
+}
+
+if ($config.profiles) {
+    foreach ($profileProp in $config.profiles.PSObject.Properties) {
+        $profile = $profileProp.Value
+        if ($profile -and $profile.PSObject.Properties['ethernetBoost']) {
+            [void]$profile.PSObject.Properties.Remove('ethernetBoost')
+            $script:configChanged = $true
+        }
+    }
 }
 
 if ($config.selfHealing) {
@@ -173,7 +197,7 @@ if ($config.selfHealing) {
 }
 
 # Throughput-profile guardrails: keep high-performance modes from inheriting
-# conservative thread and stickiness values that cap dual-link aggregation.
+# conservative thread and stickiness values that cap multi-adapter aggregation.
 $throughputMode = $config.mode -in @('maxspeed', 'download')
 if ($throughputMode -and $config.proxy) {
     if ($config.proxy.maxThreads -lt 512) {

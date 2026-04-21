@@ -1,36 +1,64 @@
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "     NetFusion Network Repair Utility     " -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "Restarting Wi-Fi 4..." -ForegroundColor Yellow
-Disable-NetAdapter -Name "Wi-Fi 4" -Confirm:$false -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-Enable-NetAdapter -Name "Wi-Fi 4" -Confirm:$false -ErrorAction SilentlyContinue
+[CmdletBinding()]
+param(
+    [string]$AdapterName = '',
+    [int]$Metric = 25
+)
 
-Write-Host "Waiting 5 seconds for DHCP..." -ForegroundColor Yellow
-Start-Sleep -Seconds 5
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-$ipConf = Get-NetIPConfiguration -InterfaceAlias "Wi-Fi 4" -ErrorAction SilentlyContinue
-if ($null -ne $ipConf -and ($null -eq $ipConf.IPv4Address -or $ipConf.IPv4Address.IPAddress -match "^169\.254\.")) {
-    Write-Host "DHCP is dead on Wi-Fi 4. Applying Emergency Static IP (192.168.1.147)..." -ForegroundColor Red
-    
-    Remove-NetIPAddress -InterfaceAlias "Wi-Fi 4" -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-NetRoute -InterfaceAlias "Wi-Fi 4" -Confirm:$false -ErrorAction SilentlyContinue
-    
-    New-NetIPAddress -InterfaceAlias "Wi-Fi 4" -IPAddress "192.168.1.147" -PrefixLength 24 -DefaultGateway "192.168.1.254" -ErrorAction SilentlyContinue
-    Set-DnsClientServerAddress -InterfaceAlias "Wi-Fi 4" -ServerAddresses ("8.8.8.8","1.1.1.1") -ErrorAction SilentlyContinue
-    Write-Host "Static IP successfully applied!" -ForegroundColor Green
-} else {
-    Write-Host "DHCP recovered successfully!" -ForegroundColor Green
+function Get-UsableAdapters {
+    return @(
+        Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Status -eq 'Up' -and
+                $_.InterfaceDescription -notmatch '(?i)Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN|OpenVPN|WireGuard|Tailscale|ZeroTier|Npcap|vEthernet|VMware|VirtualBox'
+            }
+    )
 }
 
-Write-Host "
-Enforcing Perfect 50/50 E.C.M.P Routing..." -ForegroundColor Yellow
-Set-NetIPInterface -InterfaceAlias "Wi-Fi 4" -AutomaticMetric Disabled -InterfaceMetric 15 -ErrorAction SilentlyContinue
-Set-NetRoute -InterfaceAlias "Wi-Fi 4" -DestinationPrefix '0.0.0.0/0' -RouteMetric 15 -ErrorAction SilentlyContinue
-Set-NetIPInterface -InterfaceAlias "Wi-Fi 3" -AutomaticMetric Disabled -InterfaceMetric 15 -ErrorAction SilentlyContinue
-Set-NetRoute -InterfaceAlias "Wi-Fi 3" -DestinationPrefix '0.0.0.0/0' -RouteMetric 15 -ErrorAction SilentlyContinue
+function Repair-Adapter {
+    param([object]$Adapter)
 
-Write-Host "
-Network Repaired!" -ForegroundColor Green
-Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Format-Table InterfaceAlias, RouteMetric -AutoSize
-Start-Sleep -Seconds 10
+    Write-Host "Repairing adapter: $($Adapter.Name)" -ForegroundColor Cyan
+    try {
+        Disable-NetAdapter -Name $Adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Enable-NetAdapter -Name $Adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+    } catch {}
+
+    try {
+        ipconfig /renew "$($Adapter.Name)" | Out-Null
+    } catch {}
+
+    try {
+        Set-NetIPInterface -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric $Metric -ErrorAction SilentlyContinue
+    } catch {}
+
+    $ip = @(
+        Get-NetIPAddress -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } |
+            Select-Object -ExpandProperty IPAddress
+    )
+    $hasDefault = @(
+        Get-NetRoute -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
+    ).Count -gt 0
+    Write-Host ("  IPv4: {0}" -f ($(if ($ip.Count -gt 0) { $ip[0] } else { 'none' }))) -ForegroundColor Gray
+    Write-Host ("  Default route: {0}" -f ($(if ($hasDefault) { 'yes' } else { 'no' }))) -ForegroundColor Gray
+}
+
+$adapters = Get-UsableAdapters
+if ([string]::IsNullOrWhiteSpace($AdapterName)) {
+    foreach ($adapter in $adapters) { Repair-Adapter -Adapter $adapter }
+} else {
+    $adapter = $adapters | Where-Object { $_.Name -eq $AdapterName } | Select-Object -First 1
+    if (-not $adapter) { throw "Adapter not found or not usable: $AdapterName" }
+    Repair-Adapter -Adapter $adapter
+}
+
+Write-Host ""
+Write-Host "Post-repair default routes:" -ForegroundColor Yellow
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Sort-Object InterfaceAlias, RouteMetric |
+    Format-Table InterfaceAlias, NextHop, RouteMetric -AutoSize

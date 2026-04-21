@@ -2,7 +2,7 @@
     "proxyPort":  8080,
     "dashboardPort":  9090,
     "dashboardAllowLAN": false,
-    "blockQUICOnSecondaryAdapters": true,
+    "blockQUICForUnproxiedTraffic": true,
     "mode":  "maxspeed",
     "startupTimeoutSec": 20,
     "monitorInterval":  2000,
@@ -34,7 +34,6 @@
     "routing":  {
                     "targetMetric":  25,
                     "watchInterval":  15,
-                    "ethernetPriority":  true,
                     "enforceECMP": true,
                     "metricRefreshSec": 30,
                     "ecmpRefreshSec": 60,
@@ -141,30 +140,25 @@
                 },
     "profiles":  {
                      "maxspeed":  {
-                                      "strategy":  "max-bandwidth",
-                                      "description":  "Maximum speed -- all adapters pushed to full capacity with health-weighted distribution.",
-                                      "ethernetBoost":  2.0
-                                  },
-                     "download":  {
-                                      "strategy":  "bandwidth-weighted",
-                                      "description":  "Maximize download throughput. Ethernet boosted 1.5x. Success-rate weighted.",
-                                      "ethernetBoost":  1.5
-                                  },
-                     "streaming":  {
-                                       "strategy":  "lowest-latency",
-                                       "description":  "Prioritize lowest EWMA latency for smooth streaming. Stability-weighted.",
-                                       "ethernetBoost":  2.0
+                                       "strategy":  "max-bandwidth",
+                                       "description":  "Maximum speed -- all adapters pushed to full capacity with health-weighted distribution."
                                    },
+                     "download":  {
+                                       "strategy":  "bandwidth-weighted",
+                                       "description":  "Maximize download throughput with capacity and success-rate weighting."
+                                   },
+                     "streaming":  {
+                                        "strategy":  "lowest-latency",
+                                        "description":  "Prioritize lowest EWMA latency for smooth streaming. Stability-weighted."
+                                    },
                      "gaming":  {
-                                    "strategy":  "lowest-latency",
-                                    "description":  "Ultra-low latency for gaming. Jitter-penalized. Ethernet boosted 3x.",
-                                    "ethernetBoost":  3.0
-                                },
+                                     "strategy":  "lowest-latency",
+                                     "description":  "Ultra-low latency for gaming with jitter-aware penalties."
+                                 },
                      "balanced":  {
-                                      "strategy":  "round-robin",
-                                      "description":  "Equal distribution across all healthy interfaces.",
-                                      "ethernetBoost":  1.0
-                                  }
+                                       "strategy":  "round-robin",
+                                       "description":  "Equal distribution across all healthy interfaces."
+                                   }
                  },
     "excludedAdapters":  [
 

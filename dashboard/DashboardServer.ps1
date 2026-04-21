@@ -19,7 +19,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$Port = 9090
+    [int]$Port = 0
 )
 
 $dashDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
@@ -37,6 +37,17 @@ $script:AuthRateLock = [object]::new()
 $script:AuthFailWindowSeconds = 60
 $script:AuthFailLimit = 10
 $script:AuthBlockSeconds = 300
+$script:DashboardInstanceMutex = New-Object System.Threading.Mutex($false, "Global\NetFusion-Dashboard")
+$script:DashboardInstanceHeld = $false
+try {
+    $script:DashboardInstanceHeld = $script:DashboardInstanceMutex.WaitOne(0, $false)
+} catch [System.Threading.AbandonedMutexException] {
+    $script:DashboardInstanceHeld = $true
+}
+if (-not $script:DashboardInstanceHeld) {
+    Write-Host "  [Dashboard] Another dashboard instance is already running." -ForegroundColor Yellow
+    exit 1
+}
 
 function Write-AtomicJson {
     param(
@@ -449,6 +460,43 @@ function Test-IsMutationAuthorized {
     return (Test-IsLocalReferer $Headers['referer'])
 }
 
+function Get-DataFreshness {
+    param(
+        [string]$Path,
+        [AllowNull()][object]$Data,
+        [string]$TimestampField = 'timestamp',
+        [int]$StaleAfterSec = 8
+    )
+
+    $ageSec = [double]::PositiveInfinity
+    $source = 'none'
+
+    if ($Data -and $Data.PSObject.Properties[$TimestampField] -and $Data.$TimestampField) {
+        try {
+            $ts = [datetime]$Data.$TimestampField
+            $ageSec = [double]((Get-Date) - $ts).TotalSeconds
+            $source = 'payload'
+        } catch {}
+    }
+
+    if ([double]::IsInfinity($ageSec) -and (Test-Path $Path)) {
+        try {
+            $ageSec = [double]((Get-Date) - (Get-Item $Path).LastWriteTime).TotalSeconds
+            $source = 'file'
+        } catch {}
+    }
+
+    if ([double]::IsInfinity($ageSec)) { $ageSec = 999999.0 }
+    if ($ageSec -lt 0) { $ageSec = 0.0 }
+
+    return @{
+        ageSec = [math]::Round($ageSec, 2)
+        isStale = ($ageSec -gt $StaleAfterSec)
+        staleAfterSec = [int]$StaleAfterSec
+        source = $source
+    }
+}
+
 function Get-ClientInterfaces {
     $data = Read-JsonFile (Join-Path $configDir "interfaces.json")
     $interfaces = @()
@@ -467,24 +515,49 @@ function Get-ClientInterfaces {
 }
 
 function Get-ClientHealth {
-    $data = Read-JsonFile (Join-Path $configDir "health.json")
+    $healthPath = Join-Path $configDir "health.json"
+    $data = Read-JsonFile $healthPath
     $adapters = @()
     $degradation = @{}
+    $rebalance = @{ trigger = $false; overUtilized = @(); underUtilized = @(); reason = '' }
+    $upstreamBottleneck = @{ detected = $false; reason = '' }
     if ($data -and $data.adapters) {
         foreach ($a in @($data.adapters)) {
+            $healthScore = if ($null -ne $a.HealthScore) { [double]$a.HealthScore } else { 0.0 }
+            $healthScore01 = if ($null -ne $a.HealthScore01) { [double]$a.HealthScore01 } else { [math]::Round($healthScore / 100.0, 3) }
             $adapters += @{
                 Name = Normalize-DisplayText $a.Name 64
                 Type = Normalize-DisplayText $a.Type 24
-                HealthScore = if ($null -ne $a.HealthScore) { [double]$a.HealthScore } else { 0 }
+                HealthScore = $healthScore
+                HealthScore01 = $healthScore01
                 InternetLatency = if ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
                 InternetLatencyEWMA = if ($null -ne $a.InternetLatencyEWMA) { [double]$a.InternetLatencyEWMA } elseif ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
+                GatewayLatency = if ($null -ne $a.GatewayLatency) { [double]$a.GatewayLatency } else { 999 }
+                DNSLatency = if ($null -ne $a.DNSLatency) { [double]$a.DNSLatency } else { 999 }
+                PacketLoss = if ($null -ne $a.PacketLoss) { [double]$a.PacketLoss } else { 0 }
                 Jitter = if ($null -ne $a.Jitter) { [double]$a.Jitter } else { 0 }
                 DownloadMbps = if ($null -ne $a.DownloadMbps) { [double]$a.DownloadMbps } else { 0 }
                 UploadMbps = if ($null -ne $a.UploadMbps) { [double]$a.UploadMbps } else { 0 }
+                ThroughputMbps = if ($null -ne $a.ThroughputMbps) { [double]$a.ThroughputMbps } else { 0 }
+                ThroughputAvg5 = if ($null -ne $a.ThroughputAvg5) { [double]$a.ThroughputAvg5 } else { 0 }
+                ThroughputAvg30 = if ($null -ne $a.ThroughputAvg30) { [double]$a.ThroughputAvg30 } else { 0 }
+                ThroughputAvg60 = if ($null -ne $a.ThroughputAvg60) { [double]$a.ThroughputAvg60 } else { 0 }
+                ThroughputHistory = if ($a.ThroughputHistory) { @($a.ThroughputHistory) } else { @() }
+                EstimatedCapacityMbps = if ($null -ne $a.EstimatedCapacityMbps) { [double]$a.EstimatedCapacityMbps } else { 0 }
+                UtilizationPct = if ($null -ne $a.UtilizationPct) { [double]$a.UtilizationPct } else { 0 }
+                ErrorRate = if ($null -ne $a.ErrorRate) { [double]$a.ErrorRate } else { 0 }
                 SuccessRate = if ($null -ne $a.SuccessRate) { [double]$a.SuccessRate } else { 100 }
                 StabilityScore = if ($null -ne $a.StabilityScore) { [double]$a.StabilityScore } else { 80 }
                 HealthTrend = if ($null -ne $a.HealthTrend) { [double]$a.HealthTrend } else { 0 }
                 IsDegrading = [bool]$a.IsDegrading
+                IsQuarantined = [bool]$a.IsQuarantined
+                IsDisabled = [bool]$a.IsDisabled
+                ShouldAvoidNewFlows = [bool]$a.ShouldAvoidNewFlows
+                ForceDrain = [bool]$a.ForceDrain
+                ReintroLimitFlows = if ($null -ne $a.ReintroLimitFlows) { [int]$a.ReintroLimitFlows } else { 0 }
+                ActiveFlows = if ($null -ne $a.ActiveFlows) { [int]$a.ActiveFlows } else { 0 }
+                Status = Normalize-DisplayText $a.Status 24
+                PublicIP = Normalize-DisplayText $a.PublicIP 64
             }
         }
     }
@@ -498,11 +571,44 @@ function Get-ClientHealth {
             }
         }
     }
-    return @{ timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; version = '6.2'; uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }; adapters = $adapters; degradation = $degradation }
+    if ($data -and $data.rebalance) {
+        $rebalance = @{
+            trigger = [bool]$data.rebalance.trigger
+            overUtilized = if ($data.rebalance.overUtilized) { @($data.rebalance.overUtilized | ForEach-Object { Normalize-DisplayText $_ 64 }) } else { @() }
+            underUtilized = if ($data.rebalance.underUtilized) { @($data.rebalance.underUtilized | ForEach-Object { Normalize-DisplayText $_ 64 }) } else { @() }
+            reason = Normalize-DisplayText $data.rebalance.reason 96
+        }
+    }
+    if ($data -and $data.upstreamBottleneck) {
+        $upstreamBottleneck = @{
+            detected = [bool]$data.upstreamBottleneck.detected
+            reason = Normalize-DisplayText $data.upstreamBottleneck.reason 96
+            sameGateway = [bool]$data.upstreamBottleneck.sameGateway
+            samePublicIp = [bool]$data.upstreamBottleneck.samePublicIp
+            ratioCombinedToSingle = if ($null -ne $data.upstreamBottleneck.ratioCombinedToSingle) { [double]$data.upstreamBottleneck.ratioCombinedToSingle } else { 0 }
+            combinedThroughputMbps = if ($null -ne $data.upstreamBottleneck.combinedThroughputMbps) { [double]$data.upstreamBottleneck.combinedThroughputMbps } else { 0 }
+            maxSingleThroughputMbps = if ($null -ne $data.upstreamBottleneck.maxSingleThroughputMbps) { [double]$data.upstreamBottleneck.maxSingleThroughputMbps } else { 0 }
+        }
+    }
+    $freshness = Get-DataFreshness -Path $healthPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
+    return @{
+        timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }
+        version = '6.2'
+        uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }
+        adapters = $adapters
+        degradation = $degradation
+        rebalance = $rebalance
+        upstreamBottleneck = $upstreamBottleneck
+        ageSec = [double]$freshness.ageSec
+        isStale = [bool]$freshness.isStale
+        staleAfterSec = [int]$freshness.staleAfterSec
+        freshnessSource = Normalize-DisplayText $freshness.source 24
+    }
 }
 
 function Get-ClientProxy {
-    $data = Read-JsonFile (Join-Path $configDir "proxy-stats.json")
+    $proxyPath = Join-Path $configDir "proxy-stats.json"
+    $data = Read-JsonFile $proxyPath
     $adapters = @()
     $activePerAdapter = @{}
     $connectionTypes = @{}
@@ -518,12 +624,49 @@ function Get-ClientProxy {
                 latency = if ($null -ne $a.latency) { [double]$a.latency } else { 999 }
                 jitter = if ($null -ne $a.jitter) { [double]$a.jitter } else { 0 }
                 isDegrading = [bool]$a.isDegrading
+                activeFlowCount = if ($null -ne $a.activeFlowCount) { [int]$a.activeFlowCount } elseif ($null -ne $a.flowCount) { [int]$a.flowCount } else { 0 }
+                flowCount = if ($null -ne $a.flowCount) { [int]$a.flowCount } elseif ($null -ne $a.activeFlowCount) { [int]$a.activeFlowCount } else { 0 }
+                measuredLoadMbps = if ($null -ne $a.measuredLoadMbps) { [double]$a.measuredLoadMbps } else { 0 }
+                estimatedCapacityMbps = if ($null -ne $a.estimatedCapacityMbps) { [double]$a.estimatedCapacityMbps } else { 0 }
+                effectiveCapacityMbps = if ($null -ne $a.effectiveCapacityMbps) { [double]$a.effectiveCapacityMbps } else { 0 }
+                availableCapacityMbps = if ($null -ne $a.availableCapacityMbps) { [double]$a.availableCapacityMbps } else { 0 }
+                utilizationPct = if ($null -ne $a.utilizationPct) { [double]$a.utilizationPct } else { 0 }
+                avgFlowThroughputMbps = if ($null -ne $a.avgFlowThroughputMbps) { [double]$a.avgFlowThroughputMbps } elseif ($null -ne $a.averageFlowThroughputMbps) { [double]$a.averageFlowThroughputMbps } else { 0 }
+                bytesWindow = if ($null -ne $a.bytesWindow) { [double]$a.bytesWindow } elseif ($null -ne $a.totalBytesWindow) { [double]$a.totalBytesWindow } else { 0 }
+                score01 = if ($null -ne $a.score01) { [double]$a.score01 } elseif ($null -ne $a.health01) { [double]$a.health01 } else { 0 }
+                errorRate = if ($null -ne $a.errorRate) { [double]$a.errorRate } else { 0 }
+                shouldAvoidNewFlows = [bool]$a.shouldAvoidNewFlows
+                forceDrain = [bool]$a.forceDrain
+                isQuarantined = [bool]$a.isQuarantined
+                isDisabled = [bool]$a.isDisabled
             }
         }
     }
     if ($data -and $data.activePerAdapter) { foreach ($prop in $data.activePerAdapter.PSObject.Properties) { $activePerAdapter[(Normalize-DisplayText $prop.Name 64)] = [int]$prop.Value } }
     if ($data -and $data.connectionTypes) { foreach ($prop in $data.connectionTypes.PSObject.Properties) { $connectionTypes[(Normalize-DisplayText $prop.Name 24)] = [int]$prop.Value } }
-    return @{ running = if ($data) { [bool]$data.running } else { $false }; timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }; totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }; activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }; activePerAdapter = $activePerAdapter; adapterCount = $adapters.Count; adapters = $adapters; connectionTypes = $connectionTypes; safeMode = if ($data) { [bool]$data.safeMode } else { $false }; currentMaxThreads = if ($data -and $null -ne $data.currentMaxThreads) { [int]$data.currentMaxThreads } else { 0 } }
+    $freshness = Get-DataFreshness -Path $proxyPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
+    return @{
+        running = if ($data) { [bool]$data.running } else { $false }
+        timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }
+        totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }
+        totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }
+        activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }
+        activePerAdapter = $activePerAdapter
+        adapterCount = $adapters.Count
+        adapters = $adapters
+        connectionTypes = $connectionTypes
+        safeMode = if ($data) { [bool]$data.safeMode } else { $false }
+        currentMaxThreads = if ($data -and $null -ne $data.currentMaxThreads) { [int]$data.currentMaxThreads } else { 0 }
+        rebalance = if ($data -and $data.rebalance) { $data.rebalance } else { @{ trigger = $false } }
+        upstreamBottleneck = if ($data -and $data.upstreamBottleneck) { $data.upstreamBottleneck } else { @{ detected = $false } }
+        totalMeasuredLoadMbps = if ($data -and $null -ne $data.totalMeasuredLoadMbps) { [double]$data.totalMeasuredLoadMbps } else { 0 }
+        totalEstimatedCapacityMbps = if ($data -and $null -ne $data.totalEstimatedCapacityMbps) { [double]$data.totalEstimatedCapacityMbps } else { 0 }
+        connectionRegistrySize = if ($data -and $null -ne $data.connectionRegistrySize) { [int]$data.connectionRegistrySize } else { 0 }
+        ageSec = [double]$freshness.ageSec
+        isStale = [bool]$freshness.isStale
+        staleAfterSec = [int]$freshness.staleAfterSec
+        freshnessSource = Normalize-DisplayText $freshness.source 24
+    }
 }
 
 function Get-ClientConfig {
@@ -764,6 +907,15 @@ Write-Host "    Local Auto-Login + Reduced Telemetry Surface      " -ForegroundC
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
+if ($Port -le 0) {
+    $cfg = Read-JsonFile (Join-Path $configDir "config.json")
+    if ($cfg -and $cfg.dashboardPort) {
+        $Port = [int]$cfg.dashboardPort
+    } else {
+        $Port = 9090
+    }
+}
+
 $listener = $null
 try {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
@@ -990,5 +1142,11 @@ try {
     }
 } finally {
     if ($listener) { $listener.Stop() }
+    if ($script:DashboardInstanceHeld -and $script:DashboardInstanceMutex) {
+        try { $script:DashboardInstanceMutex.ReleaseMutex() } catch {}
+    }
+    if ($script:DashboardInstanceMutex) {
+        try { $script:DashboardInstanceMutex.Dispose() } catch {}
+    }
     Write-Host "`n  Dashboard stopped." -ForegroundColor Yellow
 }

@@ -97,7 +97,7 @@ function Show-MetricGuidance {
     }
 
     Write-Host ""
-    Write-Host "If you are using two adapters on the same router/subnet, Windows may still resist balancing traffic." -ForegroundColor White
+    Write-Host "If multiple adapters share the same router/subnet, Windows may still resist perfect balancing traffic." -ForegroundColor White
     Write-Host "In that case, NetFusion's routing helpers may need to correct metrics before performance stabilizes." -ForegroundColor White
     Write-Host "Relevant tools: core\\RouteController.ps1, test-ecmp.ps1, and the built-in repair logic in the engine." -ForegroundColor Gray
 }

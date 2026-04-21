@@ -18,12 +18,39 @@ param(
     [string]$ProxyHost = "127.0.0.1",
     [int]$ProxyPort = 8080,
     [int]$DashboardPort = 9090,
-    [string[]]$AdapterNames = @("Wi-Fi 3", "Wi-Fi 4")
+    [string[]]$AdapterNames = @()
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+
+if (-not $AdapterNames -or $AdapterNames.Count -eq 0) {
+    $autoAdapters = @()
+    $interfacesPath = Join-Path $PSScriptRoot "config\interfaces.json"
+    if (Test-Path $interfacesPath) {
+        try {
+            $ifData = Get-Content $interfacesPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $autoAdapters = @(
+                @($ifData.interfaces) |
+                    Where-Object { $_.Status -eq 'Up' -and (($_.PrimaryIPv4) -or ($_.IPAddress)) } |
+                    Select-Object -ExpandProperty Name -Unique
+            )
+        } catch {}
+    }
+    if ($autoAdapters.Count -eq 0) {
+        $autoAdapters = @(
+            Get-NetAdapter -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch '(?i)Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN|OpenVPN|WireGuard|Tailscale|ZeroTier' } |
+                Select-Object -ExpandProperty Name -Unique
+        )
+    }
+    $AdapterNames = @($autoAdapters)
+}
+$AdapterNames = @($AdapterNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+if ($AdapterNames.Count -eq 0) {
+    throw "No usable adapters discovered. Pass -AdapterNames explicitly."
+}
 
 function Write-Section {
     param(
@@ -431,7 +458,7 @@ $adapterDiag = Get-AdapterDiagnostics -Names $AdapterNames
 foreach ($d in $adapterDiag) {
     if (-not $d.Exists) {
         Write-Host ("  {0}: MISSING" -f $d.Name) -ForegroundColor Red
-        Add-InvestigationIssue -Domain "routing" -Issue "Adapter missing" -Evidence $d.Name -Action "Use valid adapter names and ensure both adapters are enabled."
+        Add-InvestigationIssue -Domain "routing" -Issue "Adapter missing" -Evidence $d.Name -Action "Use valid adapter names and ensure all required adapters are enabled."
         continue
     }
 
