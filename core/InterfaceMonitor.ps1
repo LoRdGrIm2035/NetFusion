@@ -20,7 +20,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$Interval = 2
+    [int]$Interval = 15
 )
 
 # Resolve paths

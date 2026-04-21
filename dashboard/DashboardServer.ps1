@@ -532,7 +532,6 @@ function Send-TcpResponse {
     $hBytes = [System.Text.Encoding]::UTF8.GetBytes($rawHeaders)
     $Stream.Write($hBytes, 0, $hBytes.Length)
     if ($Body.Length -gt 0) { $Stream.Write($Body, 0, $Body.Length) }
-    $Stream.Flush()
 }
 
 function Get-AutoLoginCookie {
@@ -617,7 +616,7 @@ try {
         $stream.ReadTimeout = 5000
 
         try {
-            $buffer = New-Object byte[] 65536
+            $buffer = New-Object byte[] 262144
             $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
             if ($bytesRead -le 0) { $stream.Close(); $client.Close(); continue }
             $requestText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)

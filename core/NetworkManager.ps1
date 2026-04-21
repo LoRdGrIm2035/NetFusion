@@ -12,7 +12,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$PollInterval = 3
+    [int]$PollInterval = 15
 )
 
 # Resolve paths
@@ -49,11 +49,11 @@ function Get-AdapterCapabilityScore {
     if ($Status -ne 'Up') { return 0 }
     $score = 30  # Base score for being active
 
-    # Type bonus
+    # Type baseline (no hardware-form-factor bias)
     switch ($Type) {
-        'Ethernet'  { $score += 30 }   # Most reliable
-        'WiFi'      { $score += 20 }   # Good, internal
-        'USB-WiFi'  { $score += 15 }   # USB overhead penalty
+        'Ethernet'  { $score += 20 }
+        'WiFi'      { $score += 20 }
+        'USB-WiFi'  { $score += 20 }
         default     { $score += 10 }
     }
 
