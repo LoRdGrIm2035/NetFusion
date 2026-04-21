@@ -46,7 +46,7 @@ This project is designed for real aggregate throughput on workloads that already
 > The best proof of value is a segmented downloader, torrent client, or any workload that opens many concurrent TCP sessions. A single browser download is usually the wrong benchmark.
 
 > [!NOTE]
-> NetFusion is designed for dynamic multi-adapter operation and does not impose a two-adapter limit. Any number of active, healthy, routable adapters can participate.
+> The documented target right now is multi-adapter operation with at least two active links. Mixed pairs such as `Wi-Fi + Ethernet` or `2 Wi-Fi` are valid current use cases. Three-adapter layouts should be treated as exploratory unless they are explicitly validated and documented in a future update.
 
 <table>
   <tr>
@@ -79,17 +79,19 @@ This project is designed for real aggregate throughput on workloads that already
 
 ## Multi-Adapter Support
 
-NetFusion is designed around multi-adapter traffic steering with dynamic N-adapter handling.
+NetFusion is designed around multi-adapter traffic steering, but this README should only claim configurations that are intentionally documented today.
 
 Currently documented use cases:
 
-- Mixed media: `Wi-Fi`, `Ethernet`, `USB-Wi-Fi`, `USB-Ethernet`, `Cellular`
-- Any adapter count where Windows exposes usable addresses and routes
+- `Wi-Fi + Ethernet`
+- `2 Wi-Fi adapters`
+- Other two-adapter combinations that Windows exposes cleanly with valid IPv4 addresses and gateways
 
 Scope notes:
 
-- NetFusion schedules per connection; one TCP stream still maps to one adapter at a time.
-- Combined speed depends on workload concurrency and upstream path diversity.
+- Some backend components are adapter-count aware beyond two interfaces, but that should be treated as an implementation detail, not a documented feature promise.
+- The current dashboard throughput chart and legend are still tuned for the first two adapters.
+- If three-adapter layouts such as `2 USB Wi-Fi + 1 Ethernet` or `2 Ethernet + 1 Wi-Fi` are validated later, they should be added back as explicit support statements at that time.
 
 > [!IMPORTANT]
 > NetFusion does per-connection steering, not packet bonding. Even in multi-adapter scenarios, it does not turn one TCP download into a true summed link.
@@ -101,7 +103,7 @@ Before expecting useful results, make sure the environment actually supports mul
 - Windows 10 or Windows 11
 - PowerShell 5.1 or newer
 - Administrator privileges
-- At least one active adapter with valid IP routing (multiple adapters recommended for aggregation)
+- At least two active adapters with valid IPv4 addresses
 - A working gateway on each adapter you expect NetFusion to use
 - `curl.exe` available for adapter-bound diagnostics
 
@@ -110,13 +112,13 @@ Recommended:
 - Separate upstream paths when possible
 - A downloader that supports many parallel connections
 - Verify real adapter traffic counters instead of trusting app-level speed numbers
-- Keep adapter chipsets and drivers stable when running many active links simultaneously
+- Keep adapter chipsets and drivers stable if you plan to run three active links at once
 
 > [!WARNING]
 > If all active adapters ultimately feed the same router and the same constrained WAN uplink, NetFusion cannot manufacture more internet bandwidth than that upstream bottleneck allows.
 
 > [!WARNING]
-> Multiple USB adapters can work, but USB bus contention, driver quality, and RF interference may reduce stability versus mixed media paths.
+> Two USB Wi-Fi adapters can work, but USB bus contention, driver quality, and RF interference can make them less stable than one internal radio plus Ethernet.
 
 ## Fit Matrix
 
@@ -213,9 +215,6 @@ http://localhost:9090
 
 The local browser session signs in automatically on first visit. The dashboard token file is still kept for local automation and scripted access.
 
-> [!NOTE]
-> `config/dashboard-token.txt` and `config/dashboard-token-hash.txt` are local secrets. They are auto-generated on first local setup/run (`Setup-NetFusion.ps1` + first dashboard startup) and should remain untracked in git.
-
 ### Step 4: Point supported apps to the proxy
 
 Configure:
@@ -250,7 +249,7 @@ Configure:
 
 - `WiFi` usually represents the internal wireless card.
 - `USB-WiFi` is detected separately and scored with a small stability penalty because USB radios are often less consistent under load.
-- Capability scoring is telemetry-driven; no static type preference is forced at runtime.
+- `Ethernet` usually gets the highest capability score because it is the most predictable path.
 
 <details>
 <summary><strong>Repository map</strong></summary>
@@ -269,29 +268,15 @@ Configure:
 
 [`config/config.default.json`](./config/config.default.json) defines the shipped defaults. Runtime-generated state such as `config/health.json`, `config/interfaces.json`, and `config/proxy-stats.json` is intentionally excluded from version control.
 
-`config/config.default.json` and `config/config.json` intentionally differ for `safety.circuitBreaker.memoryThresholdMB`:
-
-- `config/config.default.json`: `800` (conservative shared default)
-- `config/config.json`: `2500` (local runtime headroom for high-throughput sessions)
-
-`config/config.json` is gitignored and should be treated as machine-local runtime config generated from `config/config.default.json` on first setup, so local tuning is not accidentally committed.
-
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `mode` | `maxspeed` | Primary strategy profile |
 | `proxyPort` | `8080` | Local proxy listen port |
 | `dashboardPort` | `9090` | Dashboard server port |
-| `blockQUICForUnproxiedTraffic` | `true` | Pushes browser traffic toward TCP paths the proxy can observe |
+| `blockQUICOnSecondaryAdapters` | `true` | Pushes browser traffic toward TCP paths the proxy can observe |
 | `routing.splitRoutesEnabled` | `false` | Split routes are optional and secondary to proxy-based steering |
 | `proxy.maxRetries` | `3` | Connection establishment retry count |
 | `proxy.sessionAffinityTTL` | `300` | Keeps related traffic stable for a short window |
-| `startupTimeoutSec` | `20` | Startup proxy bind timeout used by `NetFusion-START.bat` |
-| `proxy.httpsBulkPromotionHostThreshold` | `2` | Promotes HTTP/HTTPS flows to bulk earlier in throughput modes when same-host concurrency rises |
-| `proxy.httpsBulkPromotionGlobalThreshold` | `8` | Global active connection threshold that triggers earlier bulk promotion |
-| `proxy.retryPolicy` | `leastLoaded` | Retry adapter selection policy (`leastLoaded` or `weightedRandom`) |
-| `proxy.retryWeightFloor` | `0.25` | Lower bound used in least-loaded retry score normalization |
-| `proxy.bulkHeadroomWeight` | `0.35` | Strength of observed-throughput headroom bias in bulk scheduler |
-| `proxy.bulkPressureThreshold` | `24` | Active-connection level where anti-concentration pressure balancing activates |
 | `telemetry.enabled` | `true` | Enables local decision and health visibility |
 
 ## Traffic Profiles
@@ -315,9 +300,8 @@ The default profile is `maxspeed`.
 Do not rely on application-level speed displays alone. Confirm that the adapters you expect to use are moving traffic:
 
 ```powershell
-Get-NetAdapter |
-Where-Object Status -eq 'Up' |
-ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
+Get-NetAdapterStatistics -Name 'Wi-Fi 3'
+Get-NetAdapterStatistics -Name 'Wi-Fi 4'
 ```
 
 ### Run the combined-speed test
@@ -342,7 +326,7 @@ Use these files as ground truth:
 - `config/decisions.json`
 - `logs/events.json`
 
-When validating, compare all active adapters shown in telemetry and OS counters.
+If you are testing three active links, compare all three adapters instead of only the two shown in the dashboard throughput chart.
 
 ## Troubleshooting
 
@@ -413,6 +397,7 @@ Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 
 2. If the adapter has no valid address or no usable route, run one of the recovery helpers as Administrator.
 
+- `test-wifi4-fix.ps1`
 - `fix-wifi4.ps1`
 - `fix-wifi4-arp.ps1`
 
@@ -552,4 +537,3 @@ New-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0
 ## License
 
 This project is licensed under the [MIT License](./LICENSE).
-

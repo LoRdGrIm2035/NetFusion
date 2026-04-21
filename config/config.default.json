@@ -2,9 +2,8 @@
     "proxyPort":  8080,
     "dashboardPort":  9090,
     "dashboardAllowLAN": false,
-    "blockQUICForUnproxiedTraffic": true,
+    "blockQUICOnSecondaryAdapters": true,
     "mode":  "maxspeed",
-    "startupTimeoutSec": 20,
     "monitorInterval":  2000,
     "healthCheck":  {
                         "pingTarget":  "8.8.8.8",
@@ -13,30 +12,19 @@
                         "failThreshold":  3
                     },
     "proxy":  {
-                  "connectTimeout":  7000,
+                  "connectTimeout":  5000,
                   "maxRetries":  3,
                   "bufferSize":  65536,
-                  "minThreads":  96,
-                  "maxThreads":  1024,
+                  "minThreads":  64,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  120,
-                  "socketIoTimeout": 45000,
-                  "listenerBacklog": 2048,
-                  "staleJobTimeoutSec": 0,
-                  "sessionAffinityTTL":  120,
-                  "httpsBulkPromotionHostThreshold": 1,
-                  "httpsBulkPromotionGlobalThreshold": 4,
-                  "retryPolicy": "leastLoaded",
-                  "retryWeightFloor": 0.25,
-                  "bulkHeadroomWeight": 0.35,
-                  "bulkPressureThreshold": 10,
+                  "sessionAffinityTTL":  300,
                   "healthEndpoint":  true
               },
     "routing":  {
                     "targetMetric":  25,
                     "watchInterval":  15,
-                    "enforceECMP": true,
-                    "metricRefreshSec": 30,
-                    "ecmpRefreshSec": 60,
+                    "ethernetPriority":  true,
                     "splitRoutesEnabled":  false
                 },
     "safety":  {
@@ -54,14 +42,12 @@
                    }
                },
     "selfHealing":  {
-                         "enabled":  true,
-                         "routeCheckInterval":  15,
-                         "adapterRecoveryDelay":  5,
-                         "dhcpAutoRepair": false,
-                         "dhcpRepairIntervalSec": 120,
-                         "dnsVerification":  true,
-                         "gatewayChangeDetection":  true
-                     },
+                        "enabled":  true,
+                        "routeCheckInterval":  15,
+                        "adapterRecoveryDelay":  5,
+                        "dnsVerification":  true,
+                        "gatewayChangeDetection":  true
+                    },
     "intelligence":  {
                          "ewmaAlphas": {
                              "gaming": 0.65,
@@ -140,25 +126,30 @@
                 },
     "profiles":  {
                      "maxspeed":  {
-                                       "strategy":  "max-bandwidth",
-                                       "description":  "Maximum speed -- all adapters pushed to full capacity with health-weighted distribution."
-                                   },
+                                      "strategy":  "max-bandwidth",
+                                      "description":  "Maximum speed -- all adapters pushed to full capacity with health-weighted distribution.",
+                                      "ethernetBoost":  2.0
+                                  },
                      "download":  {
-                                       "strategy":  "bandwidth-weighted",
-                                       "description":  "Maximize download throughput with capacity and success-rate weighting."
-                                   },
+                                      "strategy":  "bandwidth-weighted",
+                                      "description":  "Maximize download throughput. Ethernet boosted 1.5x. Success-rate weighted.",
+                                      "ethernetBoost":  1.5
+                                  },
                      "streaming":  {
-                                        "strategy":  "lowest-latency",
-                                        "description":  "Prioritize lowest EWMA latency for smooth streaming. Stability-weighted."
-                                    },
+                                       "strategy":  "lowest-latency",
+                                       "description":  "Prioritize lowest EWMA latency for smooth streaming. Stability-weighted.",
+                                       "ethernetBoost":  2.0
+                                   },
                      "gaming":  {
-                                     "strategy":  "lowest-latency",
-                                     "description":  "Ultra-low latency for gaming with jitter-aware penalties."
-                                 },
+                                    "strategy":  "lowest-latency",
+                                    "description":  "Ultra-low latency for gaming. Jitter-penalized. Ethernet boosted 3x.",
+                                    "ethernetBoost":  3.0
+                                },
                      "balanced":  {
-                                       "strategy":  "round-robin",
-                                       "description":  "Equal distribution across all healthy interfaces."
-                                   }
+                                      "strategy":  "round-robin",
+                                      "description":  "Equal distribution across all healthy interfaces.",
+                                      "ethernetBoost":  1.0
+                                  }
                  },
     "excludedAdapters":  [
 

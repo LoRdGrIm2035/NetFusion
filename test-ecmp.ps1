@@ -1,49 +1,19 @@
-[CmdletBinding()]
-param(
-    [int]$TargetMetric = 25,
-    [switch]$RestoreAutomaticMetric
-)
+$wifi3Idx = (Get-NetAdapter -Name 'Wi-Fi 3' -ErrorAction SilentlyContinue).InterfaceIndex
+$wifi4Idx = (Get-NetAdapter -Name 'Wi-Fi 4' -ErrorAction SilentlyContinue).InterfaceIndex
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-function Get-UsableAdapters {
-    return @(
-        Get-NetAdapter -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Status -eq 'Up' -and
-                $_.InterfaceDescription -notmatch '(?i)Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN|OpenVPN|WireGuard|Tailscale|ZeroTier|Npcap|vEthernet|VMware|VirtualBox'
-            }
-    )
-}
-
-$adapters = Get-UsableAdapters
-if ($adapters.Count -eq 0) {
-    Write-Host "[FAIL] No usable adapters found." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "Applying ECMP-style harmonized metrics across $($adapters.Count) adapter(s)..." -ForegroundColor Cyan
-
-foreach ($adapter in $adapters) {
-    $ifIndex = [int]$adapter.ifIndex
+if ($wifi3Idx -and $wifi4Idx) {
+    Write-Host 'Enforcing ECMP via Metrics on overlapping Wi-Fi networks...'
     try {
-        if ($RestoreAutomaticMetric) {
-            Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue
-        } else {
-            Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric $TargetMetric -ErrorAction SilentlyContinue
-        }
+        Set-NetIPInterface -InterfaceIndex $wifi3Idx -AutomaticMetric Disabled -InterfaceMetric 15
+        Set-NetIPInterface -InterfaceIndex $wifi4Idx -AutomaticMetric Disabled -InterfaceMetric 15
+        Set-NetRoute -InterfaceIndex $wifi3Idx -DestinationPrefix '0.0.0.0/0' -RouteMetric 15 -ErrorAction SilentlyContinue
+        Set-NetRoute -InterfaceIndex $wifi4Idx -DestinationPrefix '0.0.0.0/0' -RouteMetric 15 -ErrorAction SilentlyContinue
+        Write-Host 'Networks successfully bound for 50/50 Dual Routing!'
+        Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Format-Table InterfaceAlias, InterfaceIndex, NextHop, RouteMetric, ifMetric -AutoSize
     } catch {
-        Write-Host "  [WARN] Failed to update $($adapter.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host 'Failed: ' $_
     }
-}
-
-Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-    Sort-Object InterfaceAlias, RouteMetric |
-    Format-Table InterfaceAlias, InterfaceIndex, NextHop, RouteMetric -AutoSize
-
-if ($RestoreAutomaticMetric) {
-    Write-Host "Automatic metrics restored for active adapters." -ForegroundColor Green
 } else {
-    Write-Host "Interface metrics harmonized to $TargetMetric for active adapters (default-route entries unchanged)." -ForegroundColor Green
+    Write-Host 'Could not find Wi-Fi 3 and Wi-Fi 4 adapters.'
 }
+Start-Sleep -Seconds 5

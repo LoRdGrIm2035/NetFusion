@@ -4,7 +4,7 @@
 .DESCRIPTION
     v5.0 design: Proxy is primary distribution method. Routes are secondary.
       - Dynamic metric adjustment based on real-time health scores
-      - Metric decisions derive from live health and capacity signals
+      - Ethernet gets lower metric for latency-sensitive traffic
       - Self-healing: DNS verification, gateway change detection
       - Route verification with retry (up to 3 attempts)
       - Safe mode awareness: skips all changes when safe mode active
@@ -36,7 +36,7 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 # Load config
 $configPath = Join-Path $projectDir "config\config.json"
 $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
-$script:throughputMode = if ($config -and $config.mode -and ([string]$config.mode).ToLowerInvariant() -in @('maxspeed', 'download')) { $true } else { $false }
+$ethernetPriority = if ($config -and $config.routing -and $config.routing.ethernetPriority) { $config.routing.ethernetPriority } else { $true }
 
 $script:prevAdapterSet = @()
 $script:routesActive = $false
@@ -45,23 +45,7 @@ $script:dnsVerified = @{}          # DNS verification status
 $script:routeRetryCount = @{}     # Route creation retry tracking
 $script:prevGateways = @{}         # Previous gateways for DHCP change detection
 $script:loopCount = 0              # Watch loop counter for periodic tasks
-$script:metricSnapshots = @{}      # interfaceIndex -> original metric/auto state
 $script:RouteControllerLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
-$script:RouteControllerRequiresLock = $Action -in @('Enable','Disable','Watch')
-$script:RouteControllerInstanceMutex = $null
-$script:RouteControllerInstanceHeld = $false
-if ($script:RouteControllerRequiresLock) {
-    $script:RouteControllerInstanceMutex = New-Object System.Threading.Mutex($false, "Global\NetFusion-RouteController")
-    try {
-        $script:RouteControllerInstanceHeld = $script:RouteControllerInstanceMutex.WaitOne(0, $false)
-    } catch [System.Threading.AbandonedMutexException] {
-        $script:RouteControllerInstanceHeld = $true
-    }
-    if (-not $script:RouteControllerInstanceHeld) {
-        Write-Host "  [RouteCtrl] Another RouteController instance is already running." -ForegroundColor Yellow
-        exit 1
-    }
-}
 
 function Write-AtomicJson {
     param(
@@ -81,27 +65,6 @@ function Write-AtomicJson {
         Move-Item $tmp $Path -Force -ErrorAction Stop
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        throw
-    }
-}
-
-function Write-AtomicText {
-    param(
-        [string]$Path,
-        [string]$Content
-    )
-
-    $directory = Split-Path -Parent $Path
-    if (-not (Test-Path $directory)) {
-        New-Item -ItemType Directory -Path $directory -Force | Out-Null
-    }
-
-    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
-    try {
-        Set-Content -Path $tmp -Value $Content -Encoding UTF8 -Force -ErrorAction Stop
-        Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
-    } catch {
-        Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
         throw
     }
 }
@@ -185,21 +148,11 @@ function Get-ActiveInterfaces {
                Sort-Object RouteMetric | Select-Object -First 1).NextHop
         if ($ip -and $gw) {
             $type = 'Unknown'
-            $ipIf4 = Get-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-            $ifType = if ($ipIf4 -and $null -ne $ipIf4.InterfaceType) { [int]$ipIf4.InterfaceType } else { 0 }
-            $mediaType = if ($null -ne $a.MediaType) { [string]$a.MediaType } else { '' }
-            $physicalMediaType = if ($null -ne $a.PhysicalMediaType) { [string]$a.PhysicalMediaType } else { '' }
-            $desc = [string]$a.InterfaceDescription
-            $isUsb = $desc -match '(?i)USB'
-            $isWifi = $ifType -eq 71 -or $desc -match '(?i)Wi-Fi|Wireless|802\.11|WLAN' -or $mediaType -match '(?i)Native802_11|Wireless' -or $physicalMediaType -match '(?i)Native802_11|Wireless'
-            $isEthernet = $ifType -eq 6 -or $desc -match '(?i)Ethernet|GbE|RJ45' -or $mediaType -match '(?i)802\.3|Ethernet'
-            $isWwan = $ifType -in @(243, 244) -or $desc -match '(?i)WWAN|Cellular|Mobile'
-
-            if ($isWifi -and $isUsb) { $type = 'USB-WiFi' }
-            elseif ($isWifi) { $type = 'WiFi' }
-            elseif ($isEthernet -and $isUsb) { $type = 'USB-Ethernet' }
-            elseif ($isEthernet) { $type = 'Ethernet' }
-            elseif ($isWwan) { $type = 'Cellular' }
+            if ($a.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11' -or $a.Name -match 'Wi-Fi') {
+                $type = if ($a.InterfaceDescription -match 'USB') { 'USB-WiFi' } else { 'WiFi' }
+            } elseif ($a.InterfaceDescription -match 'Ethernet' -or $a.Name -match 'Ethernet') {
+                $type = 'Ethernet'
+            }
             $results += @{ Name = $a.Name; InterfaceIndex = $a.ifIndex; IPAddress = $ip; Gateway = $gw; Type = $type }
         }
     }
@@ -216,62 +169,18 @@ function Get-AdapterHealthScore {
             if ($adapter) {
                 return @{
                     Score = $adapter.HealthScore
-                    Score01 = if ($adapter.HealthScore01) { [double]$adapter.HealthScore01 } else { [math]::Min(1.0, [math]::Max(0.0, [double]$adapter.HealthScore / 100.0)) }
                     IsDegrading = if ($adapter.IsDegrading) { $adapter.IsDegrading } else { $false }
                     Latency = if ($adapter.InternetLatencyEWMA) { $adapter.InternetLatencyEWMA } else { $adapter.InternetLatency }
-                    IsQuarantined = if ($adapter.IsQuarantined) { $true } else { $false }
-                    IsDisabled = if ($adapter.IsDisabled) { $true } else { $false }
-                    ShouldAvoidNewFlows = if ($adapter.ShouldAvoidNewFlows) { $true } else { $false }
                 }
             }
         } catch {}
     }
-    return @{ Score = 80; Score01 = 0.8; IsDegrading = $false; Latency = 50; IsQuarantined = $false; IsDisabled = $false; ShouldAvoidNewFlows = $false }
-}
-
-function Save-InterfaceMetricSnapshot {
-    param([int]$InterfaceIndex)
-
-    if ($script:metricSnapshots.ContainsKey($InterfaceIndex)) { return }
-    try {
-        $ipif = Get-NetIPInterface -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        if ($ipif) {
-            $script:metricSnapshots[$InterfaceIndex] = @{
-                AutomaticMetric = [string]$ipif.AutomaticMetric
-                InterfaceMetric = if ($null -ne $ipif.InterfaceMetric) { [int]$ipif.InterfaceMetric } else { 0 }
-            }
-        }
-    } catch {}
-}
-
-function Restore-InterfaceMetricSnapshot {
-    param([int]$InterfaceIndex)
-
-    if (-not $script:metricSnapshots.ContainsKey($InterfaceIndex)) { return }
-    $snapshot = $script:metricSnapshots[$InterfaceIndex]
-    try {
-        if ($snapshot.AutomaticMetric -match 'Enabled|True|1') {
-            Enable-AutomaticMetric -InterfaceIndex $InterfaceIndex
-        } else {
-            Set-InterfaceMetric -InterfaceIndex $InterfaceIndex -Metric ([int]$snapshot.InterfaceMetric)
-        }
-    } catch {
-        Write-RouteEvent "Failed to restore metric snapshot for ifIndex=${InterfaceIndex}: $($_.Exception.Message)"
-    }
+    return @{ Score = 80; IsDegrading = $false; Latency = 50 }
 }
 
 function Set-DynamicMetrics {
-    <# v4.0+: Set metrics from real-time health telemetry. Lower metric = higher priority. #>
+    <# v4.0: Set metrics based on adapter type and real-time health. Lower metric = higher priority. #>
     param([array]$Interfaces, [int]$BaseMetric)
-
-    $liveAdapterCache = @{}
-    try {
-        foreach ($adapter in @(Get-NetworkAdapters)) {
-            if ($adapter -and $adapter.Name -and -not $liveAdapterCache.ContainsKey($adapter.Name)) {
-                $liveAdapterCache[$adapter.Name] = $adapter
-            }
-        }
-    } catch {}
 
     foreach ($iface in $Interfaces) {
         $idx = $iface.InterfaceIndex
@@ -281,27 +190,27 @@ function Set-DynamicMetrics {
         $health = Get-AdapterHealthScore -Name $name
         $metric = $BaseMetric
 
-        # Keep base metrics uniform and let health/capacity telemetry decide.
-        # This avoids hardcoding adapter-type preference (e.g., Ethernet > Wi-Fi).
-
-        # Health-based adjustment using 0.0-1.0 thresholds.
-        $health01 = if ($null -ne $health.Score01) { [double]$health.Score01 } else { [math]::Min(1.0, [math]::Max(0.0, [double]$health.Score / 100.0)) }
-        if ($health.IsDisabled -or $health.IsQuarantined -or $health01 -lt 0.3) {
-            $metric += 80
-        } elseif ($health01 -lt 0.5 -or $health.ShouldAvoidNewFlows) {
-            $metric += 30
-        } elseif ($health01 -lt 0.8 -or $health.IsDegrading) {
-            $metric += 10
+        # Type-based adjustment: Ethernet gets lower metric (higher priority)
+        if ($ethernetPriority -and $type -eq 'Ethernet') {
+            $metric = [math]::Max(5, $BaseMetric - 15)
+        } elseif ($type -eq 'USB-WiFi') {
+            $metric = $BaseMetric + 5  # Slight penalty for USB overhead
         }
 
-        $metric = [math]::Max(5, [math]::Min(900, [int]$metric))
+        # Health-based adjustment: degrading adapters get higher metric
+        if ($health.IsDegrading) {
+            $metric += 20
+            Write-Host "    [!] $name is degrading -- metric increased to $metric" -ForegroundColor Yellow
+        } elseif ($health.Score -lt 50) {
+            $metric += 10
+        }
 
         $script:adapterMetrics[$name] = $metric
 
         $liveIdx = $null
         try {
-            # Resolve from a single per-pass adapter cache to avoid repeated OS queries.
-            $liveAdapter = if ($liveAdapterCache.ContainsKey($name)) { $liveAdapterCache[$name] } else { $null }
+            # Always fetch the extreme live OS index in case the caching is desynced
+            $liveAdapter = Get-NetworkAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
             if (-not $liveAdapter) {
                 Write-Host "    - $name -> waiting for adapter to initialize..." -ForegroundColor DarkGray
                 continue
@@ -315,22 +224,8 @@ function Set-DynamicMetrics {
                 continue
             }
 
-            $currentMetric = if ($null -ne $ipif.InterfaceMetric) { [int]$ipif.InterfaceMetric } else { -1 }
-            $autoMetricState = [string]$ipif.AutomaticMetric
-            $autoDisabled = $autoMetricState -match 'Disabled|False|0'
-            if ($autoDisabled -and $currentMetric -eq $metric) {
-                Write-Host "    - $name (index $liveIdx) -> metric unchanged ($metric)" -ForegroundColor DarkGray
-                continue
-            }
-
-            Save-InterfaceMetricSnapshot -InterfaceIndex $liveIdx
-            try {
-                Set-InterfaceMetric -InterfaceIndex $liveIdx -Metric $metric
-                Write-Host "    * $name (index $liveIdx) -> metric $metric [$type HP:$($health.Score)]" -ForegroundColor Green
-            } catch {
-                Restore-InterfaceMetricSnapshot -InterfaceIndex $liveIdx
-                throw
-            }
+            Set-InterfaceMetric -InterfaceIndex $liveIdx -Metric $metric
+            Write-Host "    * $name (index $liveIdx) -> metric $metric [$type HP:$($health.Score)]" -ForegroundColor Green
         } catch {
             $idxLabel = if ($null -ne $liveIdx) { $liveIdx } else { '(unknown)' }
             Write-Host "    x $name (index $idxLabel) -> $($_.Exception.Message)" -ForegroundColor Red
@@ -352,27 +247,90 @@ function Restore-AutoMetrics {
 
 function Get-SplitPrefixes {
     param([int]$Count)
-    return @()
+    switch ($Count) {
+        2 { return @('0.0.0.0/1', '128.0.0.0/1') }
+        3 { return @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/1') }
+        default { return @() }
+    }
 }
 
 function Add-SplitRoutes {
-    <# Safety policy: do not modify default-route split prefixes. #>
+    <# v4.0: Add split routes with retry logic and verification. #>
     param([array]$Interfaces)
-    Write-RouteEvent "Split-route mutation skipped by safety policy (default route remains untouched)."
-    $script:routesActive = $false
-    return $false
+    $count = $Interfaces.Count
+    if ($count -lt 2) {
+        Write-Host "  Need 2+ interfaces for split routes. Found: $count" -ForegroundColor Yellow
+        return $false
+    }
+
+    Remove-SplitRoutes -Silent
+    $prefixes = Get-SplitPrefixes -Count $count
+
+    if ($prefixes.Count -gt 0) {
+        Write-RouteEvent "Creating $count-way split routes"
+        for ($i = 0; $i -lt [math]::Min($count, $prefixes.Count); $i++) {
+            $success = $false
+            for ($retry = 0; $retry -lt 3; $retry++) {
+                try {
+                    Add-Route -DestinationPrefix $prefixes[$i] -InterfaceIndex $Interfaces[$i].InterfaceIndex -NextHop $Interfaces[$i].Gateway -RouteMetric 10
+
+                    # Verify route was actually created
+                    $verify = Get-NetRoute -DestinationPrefix $prefixes[$i] -InterfaceIndex $Interfaces[$i].InterfaceIndex -ErrorAction SilentlyContinue
+                    if ($verify) {
+                        Write-Host "    * $($prefixes[$i]) -> $($Interfaces[$i].Name) via $($Interfaces[$i].Gateway)" -ForegroundColor Green
+                        $success = $true
+                        break
+                    }
+                } catch {
+                    if ($_.Exception.Message -match 'already exists') {
+                        $success = $true
+                        break
+                    }
+                    if ($retry -lt 2) {
+                        Start-Sleep -Milliseconds 500
+                    }
+                }
+            }
+            if (-not $success) {
+                Write-Host "    x $($prefixes[$i]) -> FAILED after 3 retries" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-RouteEvent "$count interfaces: using ECMP (equal metric routing)"
+    }
+    $script:routesActive = $true
+    return $true
 }
 
 function Remove-SplitRoutes {
     param([switch]$Silent)
-    if (-not $Silent) {
-        Write-RouteEvent "Split-route removal skipped by safety policy."
+    $prefixes = @('0.0.0.0/1', '128.0.0.0/1', '0.0.0.0/2', '64.0.0.0/2')
+    $removed = 0
+    foreach ($prefix in $prefixes) {
+        $routes = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
+        foreach ($r in $routes) {
+            Remove-Route -DestinationPrefix $prefix -InterfaceIndex $r.InterfaceIndex -NextHop $r.NextHop
+            $removed++
+        }
+    }
+    if (-not $Silent -and $removed -gt 0) {
+        Write-RouteEvent "Removed $removed split routes"
     }
     $script:routesActive = $false
 }
 
 function Test-RoutesIntact {
-    <# No split-route enforcement in safety mode. #>
+    <# Check if our split routes still exist. #>
+    $interfaces = Get-ActiveInterfaces
+    if ($interfaces.Count -lt 2) { return $false }
+
+    $prefixes = Get-SplitPrefixes -Count $interfaces.Count
+    if ($prefixes.Count -eq 0) { return $true }  # ECMP mode, no explicit routes
+
+    foreach ($prefix in $prefixes) {
+        $exists = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
+        if (-not $exists) { return $false }
+    }
     return $true
 }
 
@@ -431,7 +389,18 @@ function Show-Status {
         Write-Host "    $($iface.Name) | IP: $($iface.IPAddress) | GW: $($iface.Gateway) | Metric: $metric (Auto: $auto) | HP:$($health.Score) [$type]" -ForegroundColor DarkGray
     }
 
-    Write-Host "`n  Split routes: disabled by safety policy (metric-only routing)." -ForegroundColor Yellow
+    $splitRoutes = Get-NetRoute -ErrorAction SilentlyContinue | Where-Object {
+        $_.DestinationPrefix -match '^(0\.0\.0\.0/[12]|64\.0\.0\.0/2|128\.0\.0\.0/[12])$'
+    }
+    if ($splitRoutes) {
+        Write-Host "`n  Split Routes:" -ForegroundColor Green
+        foreach ($r in $splitRoutes) {
+            $adapterName = (Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -ErrorAction SilentlyContinue).Name
+            Write-Host "    $($r.DestinationPrefix) -> $($r.NextHop) [$adapterName]" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "`n  No split routes active." -ForegroundColor Yellow
+    }
     Write-Host ""
 }
 
@@ -449,16 +418,10 @@ function Invoke-WatchMode {
         try {
             Unregister-Event -SourceIdentifier "PowerEventHook" -ErrorAction SilentlyContinue
             $script:powerJob = Register-WmiEvent -Class Win32_PowerManagementEvent -SourceIdentifier "PowerEventHook" -Action {
-                $powerFile = "$using:projectDir\logs\power.state"
-                $tmp = [System.IO.Path]::GetTempFileName()
                 if ($Event.SourceEventArgs.NewEvent.EventType -eq 4) {
-                    Set-Content -Path $tmp -Value "SLEEP" -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-                    Move-Item -Path $tmp -Destination $powerFile -Force -ErrorAction SilentlyContinue
+                    Out-File -InputObject "SLEEP" -FilePath "$using:projectDir\logs\power.state"
                 } elseif ($Event.SourceEventArgs.NewEvent.EventType -eq 7) {
-                    Set-Content -Path $tmp -Value "RESUME" -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-                    Move-Item -Path $tmp -Destination $powerFile -Force -ErrorAction SilentlyContinue
-                } else {
-                    Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+                    Out-File -InputObject "RESUME" -FilePath "$using:projectDir\logs\power.state"
                 }
             } -ErrorAction SilentlyContinue
         } catch {}
@@ -467,9 +430,9 @@ function Invoke-WatchMode {
 
     # Initial setup -- set metrics only (no split routes by default in v5.0)
     $interfaces = Get-ActiveInterfaces
-    if ($interfaces.Count -gt 1 -and -not (Test-SafeMode)) {
+    if ($interfaces.Count -ge 2 -and -not (Test-SafeMode)) {
         Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
-        Write-AtomicText -Path "$projectDir\config\routes-applied.flag" -Content "routes_applied"
+        Out-File -InputObject "routes_applied" -FilePath "$projectDir\config\routes-applied.flag"
         # v5.0: Do NOT add split routes by default -- proxy handles distribution
     } elseif (Test-SafeMode) {
         Write-Host "  [!] Safe mode active -- skipping all route changes" -ForegroundColor Yellow
@@ -505,8 +468,7 @@ function Invoke-WatchMode {
             $vpnAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier|Virtual' }
             if ($vpnAdapters) {
                 if (-not $script:vpnMode) {
-                    $vpnNames = @($vpnAdapters | ForEach-Object { $_.Name }) -join ', '
-                    Write-RouteEvent "VPN Detected! ($vpnNames) - Entering VPN passthrough mode"
+                    Write-RouteEvent "VPN Detected! ($($vpnAdapters[0].Name)) - Entering VPN passthrough mode"
                     Write-Host "  [!] VPN Detected - Disabling orchestration" -ForegroundColor Yellow
                     Remove-SplitRoutes -Silent
                     Restore-AutoMetrics -Interfaces (Get-ActiveInterfaces)
@@ -551,7 +513,7 @@ function Invoke-WatchMode {
                 }
                 # Clean any existing split routes on adapter change
                 Remove-SplitRoutes -Silent
-                if ($currentInterfaces.Count -gt 1) {
+                if ($currentInterfaces.Count -ge 2) {
                     Set-DynamicMetrics -Interfaces $currentInterfaces -BaseMetric $TargetMetric
                 } elseif ($currentInterfaces.Count -eq 1) {
                     Write-Host "  [!] Only 1 adapter -- restoring auto metrics" -ForegroundColor Yellow
@@ -566,13 +528,13 @@ function Invoke-WatchMode {
                     $gatewayChanged = $true
                 }
             }
-            if ($gatewayChanged -and $currentInterfaces.Count -gt 1) {
+            if ($gatewayChanged -and $currentInterfaces.Count -ge 2) {
                 Write-RouteEvent "Gateway change detected -- refreshing metrics"
                 Set-DynamicMetrics -Interfaces $currentInterfaces -BaseMetric $TargetMetric
             }
 
             # Self-heal: if split routes exist (user enabled MaxSpeed), verify them
-            if ($currentInterfaces.Count -gt 1 -and $script:routesActive) {
+            if ($currentInterfaces.Count -ge 2 -and $script:routesActive) {
                 if (-not (Test-RoutesIntact)) {
                     Write-RouteEvent "Split routes corrupted -- auto-repairing"
                     Write-Host "  [!] Routes corrupted -- repairing..." -ForegroundColor Yellow
@@ -582,7 +544,7 @@ function Invoke-WatchMode {
             }
 
             # Periodically refresh dynamic metrics based on current health
-            if (-not $added -and -not $removed -and -not $gatewayChanged -and $currentInterfaces.Count -gt 1) {
+            if (-not $added -and -not $removed -and -not $gatewayChanged -and $currentInterfaces.Count -ge 2) {
                 $needsRefresh = $false
                 foreach ($iface in $currentInterfaces) {
                     $health = Get-AdapterHealthScore -Name $iface.Name
@@ -617,36 +579,26 @@ function Invoke-WatchMode {
 }
 
 # --- Main ---
-try {
-    $interfaces = Get-ActiveInterfaces
+$interfaces = Get-ActiveInterfaces
 
-    switch ($Action) {
-        'Enable' {
-            Write-RouteEvent "Enabling metric-aware routing on $($interfaces.Count) interfaces (default route untouched)"
-            Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
-            Show-Status
-        }
-        'Disable' {
-            Write-RouteEvent "Disabling metric-aware routing and restoring automatic metrics"
-            foreach ($iface in $interfaces) {
-                Restore-InterfaceMetricSnapshot -InterfaceIndex $iface.InterfaceIndex
-            }
-            Restore-AutoMetrics -Interfaces $interfaces
-            Show-Status
-        }
-        'Status' {
-            Show-Status
-        }
-        'Watch' {
-            Invoke-WatchMode
-        }
+switch ($Action) {
+    'Enable' {
+        Write-RouteEvent "Enabling load balancing on $($interfaces.Count) interfaces (v4.0 dynamic)"
+        Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
+        Add-SplitRoutes -Interfaces $interfaces
+        Show-Status
     }
-} finally {
-    if ($script:RouteControllerInstanceHeld -and $script:RouteControllerInstanceMutex) {
-        try { $script:RouteControllerInstanceMutex.ReleaseMutex() } catch {}
+    'Disable' {
+        Write-RouteEvent "Disabling load balancing"
+        Remove-SplitRoutes
+        Restore-AutoMetrics -Interfaces $interfaces
+        Show-Status
     }
-    if ($script:RouteControllerInstanceMutex) {
-        try { $script:RouteControllerInstanceMutex.Dispose() } catch {}
+    'Status' {
+        Show-Status
+    }
+    'Watch' {
+        Invoke-WatchMode
     }
 }
 

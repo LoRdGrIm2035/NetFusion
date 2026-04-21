@@ -42,17 +42,8 @@ $ruleName = "NetFusion_Block_QUIC"
 try {
     $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
     
-    # Config compatibility:
-    # - Preferred key: blockQUICForUnproxiedTraffic
-    # - Legacy key: blockQUICOnSecondaryAdapters
-    $shouldBlock = $false
-    if ($config) {
-        if ($null -ne $config.blockQUICForUnproxiedTraffic) {
-            $shouldBlock = [bool]$config.blockQUICForUnproxiedTraffic
-        } elseif ($null -ne $config.blockQUICOnSecondaryAdapters) {
-            $shouldBlock = [bool]$config.blockQUICOnSecondaryAdapters
-        }
-    }
+    # The QUIC toggle lives at the config root. If this is false, browsers can bypass the TCP proxy.
+    $shouldBlock = if ($config -and $config.blockQUICOnSecondaryAdapters -eq $true) { $true } else { $false }
     
     $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
     

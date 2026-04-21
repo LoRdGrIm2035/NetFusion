@@ -1,21 +1,29 @@
 <#
 .SYNOPSIS
-    InterfaceMonitor v5.0 -- Adaptive per-adapter telemetry and health scoring.
+    InterfaceMonitor v4.0 -- Intelligent adaptive health monitoring with predictive analytics.
 .DESCRIPTION
-    Provides continuous N-adapter health and throughput telemetry:
-      - 1s performance-counter throughput sampling (Rx/Tx/Total)
-      - Rolling 5s/30s/60s throughput windows
-      - Weighted health score (0.0-1.0) with 0-100 mirror
-      - Fast/medium/deep checks with independent cadences
-      - Quarantine and instability isolation state machine
-      - Rebalance and shared-upstream bottleneck hints
+    Production-grade health monitoring with:
+      - EWMA (Exponential Weighted Moving Average) smoothed latency
+      - Jitter tracking via rolling window variance
+      - Rolling statistics engine (min/max/avg/p95)
+      - Connection success rate tracking
+      - Predictive degradation detection with trend analysis
+      - Preemptive rerouting signals
+      - Enhanced multi-factor health scoring
+    Multi-method health detection:
+      1. Direct gateway ping (most reliable)
+      2. Internet ping with source binding
+      3. DNS resolution test
+      4. Bandwidth-based health (if data flows, adapter is alive)
+    Writes enriched health data to shared JSON for proxy/router consumption.
 #>
 
 [CmdletBinding()]
 param(
-    [int]$Interval = 1
+    [int]$Interval = 2
 )
 
+# Resolve paths
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $InterfacesFile = Join-Path $projectDir "config\interfaces.json"
@@ -23,40 +31,47 @@ $HealthFile = Join-Path $projectDir "config\health.json"
 $LogFile = Join-Path $projectDir "config\throughput.csv"
 $EventsFile = Join-Path $projectDir "logs\events.json"
 
+# Ensure logs dir exists
 $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
+# Load config
 $configPath = Join-Path $projectDir "config\config.json"
 $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { $null }
-$pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { [string]$config.healthCheck.pingTarget } else { '8.8.8.8' }
-$pingTarget2 = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget2) { [string]$config.healthCheck.pingTarget2 } else { '1.1.1.1' }
-$pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { [int]$config.healthCheck.timeout } else { 1500 }
+$pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
+$pingTarget2 = '1.1.1.1'
+$pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
 
-# Fixed cadences per requirements
-$script:fastCheckSec = 3
-$script:mediumCheckSec = 10
-$script:deepCheckSec = 30
-$script:throughputSampleSec = 1
+# Intelligence config
+$script:defaultEwmaAlpha = 0.30
+$script:ewmaAlphaMap = @{}
+$jitterWindowSize = if ($config -and $config.intelligence -and $config.intelligence.jitterWindow) { $config.intelligence.jitterWindow } else { 30 }
+$healthTrendWindow = if ($config -and $config.intelligence -and $config.intelligence.healthTrendWindow) { $config.intelligence.healthTrendWindow } else { 20 }
+$degradationThreshold = if ($config -and $config.intelligence -and $config.intelligence.degradationThreshold) { $config.intelligence.degradationThreshold } else { -2.0 }
 
-$script:adapterState = @{}
+# ===== State Tracking =====
+$script:prevBytes = @{}     # @{ name = @{ rx=N; tx=N; time=[DateTime] } }
 $script:startTime = Get-Date
-$script:loopCount = 0
-$script:maxCSVLines = if ($config -and $config.logging -and $config.logging.maxCSVLines) { [int]$config.logging.maxCSVLines } else { 2000 }
-$script:csvBuffer = [System.Collections.Generic.List[string]]::new()
-$script:lastCsvFlush = Get-Date
-$script:lastCounterSample = [datetime]::MinValue
-$script:lastPublicIpRefresh = [datetime]::MinValue
-$script:perfCounterCache = @{}
-$script:netAdapterCounterCache = @{}
-$script:globalAnomalyCounter = @{}
-$script:rebalanceHint = @{}
+$script:events = @()
+$script:prevStates = @{}
+$script:maxCSVLines = 2000
+
+# v4.0 Intelligence State
+$script:latencyHistory = @{}        # Rolling latency samples per adapter: @{ name = @(samples) }
+$script:ewmaLatency = @{}           # EWMA-smoothed latency per adapter: @{ name = [double] }
+$script:ewmaGwLatency = @{}         # EWMA-smoothed gateway latency per adapter
+$script:jitterValues = @{}          # Computed jitter per adapter
+$script:healthTrend = @{}           # Rolling health scores for trend: @{ name = @(scores) }
+$script:successRates = @{}          # Success/fail tracking: @{ name = @{ success=N; fail=N; rate=0.0 } }
+$script:degradationWarnings = @{}   # Predictive warnings: @{ name = @{ warned=$bool; trend=$val; since=$time } }
+$script:stabilityScores = @{}       # Health variance tracking for stability: @{ name = [double] }
 $script:InterfaceMonitorLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
 
 function Write-AtomicJson {
     param(
         [string]$Path,
         [object]$Data,
-        [int]$Depth = 7
+        [int]$Depth = 4
     )
 
     $directory = Split-Path -Parent $Path
@@ -92,22 +107,60 @@ function Repair-EventsFile {
     }
 }
 
-function Write-Event {
-    param(
-        [string]$Type,
-        [string]$Adapter,
-        [string]$Message,
-        [string]$Level = 'info'
-    )
+function Get-ConfiguredEwmaAlphaMap {
+    param($LiveConfig)
 
-    $evt = @{
-        timestamp = (Get-Date).ToString('o')
-        type = $Type
-        adapter = $Adapter
-        message = $Message
-        level = $Level
+    $map = @{
+        gaming     = 0.65
+        streaming  = 0.25
+        bulk       = 0.15
+        interactive = 0.45
+        default    = $script:defaultEwmaAlpha
     }
 
+    if ($LiveConfig -and $LiveConfig.intelligence -and $LiveConfig.intelligence.ewmaAlphas) {
+        $LiveConfig.intelligence.ewmaAlphas.PSObject.Properties | ForEach-Object {
+            $value = 0.0
+            if ([double]::TryParse([string]$_.Value, [ref]$value) -and $value -gt 0 -and $value -lt 1) {
+                $map[$_.Name] = $value
+            }
+        }
+    }
+
+    return $map
+}
+
+function Get-EwmaAlphaForMode {
+    param([string]$Mode = 'default')
+
+    $normalizedMode = if ([string]::IsNullOrWhiteSpace($Mode)) { 'default' } else { $Mode.ToLowerInvariant() }
+    $modeKey = switch ($normalizedMode) {
+        'balanced' { 'interactive'; break }
+        'download' { 'bulk'; break }
+        'maxspeed' { 'bulk'; break }
+        default { $normalizedMode }
+    }
+
+    if ($script:ewmaAlphaMap.ContainsKey($modeKey)) {
+        return [double]$script:ewmaAlphaMap[$modeKey]
+    }
+    if ($script:ewmaAlphaMap.ContainsKey('default')) {
+        return [double]$script:ewmaAlphaMap['default']
+    }
+    return $script:defaultEwmaAlpha
+}
+
+$script:ewmaAlphaMap = Get-ConfiguredEwmaAlphaMap -LiveConfig $config
+
+function Write-Event {
+    param([string]$Type, [string]$Adapter, [string]$Message)
+    $evt = @{
+        timestamp = (Get-Date).ToString('o')
+        type      = $Type
+        adapter   = $Adapter
+        message   = $Message
+    }
+    
     $mutexTaken = $false
     try {
         try {
@@ -120,14 +173,15 @@ function Write-Event {
         if (-not $mutexTaken) { return }
 
         try {
-            $events = @()
+            $fileEvents = @()
             if (Test-Path $EventsFile) {
                 $data = Get-Content $EventsFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($data -and $data.events) { $events = @($data.events) }
+                if ($data -and $data.events) { $fileEvents = @($data.events) }
             }
-            $events = @($evt) + $events
-            if ($events.Count -gt 300) { $events = $events[0..299] }
-            Write-AtomicJson -Path $EventsFile -Data @{ events = $events } -Depth 4
+            $fileEvents = @($evt) + $fileEvents
+            if ($fileEvents.Count -gt 200) { $fileEvents = $fileEvents[0..199] }
+
+            Write-AtomicJson -Path $EventsFile -Data @{ events = $fileEvents } -Depth 3
         } finally {
             if ($mutexTaken) {
                 try { $script:InterfaceMonitorLogMutex.ReleaseMutex() } catch {}
@@ -136,994 +190,466 @@ function Write-Event {
     } catch {}
 }
 
-function Normalize-InstanceToken {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-    return (($Value -replace '[^a-zA-Z0-9]', '').ToLowerInvariant())
-}
-
-function Get-NetAdapterRateSamples {
-    param([array]$Interfaces)
-
-    $now = Get-Date
-    $snapshot = @{}
-    $hadData = $false
-
-    foreach ($iface in @($Interfaces)) {
-        $name = [string]$iface.Name
-        if ([string]::IsNullOrWhiteSpace($name)) { continue }
-
-        $stats = $null
-        try {
-            $stats = Get-NetAdapterStatistics -Name $name -ErrorAction Stop
-        } catch {}
-
-        if (-not $stats) {
-            $snapshot[$name] = @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 }
-            continue
-        }
-
-        $hadData = $true
-        $rxBytes = [int64]$stats.ReceivedBytes
-        $txBytes = [int64]$stats.SentBytes
-        $row = @{
-            timestamp = $now
-            rxBytes = $rxBytes
-            txBytes = $txBytes
-            rxMbps = 0.0
-            txMbps = 0.0
-            totalMbps = 0.0
-        }
-
-        if ($script:netAdapterCounterCache.ContainsKey($name)) {
-            $prev = $script:netAdapterCounterCache[$name]
-            try {
-                $elapsedSec = [double](($now - [datetime]$prev.timestamp).TotalSeconds)
-                if ($elapsedSec -gt 0.15) {
-                    $rxDelta = [double]($rxBytes - [int64]$prev.rxBytes)
-                    $txDelta = [double]($txBytes - [int64]$prev.txBytes)
-                    if ($rxDelta -lt 0) { $rxDelta = 0.0 }
-                    if ($txDelta -lt 0) { $txDelta = 0.0 }
-
-                    $rxMbps = [math]::Round((($rxDelta * 8.0) / 1000000.0) / $elapsedSec, 3)
-                    $txMbps = [math]::Round((($txDelta * 8.0) / 1000000.0) / $elapsedSec, 3)
-                    $totalMbps = [math]::Round($rxMbps + $txMbps, 3)
-
-                    $row.rxMbps = [double]$rxMbps
-                    $row.txMbps = [double]$txMbps
-                    $row.totalMbps = [double]$totalMbps
-                } else {
-                    $row.rxMbps = if ($null -ne $prev.rxMbps) { [double]$prev.rxMbps } else { 0.0 }
-                    $row.txMbps = if ($null -ne $prev.txMbps) { [double]$prev.txMbps } else { 0.0 }
-                    $row.totalMbps = if ($null -ne $prev.totalMbps) { [double]$prev.totalMbps } else { [double]$row.rxMbps + [double]$row.txMbps }
-                }
-            } catch {}
-        }
-
-        $script:netAdapterCounterCache[$name] = $row
-        $snapshot[$name] = @{
-            rxMbps = [double]$row.rxMbps
-            txMbps = [double]$row.txMbps
-            totalMbps = [double]$row.totalMbps
-        }
-    }
-
-    return [pscustomobject]@{
-        hadData = [bool]$hadData
-        snapshot = $snapshot
-    }
-}
-
-function Ensure-AdapterState {
-    param([string]$Name)
-
-    if (-not $script:adapterState.ContainsKey($Name)) {
-        $script:adapterState[$Name] = @{
-            lastFastCheck = [datetime]::MinValue
-            lastMediumCheck = [datetime]::MinValue
-            lastDeepCheck = [datetime]::MinValue
-            lastGatewayLatency = 999.0
-            lastInternetLatency = 999.0
-            lastDnsLatency = 999.0
-            lastPacketLoss = 100.0
-            throughputHistory = [System.Collections.Generic.List[object]]::new()
-            lastRxMbps = 0.0
-            lastTxMbps = 0.0
-            lastTotalMbps = 0.0
-            avg5 = 0.0
-            avg30 = 0.0
-            avg60 = 0.0
-            successCount = 0
-            failCount = 0
-            errorRate = 0.0
-            healthySince = [datetime]::UtcNow
-            failStreak = 0
-            quarantineUntil = $null
-            disabledUntil = $null
-            failureTimes = [System.Collections.Generic.List[datetime]]::new()
-            quarantineCount = 0
-            reintroLimit = 0
-            lastProbeMbps = 0.0
-            lastAnomalyAt = [datetime]::MinValue
-            highUtilCount = 0
-            lowUtilCount = 0
-            publicIp = ''
-            publicIpCheckedAt = [datetime]::MinValue
-        }
-    }
-
-    return $script:adapterState[$Name]
-}
-
-function Get-RollingAverage {
-    param(
-        [System.Collections.Generic.List[object]]$History,
-        [int]$WindowSec,
-        [string]$Key = 'total'
-    )
-
-    if (-not $History -or $History.Count -eq 0) { return 0.0 }
-    $cutoff = (Get-Date).AddSeconds(-1 * [math]::Max(1, $WindowSec))
-    $vals = @()
-    foreach ($row in $History) {
-        if ($row.t -ge $cutoff) {
-            $vals += [double]$row[$Key]
-        }
-    }
-    if ($vals.Count -eq 0) { return 0.0 }
-    return [math]::Round((($vals | Measure-Object -Average).Average), 3)
-}
+# ===== Latency Testing =====
 
 function Test-GatewayLatency {
     param([string]$Gateway)
-    if ([string]::IsNullOrWhiteSpace($Gateway)) { return 999.0 }
+    if (-not $Gateway) { return 999 }
     try {
-        $pinger = New-Object System.Net.NetworkInformation.Ping
-        try {
-            $reply = $pinger.Send($Gateway, 1000)
-            if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-                return [math]::Max(1.0, [double]$reply.RoundtripTime)
-            }
-        } finally {
-            $pinger.Dispose()
-        }
+        $result = ping.exe -n 1 -w 1000 $Gateway 2>$null
+        $joined = $result -join "`n"
+        if ($joined -match 'time[=<](\d+)\s*ms') { return [int]$Matches[1] }
+        if ($joined -match 'time[=<](\d+)') { return [int]$Matches[1] }
+        if ($joined -match 'Reply from') { return 1 }
     } catch {}
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $ar = $tcp.BeginConnect($Gateway, 443, $null, $null)
-        $connected = $ar.AsyncWaitHandle.WaitOne(1000, $false)
-        if ($connected -and $tcp.Connected) {
-            try { $tcp.EndConnect($ar) } catch {}
-        }
-        $sw.Stop()
-        $tcp.Dispose()
-        if ($connected) { return [math]::Max(1.0, [double]$sw.ElapsedMilliseconds) }
-    } catch {}
-    return 999.0
+    return 999
 }
 
 function Test-InternetLatency {
-    param(
-        [string]$SourceIP,
-        [string]$Target,
-        [int]$Timeout = 1500
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SourceIP)) { return 999.0 }
-
+    param([string]$SourceIP, [string]$Target, [int]$Timeout)
+    # Method 1: ping with source binding
     try {
-        $localEndpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SourceIP), 0)
+        $result = ping.exe -S $SourceIP -n 1 -w $Timeout $Target 2>$null
+        $joined = $result -join "`n"
+        if ($joined -match 'time[=<](\d+)\s*ms') { return [int]$Matches[1] }
+        if ($joined -match 'time[=<](\d+)') { return [int]$Matches[1] }
+        if ($joined -match 'Reply from') { return 1 }
+    } catch {}
+
+    # Method 2: plain ping (no source binding)
+    try {
+        $result = ping.exe -n 1 -w $Timeout $Target 2>$null
+        $joined = $result -join "`n"
+        if ($joined -match 'time[=<](\d+)\s*ms') { return [int]$Matches[1] }
+        if ($joined -match 'time[=<](\d+)') { return [int]$Matches[1] }
+        if ($joined -match 'Reply from') { return 1 }
+    } catch {}
+
+    # Method 3: TCP connect test to DNS port
+    try {
         $tcp = New-Object System.Net.Sockets.TcpClient
-        $tcp.Client.Bind($localEndpoint)
+        $asyncResult = $tcp.BeginConnect($Target, 53, $null, $null)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $ar = $tcp.BeginConnect($Target, 443, $null, $null)
-        $connected = $ar.AsyncWaitHandle.WaitOne($Timeout, $false)
-        if ($connected -and $tcp.Connected) {
-            try { $tcp.EndConnect($ar) } catch {}
-        }
+        $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
         $sw.Stop()
-        $tcp.Dispose()
-        if ($connected) { return [math]::Max(1.0, [double]$sw.ElapsedMilliseconds) }
+        $tcp.Close()
+        if ($connected) { return [math]::Max(1, [int]$sw.ElapsedMilliseconds) }
     } catch {}
 
-    return 999.0
+    return 999
 }
 
-function Test-DnsLatency {
-    param(
-        [string]$TargetName = 'one.one.one.one'
-    )
+# ===== v4.0 Intelligence Functions =====
 
-    try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Resolve-DnsName -Name $TargetName -Type A -QuickTimeout -ErrorAction Stop | Out-Null
-        $sw.Stop()
-        $elapsed = [double]$sw.ElapsedMilliseconds
-        if ($elapsed -le 0) { $elapsed = 1.0 }
-        return $elapsed
-    } catch {
-        return 999.0
-    }
-}
+function Update-EWMALatency {
+    <# Smooth latency using Exponential Weighted Moving Average to prevent single spikes from causing routing changes. #>
+    param([string]$Name, [double]$RawLatency, [string]$Type, [string]$Mode = 'default')
 
-function Invoke-ThroughputProbe {
-    param(
-        [string]$SourceIP,
-        [string]$TargetHost = 'speed.cloudflare.com',
-        [int]$Bytes = 262144,
-        [int]$TimeoutMs = 5000
-    )
+    $store = if ($Type -eq 'gateway') { $script:ewmaGwLatency } else { $script:ewmaLatency }
+    $alpha = Get-EwmaAlphaForMode -Mode $Mode
 
-    if ([string]::IsNullOrWhiteSpace($SourceIP)) { return 0.0 }
-
-    $client = $null
-    $stream = $null
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $client.Client.NoDelay = $true
-        $client.SendTimeout = $TimeoutMs
-        $client.ReceiveTimeout = $TimeoutMs
-        $client.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SourceIP), 0)))
-        $ar = $client.BeginConnect($TargetHost, 80, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
-            return 0.0
-        }
-        try { $client.EndConnect($ar) } catch {}
-        if (-not $client.Connected) { return 0.0 }
-
-        $stream = $client.GetStream()
-        $request = "GET /__down?bytes=$Bytes&nfprobe=1 HTTP/1.1`r`nHost: $TargetHost`r`nConnection: close`r`n`r`n"
-        $reqBytes = [System.Text.Encoding]::ASCII.GetBytes($request)
-
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $stream.Write($reqBytes, 0, $reqBytes.Length)
-        $stream.Flush()
-
-        $buffer = New-Object byte[] 32768
-        $total = 0
-        while ($true) {
-            $read = $stream.Read($buffer, 0, $buffer.Length)
-            if ($read -le 0) { break }
-            $total += $read
-            if ($total -ge ($Bytes + 2048)) { break }
-        }
-        $sw.Stop()
-
-        if ($sw.Elapsed.TotalSeconds -le 0 -or $total -le 0) { return 0.0 }
-        return [math]::Round((($total * 8.0) / 1000000.0) / $sw.Elapsed.TotalSeconds, 3)
-    } catch {
-        return 0.0
-    } finally {
-        try { if ($stream) { $stream.Dispose() } } catch {}
-        try { if ($client) { $client.Dispose() } } catch {}
-    }
-}
-
-function Get-AdapterBoundPublicIP {
-    param(
-        [string]$SourceIP,
-        [int]$TimeoutMs = 3500
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SourceIP)) { return '' }
-
-    $client = $null
-    $stream = $null
-    $reader = $null
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $client.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SourceIP), 0)))
-        $client.SendTimeout = $TimeoutMs
-        $client.ReceiveTimeout = $TimeoutMs
-        $ar = $client.BeginConnect('api.ipify.org', 80, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return '' }
-        try { $client.EndConnect($ar) } catch {}
-        if (-not $client.Connected) { return '' }
-
-        $stream = $client.GetStream()
-        $request = "GET / HTTP/1.1`r`nHost: api.ipify.org`r`nConnection: close`r`n`r`n"
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($request)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush()
-
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
-        $text = $reader.ReadToEnd()
-        if ($text -match "`r`n`r`n(?<ip>\d+\.\d+\.\d+\.\d+)") {
-            return [string]$Matches['ip']
-        }
-        if ($text -match "(?<ip>\d+\.\d+\.\d+\.\d+)") {
-            return [string]$Matches['ip']
-        }
-        return ''
-    } catch {
-        return ''
-    } finally {
-        try { if ($reader) { $reader.Dispose() } } catch {}
-        try { if ($stream) { $stream.Dispose() } } catch {}
-        try { if ($client) { $client.Dispose() } } catch {}
-    }
-}
-
-function Get-PerformanceCounterSamples {
-    param([array]$Interfaces)
-
-    $now = Get-Date
-    if (($now - $script:lastCounterSample).TotalSeconds -lt $script:throughputSampleSec -and $script:perfCounterCache.Count -gt 0) {
-        return $script:perfCounterCache
-    }
-
-    $script:lastCounterSample = $now
-    $snapshot = @{}
-
-    # Primary path: use adapter byte counters directly so per-adapter Rx/Tx values
-    # remain accurate even when performance-counter instance names are ambiguous.
-    try {
-        $native = Get-NetAdapterRateSamples -Interfaces $Interfaces
-        if ($native -and $native.hadData -and $native.snapshot -and $native.snapshot.Count -gt 0) {
-            foreach ($iface in @($Interfaces)) {
-                $name = [string]$iface.Name
-                if ($native.snapshot.ContainsKey($name)) {
-                    $snapshot[$name] = $native.snapshot[$name]
-                } else {
-                    $snapshot[$name] = @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 }
-                }
-            }
-            $script:perfCounterCache = $snapshot
-            return $snapshot
-        }
-    } catch {}
-
-    try {
-        $counterPaths = @(
-            '\Network Interface(*)\Bytes Received/sec',
-            '\Network Interface(*)\Bytes Sent/sec',
-            '\Network Interface(*)\Bytes Total/sec'
-        )
-        $counter = Get-Counter -Counter $counterPaths -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
-
-        $instanceMap = @{}
-        foreach ($sample in @($counter.CounterSamples)) {
-            $inst = [string]$sample.InstanceName
-            if (-not $instanceMap.ContainsKey($inst)) {
-                $instanceMap[$inst] = @{ rx = 0.0; tx = 0.0; total = 0.0 }
-            }
-            if ($sample.Path -match 'Bytes Received/sec') {
-                $instanceMap[$inst].rx = [double]$sample.CookedValue
-            } elseif ($sample.Path -match 'Bytes Sent/sec') {
-                $instanceMap[$inst].tx = [double]$sample.CookedValue
-            } elseif ($sample.Path -match 'Bytes Total/sec') {
-                $instanceMap[$inst].total = [double]$sample.CookedValue
-            }
-        }
-
-        foreach ($iface in @($Interfaces)) {
-            $name = [string]$iface.Name
-            $desc = [string]$iface.Description
-            $nameTok = Normalize-InstanceToken -Value $name
-            $descTok = Normalize-InstanceToken -Value $desc
-
-            $best = @{ rx = 0.0; tx = 0.0; total = 0.0 }
-            $bestTotal = [double]::NegativeInfinity
-            foreach ($entry in $instanceMap.GetEnumerator()) {
-                $instTok = Normalize-InstanceToken -Value ([string]$entry.Key)
-                if ([string]::IsNullOrWhiteSpace($instTok)) { continue }
-                if (
-                    ($nameTok -and ($instTok.Contains($nameTok) -or $nameTok.Contains($instTok))) -or
-                    ($descTok -and ($instTok.Contains($descTok) -or $descTok.Contains($instTok)))
-                ) {
-                    $entryTotal = if ($null -ne $entry.Value.total) { [double]$entry.Value.total } else { [double]$entry.Value.rx + [double]$entry.Value.tx }
-                    if ($entryTotal -gt $bestTotal) {
-                        $best = $entry.Value
-                        $bestTotal = $entryTotal
-                    }
-                }
-            }
-
-            $snapshot[$name] = @{
-                rxMbps = [math]::Round(([double]$best.rx * 8.0) / 1000000.0, 3)
-                txMbps = [math]::Round(([double]$best.tx * 8.0) / 1000000.0, 3)
-                totalMbps = [math]::Round(([double]$best.total * 8.0) / 1000000.0, 3)
-            }
-        }
-    } catch {
-        foreach ($iface in @($Interfaces)) {
-            $snapshot[[string]$iface.Name] = @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 }
-        }
-    }
-
-    $script:perfCounterCache = $snapshot
-    return $snapshot
-}
-
-function Update-ThroughputState {
-    param(
-        [hashtable]$Iface,
-        [hashtable]$CounterSnapshot
-    )
-
-    $name = [string]$Iface.Name
-    $state = Ensure-AdapterState -Name $name
-    $row = if ($CounterSnapshot.ContainsKey($name)) { $CounterSnapshot[$name] } else { @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 } }
-
-    $rx = [double]$row.rxMbps
-    $tx = [double]$row.txMbps
-    $total = [double]$row.totalMbps
-
-    $state.lastRxMbps = $rx
-    $state.lastTxMbps = $tx
-    $state.lastTotalMbps = $total
-
-    $entry = [pscustomobject]@{ t = Get-Date; rx = $rx; tx = $tx; total = $total }
-    $state.throughputHistory.Add($entry)
-
-    $cutoff = (Get-Date).AddSeconds(-65)
-    while ($state.throughputHistory.Count -gt 0 -and $state.throughputHistory[0].t -lt $cutoff) {
-        $state.throughputHistory.RemoveAt(0)
-    }
-
-    $state.avg5 = Get-RollingAverage -History $state.throughputHistory -WindowSec 5 -Key 'total'
-    $state.avg30 = Get-RollingAverage -History $state.throughputHistory -WindowSec 30 -Key 'total'
-    $state.avg60 = Get-RollingAverage -History $state.throughputHistory -WindowSec 60 -Key 'total'
-
-    return $state
-}
-
-function Compute-LatencyComponent {
-    param(
-        [double]$GatewayLatency,
-        [double]$InternetLatency,
-        [double]$DnsLatency
-    )
-
-    $gwScore = if ($GatewayLatency -ge 999) { 0.0 } elseif ($GatewayLatency -le 5) { 1.0 } else { [math]::Max(0.0, 1.0 - (($GatewayLatency - 5.0) / 195.0)) }
-    $inetScore = if ($InternetLatency -ge 999) { 0.0 } elseif ($InternetLatency -le 20) { 1.0 } else { [math]::Max(0.0, 1.0 - (($InternetLatency - 20.0) / 380.0)) }
-    $dnsScore = if ($DnsLatency -ge 999) { 0.0 } elseif ($DnsLatency -le 30) { 1.0 } else { [math]::Max(0.0, 1.0 - (($DnsLatency - 30.0) / 470.0)) }
-
-    return [math]::Round((($gwScore * 0.4) + ($inetScore * 0.45) + ($dnsScore * 0.15)), 4)
-}
-
-function Compute-ThroughputComponent {
-    param(
-        [double]$CurrentMbps,
-        [double]$Avg30Mbps,
-        [double]$EstimatedCapacityMbps,
-        [double]$ProbeMbps
-    )
-
-    $capacity = [math]::Max(1.0, $EstimatedCapacityMbps)
-    $observed = [math]::Max([math]::Max($CurrentMbps, $Avg30Mbps), $ProbeMbps)
-
-    if ($observed -lt 0.5) {
-        # idle adapters should not be considered unhealthy solely due to low traffic
-        return 0.75
-    }
-
-    $ratio = [math]::Min(1.0, $observed / $capacity)
-    return [math]::Round([math]::Max(0.05, $ratio), 4)
-}
-
-function Compute-ErrorComponent {
-    param(
-        [int]$SuccessCount,
-        [int]$FailCount
-    )
-
-    $total = [math]::Max(1, $SuccessCount + $FailCount)
-    $failRate = [double]$FailCount / [double]$total
-    return [math]::Round([math]::Max(0.0, 1.0 - $failRate), 4)
-}
-
-function Compute-StabilityComponent {
-    param(
-        [double]$Avg5,
-        [double]$Avg30,
-        [int]$FailStreak,
-        [datetime]$HealthySince
-    )
-
-    $variancePenalty = 0.0
-    if ($Avg30 -gt 0) {
-        $delta = [math]::Abs($Avg5 - $Avg30)
-        $variancePenalty = [math]::Min(0.5, $delta / [math]::Max(1.0, $Avg30))
-    }
-
-    $uptimeStableBonus = 0.0
-    try {
-        $stableMinutes = ((Get-Date).ToUniversalTime() - $HealthySince).TotalMinutes
-        $uptimeStableBonus = [math]::Min(0.35, [math]::Max(0.0, $stableMinutes / 180.0))
-    } catch {}
-
-    $base = 0.65 + $uptimeStableBonus - ([math]::Min(0.5, $FailStreak * 0.12)) - $variancePenalty
-    return [math]::Round([math]::Max(0.0, [math]::Min(1.0, $base)), 4)
-}
-
-function Compute-SignalComponent {
-    param(
-        [string]$Type,
-        [double]$SignalQuality
-    )
-
-    if ($Type -notmatch 'WiFi') { return 1.0 }
-    if ($SignalQuality -le 0) { return 0.4 }
-    return [math]::Round([math]::Max(0.0, [math]::Min(1.0, $SignalQuality / 100.0)), 4)
-}
-
-function Update-QuarantineState {
-    param(
-        [string]$Name,
-        [hashtable]$State,
-        [double]$Health01,
-        [bool]$GatewayOk,
-        [bool]$InternetOk
-    )
-
-    $now = Get-Date
-    $isFailure = ($Health01 -lt 0.3) -or (-not $GatewayOk -and -not $InternetOk)
-
-    if ($State.disabledUntil -and $State.disabledUntil -gt $now) {
-        return
-    }
-
-    if ($isFailure) {
-        $State.failStreak = [int]$State.failStreak + 1
-        $State.failCount = [int]$State.failCount + 1
-        $State.failureTimes.Add($now)
-
-        $cutoff30 = $now.AddMinutes(-30)
-        while ($State.failureTimes.Count -gt 0 -and $State.failureTimes[0] -lt $cutoff30) {
-            $State.failureTimes.RemoveAt(0)
-        }
-
-        if ($State.failStreak -ge 3 -and (-not $State.quarantineUntil -or $State.quarantineUntil -le $now)) {
-            $recentFailure = $false
-            $cutoff5 = $now.AddMinutes(-5)
-            foreach ($t in @($State.failureTimes)) {
-                if ($t -gt $cutoff5 -and $t -lt $now) {
-                    $recentFailure = $true
-                    break
-                }
-            }
-
-            $qSec = if ($recentFailure) { 300 } else { 60 }
-            $State.quarantineUntil = $now.AddSeconds($qSec)
-            $State.quarantineCount = [int]$State.quarantineCount + 1
-            $State.reintroLimit = 0
-            Write-Event -Type 'quarantine' -Adapter $Name -Message "$Name quarantined for $qSec seconds after consecutive failures." -Level 'warn'
-        }
-
-        if ($State.failureTimes.Count -ge 5) {
-            # RC-7: Check if disabling this adapter would leave zero active adapters
-            $otherActive = $false
-            foreach ($otherName in $script:adapterState.Keys) {
-                if ($otherName -eq $Name) { continue }
-                $otherState = $script:adapterState[$otherName]
-                $otherDisabled = ($otherState.disabledUntil -and $otherState.disabledUntil -gt $now)
-                $otherQuarantined = ($otherState.quarantineUntil -and $otherState.quarantineUntil -gt $now)
-                if (-not $otherDisabled -and -not $otherQuarantined) {
-                    $otherActive = $true
-                    break
-                }
-            }
-
-            if (-not $otherActive) {
-                # RC-7: NEVER disable the last remaining adapter -- keep internet alive
-                $State.failStreak = 0
-                $State.quarantineUntil = $now.AddSeconds(60)
-                $State.reintroLimit = 0
-                Write-Event -Type 'quarantine' -Adapter $Name -Message "$Name has 5 failures but is the LAST active adapter. Short quarantine only (60s) to keep internet alive." -Level 'warn'
-            } else {
-                # RC-7: Use 30-minute disable instead of permanent -- auto-recovers
-                $State.disabledUntil = $now.AddMinutes(30)
-                $State.quarantineUntil = $null
-                $State.reintroLimit = 0
-                Write-Event -Type 'quarantine' -Adapter $Name -Message "$Name disabled for 30 minutes after 5 failures. Will auto-recover." -Level 'error'
-            }
+    if ($store.ContainsKey($Name) -and $store[$Name] -lt 998) {
+        $prev = $store[$Name]
+        if ($RawLatency -ge 999) {
+            # Timeout: don't fully switch, increase gradually
+            $store[$Name] = [math]::Min(999, $prev + ($alpha * (999 - $prev)))
+        } else {
+            $store[$Name] = ($alpha * $RawLatency) + ((1 - $alpha) * $prev)
         }
     } else {
-        $State.successCount = [int]$State.successCount + 1
-        $State.failStreak = 0
-
-        if ($State.quarantineUntil -and $State.quarantineUntil -le $now) {
-            # gradual re-introduction: 1 flow then 2 then normal
-            if ($State.reintroLimit -lt 1) {
-                $State.reintroLimit = 1
-            } elseif ($State.reintroLimit -lt 2) {
-                $State.reintroLimit = 2
-            } else {
-                $State.reintroLimit = 0
-                $State.quarantineUntil = $null
-            }
-        }
-
-        if (-not $State.healthySince) {
-            $State.healthySince = [datetime]::UtcNow
-        }
+        $store[$Name] = $RawLatency
     }
 
-    $totalChecks = [math]::Max(1, $State.successCount + $State.failCount)
-    $State.errorRate = [math]::Round(([double]$State.failCount / [double]$totalChecks), 4)
+    if ($Type -eq 'gateway') { $script:ewmaGwLatency = $store } else { $script:ewmaLatency = $store }
+    return [math]::Round($store[$Name], 1)
 }
+
+function Update-LatencyHistory {
+    <# Maintain rolling window of raw latency samples for jitter calculation. #>
+    param([string]$Name, [double]$RawLatency)
+
+    if (-not $script:latencyHistory.ContainsKey($Name)) {
+        $script:latencyHistory[$Name] = [System.Collections.Generic.List[double]]::new()
+    }
+    $history = $script:latencyHistory[$Name]
+    if ($RawLatency -lt 999) {
+        $history.Add($RawLatency)
+    }
+    while ($history.Count -gt $jitterWindowSize) {
+        $history.RemoveAt(0)
+    }
+}
+
+function Measure-Jitter {
+    <# Compute jitter as standard deviation of latency samples in rolling window. Low jitter = stable connection. #>
+    param([string]$Name)
+
+    if (-not $script:latencyHistory.ContainsKey($Name)) { return 0.0 }
+    $samples = $script:latencyHistory[$Name]
+    if ($samples.Count -lt 3) { return 0.0 }
+
+    $avg = ($samples | Measure-Object -Average).Average
+    $variance = 0.0
+    foreach ($s in $samples) {
+        $variance += ($s - $avg) * ($s - $avg)
+    }
+    $variance /= $samples.Count
+    $jitter = [math]::Round([math]::Sqrt($variance), 2)
+    $script:jitterValues[$Name] = $jitter
+    return $jitter
+}
+
+function Update-HealthTrend {
+    <# Track health score history for trend analysis. Returns slope of recent health scores. #>
+    param([string]$Name, [double]$HealthScore)
+
+    if (-not $script:healthTrend.ContainsKey($Name)) {
+        $script:healthTrend[$Name] = [System.Collections.Generic.List[double]]::new()
+    }
+    $trend = $script:healthTrend[$Name]
+    $trend.Add($HealthScore)
+    while ($trend.Count -gt $healthTrendWindow) {
+        $trend.RemoveAt(0)
+    }
+
+    # Calculate linear regression slope
+    if ($trend.Count -lt 5) { return 0.0 }
+    $n = $trend.Count
+    $sumX = 0.0; $sumY = 0.0; $sumXY = 0.0; $sumX2 = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $sumX += $i
+        $sumY += $trend[$i]
+        $sumXY += $i * $trend[$i]
+        $sumX2 += $i * $i
+    }
+    $denom = ($n * $sumX2) - ($sumX * $sumX)
+    if ([math]::Abs($denom) -lt 0.001) { return 0.0 }
+    $slope = [math]::Round((($n * $sumXY) - ($sumX * $sumY)) / $denom, 3)
+    return $slope
+}
+
+function Test-PredictiveDegradation {
+    <# Detect declining health trend and flag adapter for preemptive rerouting. #>
+    param([string]$Name, [double]$Slope, [double]$CurrentHealth)
+
+    $wasWarned = $script:degradationWarnings.ContainsKey($Name) -and $script:degradationWarnings[$Name].warned
+
+    if ($Slope -lt $degradationThreshold -and $CurrentHealth -lt 80) {
+        # Health is declining -- warn
+        if (-not $wasWarned) {
+            $script:degradationWarnings[$Name] = @{
+                warned = $true
+                trend  = $Slope
+                since  = (Get-Date).ToString('o')
+                health = $CurrentHealth
+            }
+            Write-Event -Type 'prediction' -Adapter $Name -Message "Degradation predicted (trend: $Slope/cycle, health: $CurrentHealth%) -- reducing traffic"
+            Write-Host "  [!] PREDICTION: $Name degrading (trend=$Slope) -- preemptive rerouting" -ForegroundColor Magenta
+        } else {
+            $script:degradationWarnings[$Name].trend = $Slope
+            $script:degradationWarnings[$Name].health = $CurrentHealth
+        }
+        return $true
+    } elseif ($wasWarned -and $Slope -ge ($degradationThreshold / 2)) {
+        # Health recovering -- clear warning
+        $script:degradationWarnings[$Name] = @{ warned = $false; trend = $Slope; since = $null; health = $CurrentHealth }
+        Write-Event -Type 'prediction' -Adapter $Name -Message "Degradation resolved (trend: $Slope/cycle, health: $CurrentHealth%) -- restoring traffic"
+        Write-Host "  [OK] RECOVERY: $Name stabilized (trend=$Slope)" -ForegroundColor Green
+        return $false
+    }
+    return $wasWarned
+}
+
+function Get-StabilityScore {
+    <# Score based on health variance over time. Low variance = high stability. Returns 0-100. #>
+    param([string]$Name)
+
+    if (-not $script:healthTrend.ContainsKey($Name)) { return 80 }
+    $trend = $script:healthTrend[$Name]
+    if ($trend.Count -lt 5) { return 80 }
+
+    $avg = ($trend | Measure-Object -Average).Average
+    $variance = 0.0
+    foreach ($s in $trend) {
+        $variance += ($s - $avg) * ($s - $avg)
+    }
+    $variance /= $trend.Count
+    $stddev = [math]::Sqrt($variance)
+
+    # Low stddev = stable = high score. StdDev of 0 â†’ 100, StdDev of 30+ â†’ 0
+    $stability = [math]::Max(0, [math]::Min(100, [math]::Round(100 - ($stddev * 3.3))))
+    $script:stabilityScores[$Name] = $stability
+    return $stability
+}
+
+function Update-SuccessRate {
+    <# Track connection success/failure rate per adapter. #>
+    param([string]$Name, [bool]$GatewayOk, [bool]$InternetOk)
+
+    if (-not $script:successRates.ContainsKey($Name)) {
+        $script:successRates[$Name] = @{ success = 0; fail = 0; rate = 100.0 }
+    }
+    $sr = $script:successRates[$Name]
+
+    if ($InternetOk) {
+        $sr.success++
+    } elseif ($GatewayOk) {
+        $sr.success++  # Gateway OK still counts as partial success
+    } else {
+        $sr.fail++
+    }
+
+    $total = $sr.success + $sr.fail
+    if ($total -gt 0) {
+        $sr.rate = [math]::Round(($sr.success / $total) * 100, 1)
+    }
+
+    # Decay old counters every 100 samples to stay responsive
+    if ($total -gt 200) {
+        $sr.success = [math]::Floor($sr.success * 0.5)
+        $sr.fail = [math]::Floor($sr.fail * 0.5)
+    }
+}
+
+# ===== Enhanced Health Measurement =====
 
 function Measure-InterfaceHealth {
-    param(
-        [hashtable]$Iface,
-        [hashtable]$CounterSnapshot
-    )
+    param([hashtable]$Interface, [string]$Mode = 'default')
 
-    $name = [string]$Iface.Name
-    $state = Update-ThroughputState -Iface $Iface -CounterSnapshot $CounterSnapshot
-    $now = Get-Date
+    $ip = $Interface.IPAddress
+    $gateway = $Interface.Gateway
+    $name = $Interface.Name
 
-    $ip = if ($Iface.PrimaryIPv4) { [string]$Iface.PrimaryIPv4 } elseif ($Iface.IPAddress) { [string]$Iface.IPAddress } else { '' }
-    $gateway = if ($Iface.Gateway) { [string]$Iface.Gateway } else { '' }
-    $dnsServers = @()
-    if ($Iface.DNSServers) { $dnsServers = @($Iface.DNSServers) }
-    $estimatedCapacity = if ($Iface.EstimatedCapacityMbps) { [double]$Iface.EstimatedCapacityMbps } else { [math]::Max(30.0, [double]$Iface.LinkSpeedMbps * 0.6) }
+    # --- Gateway latency ---
+    $gwLatencyRaw = Test-GatewayLatency -Gateway $gateway
+    $gwLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $gwLatencyRaw -Type 'gateway' -Mode $Mode
 
-    # Fast check every 3s (gateway)
-    if (($now - $state.lastFastCheck).TotalSeconds -ge $script:fastCheckSec) {
-        $state.lastGatewayLatency = Test-GatewayLatency -Gateway $gateway
-        $state.lastFastCheck = $now
-    }
-
-    # Medium check every 10s (internet + DNS)
-    if (($now - $state.lastMediumCheck).TotalSeconds -ge $script:mediumCheckSec) {
-        $lat = Test-InternetLatency -SourceIP $ip -Target $pingTarget -Timeout $pingTimeout
-        if ($lat -ge 999) {
-            $lat = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
-        }
-        $state.lastInternetLatency = $lat
-
-        $state.lastDnsLatency = Test-DnsLatency
-        $state.lastMediumCheck = $now
-    }
-
-    # Deep check every 30s only if adapter is idle
-    if (($now - $state.lastDeepCheck).TotalSeconds -ge $script:deepCheckSec) {
-        if ($state.lastTotalMbps -lt 1.0) {
-            $state.lastProbeMbps = Invoke-ThroughputProbe -SourceIP $ip
-        }
-        $state.lastDeepCheck = $now
-    }
-
-    $gatewayOk = $state.lastGatewayLatency -lt 999
-    $internetOk = $state.lastInternetLatency -lt 999
-
-    if (-not $gatewayOk -and -not $internetOk) {
-        $state.lastPacketLoss = 100.0
-    } elseif (-not $internetOk) {
-        $state.lastPacketLoss = 50.0
-    } else {
-        $state.lastPacketLoss = 0.0
-    }
-
-    $latencyComp = Compute-LatencyComponent -GatewayLatency $state.lastGatewayLatency -InternetLatency $state.lastInternetLatency -DnsLatency $state.lastDnsLatency
-    $throughputComp = Compute-ThroughputComponent -CurrentMbps $state.lastTotalMbps -Avg30Mbps $state.avg30 -EstimatedCapacityMbps $estimatedCapacity -ProbeMbps $state.lastProbeMbps
-    $errorComp = Compute-ErrorComponent -SuccessCount $state.successCount -FailCount $state.failCount
-    $stabilityComp = Compute-StabilityComponent -Avg5 $state.avg5 -Avg30 $state.avg30 -FailStreak $state.failStreak -HealthySince $state.healthySince
-    $signalComp = Compute-SignalComponent -Type ([string]$Iface.Type) -SignalQuality ([double]$Iface.SignalQuality)
-
-    $health01 =
-        ($latencyComp * 0.30) +
-        ($throughputComp * 0.30) +
-        ($errorComp * 0.20) +
-        ($stabilityComp * 0.10) +
-        ($signalComp * 0.10)
-    $health01 = [math]::Max(0.0, [math]::Min(1.0, [math]::Round($health01, 4)))
-
-    Update-QuarantineState -Name $name -State $state -Health01 $health01 -GatewayOk $gatewayOk -InternetOk $internetOk
-
-    $isDisabled = $false
-    if ($state.disabledUntil -and $state.disabledUntil -gt $now) {
-        $isDisabled = $true
-        $health01 = 0.0
-    }
-
-    $isQuarantined = $false
-    if ($state.quarantineUntil -and $state.quarantineUntil -gt $now) {
-        $isQuarantined = $true
-        $health01 = [math]::Min($health01, 0.2)
-    }
-
-    $healthScore = [int][math]::Round($health01 * 100.0)
-
-    $utilizationPct = 0.0
-    if ($estimatedCapacity -gt 0) {
-        $utilizationPct = [math]::Round(([math]::Min(1.0, [math]::Max(0.0, $state.lastTotalMbps / $estimatedCapacity)) * 100.0), 2)
-    }
-
-    # congestion hint counters
-    if ($utilizationPct -ge 90) {
-        $state.highUtilCount = [int]$state.highUtilCount + 1
-    } else {
-        $state.highUtilCount = 0
-    }
-    if ($utilizationPct -le 50) {
-        $state.lowUtilCount = [int]$state.lowUtilCount + 1
-    } else {
-        $state.lowUtilCount = 0
-    }
-
-    # anomaly detection
-    if ($state.avg30 -ge 20 -and $state.lastTotalMbps -lt ($state.avg30 * 0.4)) {
-        if (($now - $state.lastAnomalyAt).TotalSeconds -gt 30) {
-            $state.lastAnomalyAt = $now
-            Write-Event -Type 'anomaly' -Adapter $name -Message "$name throughput dropped sharply ($($state.lastTotalMbps) Mbps vs avg30=$($state.avg30) Mbps)." -Level 'warn'
+    # --- Internet latency (try primary then secondary target) ---
+    $inetLatencyRaw = 999
+    if ($ip) {
+        $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget -Timeout $pingTimeout
+        if ($inetLatencyRaw -ge 999) {
+            $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
         }
     }
+    $inetLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $inetLatencyRaw -Type 'internet' -Mode $Mode
 
+    # --- Update latency history and measure jitter ---
+    Update-LatencyHistory -Name $name -RawLatency $inetLatencyRaw
+    $jitter = Measure-Jitter -Name $name
+
+    # --- Update success rate ---
+    $gwOk = $gwLatencyRaw -lt 999
+    $inetOk = $inetLatencyRaw -lt 999
+    Update-SuccessRate -Name $name -GatewayOk $gwOk -InternetOk $inetOk
+
+    # --- Bandwidth calculation (with counter wraparound protection) ---
+    $stats = Get-NetAdapterStatistics -Name $name -ErrorAction SilentlyContinue
+    $rxBytes = if ($stats) { [long]$stats.ReceivedBytes } else { 0 }
+    $txBytes = if ($stats) { [long]$stats.SentBytes } else { 0 }
+
+    $rxSpeed = 0.0
+    $txSpeed = 0.0
+
+    if ($script:prevBytes.ContainsKey($name)) {
+        $prev = $script:prevBytes[$name]
+        $timeDelta = ((Get-Date) - $prev.time).TotalSeconds
+        if ($timeDelta -gt 0.5) {
+            $rxDelta = $rxBytes - $prev.rx
+            $txDelta = $txBytes - $prev.tx
+            if ($rxDelta -lt 0) { $rxDelta = $rxBytes }  # Counter wraparound
+            if ($txDelta -lt 0) { $txDelta = $txBytes }
+            $rxSpeed = [math]::Round($rxDelta * 8 / $timeDelta / 1000000, 2)
+            $txSpeed = [math]::Round($txDelta * 8 / $timeDelta / 1000000, 2)
+        }
+    }
+    $script:prevBytes[$name] = @{ rx = $rxBytes; tx = $txBytes; time = (Get-Date) }
+
+    # --- Packet loss estimation ---
+    $packetLoss = 0
+    if ($inetLatencyRaw -ge 999 -and $gwLatencyRaw -ge 999) { $packetLoss = 100 }
+    elseif ($inetLatencyRaw -ge 999) { $packetLoss = 50 }
+
+    # ===== Enhanced Health Score (0-100) -- 7-Factor Weighted =====
+    $score = 0
+    $hasIP = [bool]$ip
+
+    if ($hasIP) {
+        # Factor 1: Gateway reachable (15 points)
+        if ($gwLatencySmoothed -lt 998) {
+            $score += 15
+            if ($gwLatencySmoothed -lt 5) { $score += 3 }      # Ultra-low gateway bonus
+            elseif ($gwLatencySmoothed -lt 20) { $score += 2 }
+            elseif ($gwLatencySmoothed -lt 50) { $score += 1 }
+        }
+
+        # Factor 2: Internet reachable (25 points)
+        if ($inetLatencySmoothed -lt 998) {
+            $score += 25
+            if ($inetLatencySmoothed -lt 15) { $score += 5 }   # Ultra-low latency
+            elseif ($inetLatencySmoothed -lt 30) { $score += 3 }
+            elseif ($inetLatencySmoothed -lt 60) { $score += 2 }
+            elseif ($inetLatencySmoothed -lt 100) { $score += 1 }
+        }
+
+        # Factor 3: Jitter score (10 points) -- low jitter = stable
+        if ($jitter -lt 3) { $score += 10 }
+        elseif ($jitter -lt 10) { $score += 7 }
+        elseif ($jitter -lt 25) { $score += 4 }
+        elseif ($jitter -lt 50) { $score += 2 }
+
+        # Factor 4: Success rate (15 points)
+        $sr = if ($script:successRates.ContainsKey($name)) { $script:successRates[$name].rate } else { 100.0 }
+        $score += [math]::Round(($sr / 100) * 15)
+
+        # Factor 5: Bandwidth activity (10 points)
+        if ($rxSpeed -gt 1.0 -or $txSpeed -gt 1.0) {
+            $score += 10
+        } elseif ($rxSpeed -gt 0.1 -or $txSpeed -gt 0.1) {
+            $score += 7
+            if ($score -lt 50) { $score = 50 }  # If data flowing, adapter is working
+        }
+
+        # Factor 6: Stability score (15 points)
+        $stability = Get-StabilityScore -Name $name
+        $score += [math]::Round(($stability / 100) * 15)
+
+        # Factor 7: Trend bonus/penalty (10 points)
+        $trendSlope = Update-HealthTrend -Name $name -HealthScore $score
+        if ($trendSlope -gt 1) { $score += 5 }          # Improving trend
+        elseif ($trendSlope -gt 0) { $score += 3 }
+        elseif ($trendSlope -lt -2) { $score -= 5 }      # Declining trend
+        elseif ($trendSlope -lt -1) { $score -= 3 }
+
+        # Packet loss penalty
+        if ($packetLoss -gt 0) { $score -= [math]::Min(15, [int]($packetLoss / 5)) }
+
+        $score = [math]::Max(0, [math]::Min(100, [math]::Round($score)))
+
+        # --- Predictive degradation check ---
+        $isDegrading = Test-PredictiveDegradation -Name $name -Slope $trendSlope -CurrentHealth $score
+    } else {
+        $trendSlope = 0
+        $jitter = 0
+        $stability = 0
+        $isDegrading = $false
+    }
+
+    # --- Status ---
     $status = 'offline'
-    if ($isDisabled) {
-        $status = 'disabled'
-    } elseif ($isQuarantined) {
-        $status = 'quarantined'
-    } elseif ($health01 -gt 0.8) {
-        $status = 'healthy'
-    } elseif ($health01 -ge 0.5) {
-        $status = 'degraded'
-    } elseif ($health01 -ge 0.3) {
-        $status = 'poor'
-    } elseif ($health01 -gt 0.0) {
-        $status = 'failing'
+    if ($score -ge 70) { $status = 'healthy' }
+    elseif ($score -ge 40) { $status = 'degraded' }
+    elseif ($score -gt 0) { $status = 'critical' }
+
+    # --- State change events ---
+    $prevState = $script:prevStates[$name]
+    if ($prevState -and $prevState -ne $status) {
+        Write-Event -Type 'state_change' -Adapter $name -Message "Status: $prevState -> $status (HP: $score)"
     }
-
-    $shouldAvoidNew = $isDisabled -or $isQuarantined -or ($health01 -lt 0.5)
-    $forceDrain = $health01 -lt 0.3
-
-    $throughputHistory = @($state.throughputHistory | Select-Object -Last 60 | ForEach-Object {
-        @{ t = $_.t.ToString('HH:mm:ss'); rx = [double]$_.rx; tx = [double]$_.tx; total = [double]$_.total }
-    })
+    $script:prevStates[$name] = $status
 
     return @{
-        Name = $name
-        Type = $Iface.Type
-        InterfaceIndex = $Iface.InterfaceIndex
-        IPAddress = $ip
-        Gateway = $gateway
-        GatewayLatency = [math]::Round([double]$state.lastGatewayLatency, 2)
-        InternetLatency = [math]::Round([double]$state.lastInternetLatency, 2)
-        DNSLatency = [math]::Round([double]$state.lastDnsLatency, 2)
-        PacketLoss = [math]::Round([double]$state.lastPacketLoss, 2)
-        DownloadMbps = [math]::Round([double]$state.lastRxMbps, 3)
-        UploadMbps = [math]::Round([double]$state.lastTxMbps, 3)
-        ThroughputMbps = [math]::Round([double]$state.lastTotalMbps, 3)
-        ThroughputAvg5 = [math]::Round([double]$state.avg5, 3)
-        ThroughputAvg30 = [math]::Round([double]$state.avg30, 3)
-        ThroughputAvg60 = [math]::Round([double]$state.avg60, 3)
-        ThroughputHistory = $throughputHistory
-        EstimatedCapacityMbps = [math]::Round([double]$estimatedCapacity, 3)
-        UtilizationPct = [double]$utilizationPct
-        ProbeThroughputMbps = [math]::Round([double]$state.lastProbeMbps, 3)
-        HealthLatencyComponent = [double]$latencyComp
-        HealthThroughputComponent = [double]$throughputComp
-        HealthErrorComponent = [double]$errorComp
-        HealthStabilityComponent = [double]$stabilityComp
-        HealthSignalComponent = [double]$signalComp
-        HealthScore01 = [double]$health01
-        HealthScore = $healthScore
-        Status = $status
-        ErrorRate = [double]$state.errorRate
-        SuccessRate = [math]::Round((1.0 - [double]$state.errorRate) * 100.0, 2)
-        StabilityScore = [math]::Round([double]$stabilityComp * 100.0, 2)
-        HealthTrend = [math]::Round(([double]$state.avg5 - [double]$state.avg30), 3)
-        IsDegrading = [bool]($state.avg30 -gt 0 -and $state.avg5 -lt ($state.avg30 * 0.65))
-        IsQuarantined = [bool]$isQuarantined
-        QuarantineUntil = if ($state.quarantineUntil) { ([datetime]$state.quarantineUntil).ToString('o') } else { $null }
-        IsDisabled = [bool]$isDisabled
-        DisabledUntil = if ($state.disabledUntil) { ([datetime]$state.disabledUntil).ToString('o') } else { $null }
-        ReintroLimitFlows = [int]$state.reintroLimit
-        ShouldAvoidNewFlows = [bool]$shouldAvoidNew
-        ForceDrain = [bool]$forceDrain
-        ConsecutiveFailures = [int]$state.failStreak
-        QuarantineCount = [int]$state.quarantineCount
-        PublicIP = [string]$state.publicIp
-        SignalQuality = if ($Iface.SignalQuality) { [double]$Iface.SignalQuality } else { 0.0 }
-        LinkSpeedMbps = if ($Iface.LinkSpeedMbps) { [double]$Iface.LinkSpeedMbps } else { 0.0 }
-        SSID = if ($Iface.SSID) { [string]$Iface.SSID } else { '' }
-        DNSServers = $dnsServers
+        Name              = $name
+        Type              = $Interface.Type
+        InterfaceIndex    = $Interface.InterfaceIndex
+        GatewayLatency    = $gwLatencyRaw
+        GatewayLatencyEWMA = [math]::Round($gwLatencySmoothed, 1)
+        InternetLatency   = $inetLatencyRaw
+        InternetLatencyEWMA = [math]::Round($inetLatencySmoothed, 1)
+        Jitter            = $jitter
+        DownloadMbps      = $rxSpeed
+        UploadMbps        = $txSpeed
+        PacketLoss        = $packetLoss
+        HealthScore       = $score
+        Status            = $status
+        SuccessRate       = if ($script:successRates.ContainsKey($name)) { $script:successRates[$name].rate } else { 100.0 }
+        StabilityScore    = if ($script:stabilityScores.ContainsKey($name)) { $script:stabilityScores[$name] } else { 80 }
+        HealthTrend       = $trendSlope
+        IsDegrading       = $isDegrading
+        LinkSpeedMbps     = $Interface.LinkSpeedMbps
+        IPAddress         = $ip
+        Gateway           = $gateway
+        SSID              = $Interface.SSID
     }
-}
-
-function Get-SharedBottleneckState {
-    param([array]$Adapters)
-
-    $active = @($Adapters | Where-Object { $_.Status -notin @('offline', 'disabled') })
-    if ($active.Count -le 1) {
-        return @{ detected = $false; reason = 'insufficient_active_adapters'; sameGateway = $false; samePublicIp = $false }
-    }
-
-    $combined = [double](($active | Measure-Object -Property ThroughputMbps -Sum).Sum)
-    $maxSingle = [double](($active | Measure-Object -Property ThroughputMbps -Maximum).Maximum)
-
-    $gateways = @($active | ForEach-Object { [string]$_.Gateway } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    $sameGateway = $gateways.Count -eq 1
-
-    $ips = @($active | ForEach-Object { [string]$_.PublicIP } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    $samePublicIp = $ips.Count -eq 1 -and $ips.Count -gt 0
-
-    $throughputPlateau = $false
-    if ($maxSingle -gt 5) {
-        $throughputPlateau = $combined -le ($maxSingle * 1.2)
-    }
-
-    $detected = ($throughputPlateau -and ($sameGateway -or $samePublicIp))
-    $reason = if ($detected) {
-        "combined_throughput_close_to_single_adapter"
-    } elseif ($throughputPlateau) {
-        "throughput_plateau_without_gateway_or_publicip_match"
-    } else {
-        "no_shared_bottleneck_signature"
-    }
-
-    return @{
-        detected = [bool]$detected
-        reason = $reason
-        sameGateway = [bool]$sameGateway
-        samePublicIp = [bool]$samePublicIp
-        combinedMbps = [math]::Round($combined, 3)
-        maxSingleMbps = [math]::Round($maxSingle, 3)
-        combinedThroughputMbps = [math]::Round($combined, 3)
-        maxSingleThroughputMbps = [math]::Round($maxSingle, 3)
-        ratioCombinedToSingle = if ($maxSingle -gt 0) { [math]::Round($combined / $maxSingle, 4) } else { 0.0 }
-    }
-}
-
-function Update-RebalanceHint {
-    param([array]$Adapters)
-
-    $hint = @{ trigger = $false; overUtilized = @(); underUtilized = @(); reason = '' }
-    if (-not $Adapters -or $Adapters.Count -le 1) { return $hint }
-
-    $healthy = @($Adapters | Where-Object { $_.Status -in @('healthy', 'degraded', 'poor') -and -not $_.IsQuarantined -and -not $_.IsDisabled })
-    if ($healthy.Count -le 1) { return $hint }
-
-    $over = @($healthy | Where-Object { $_.UtilizationPct -ge 80 })
-    $under = @($healthy | Where-Object { $_.UtilizationPct -le 20 })
-
-    if ($over.Count -gt 0 -and $under.Count -gt 0) {
-        $hint.trigger = $true
-        $hint.overUtilized = @($over | ForEach-Object { $_.Name })
-        $hint.underUtilized = @($under | ForEach-Object { $_.Name })
-        $hint.reason = 'utilization_imbalance_over80_under20'
-    }
-
-    return $hint
 }
 
 function Rotate-CSVLog {
-    if (-not (Test-Path $LogFile)) { return }
-    try {
+    if (Test-Path $LogFile) {
         $lines = Get-Content $LogFile -ErrorAction SilentlyContinue
         if ($lines -and $lines.Count -gt $script:maxCSVLines) {
             $header = $lines[0]
-            $kept = $lines[([math]::Max(1, $lines.Count - 1000))..($lines.Count - 1)]
+            $kept = $lines[($lines.Count - 1000)..($lines.Count - 1)]
             @($header) + $kept | Set-Content $LogFile -Encoding UTF8 -Force
         }
-    } catch {}
+    }
 }
 
-function Flush-CsvBuffer {
-    if ($script:csvBuffer.Count -eq 0) { return }
-    try {
-        Add-Content -Path $LogFile -Value @($script:csvBuffer) -Encoding UTF8 -ErrorAction SilentlyContinue
-    } catch {}
-    $script:csvBuffer.Clear()
-}
+# --- Main Loop ---
+Write-Host ""
+Write-Host "  [InterfaceMonitor v4.0] Intelligent health monitoring every ${Interval}s" -ForegroundColor Yellow
+Write-Host "  Ping targets: $pingTarget, $pingTarget2" -ForegroundColor DarkGray
+Write-Host "  Multi-method: Gateway + Internet + DNS + Bandwidth" -ForegroundColor DarkGray
+Write-Host "  Intelligence: Dynamic EWMA + Jitter(w=$jitterWindowSize) + Trend(w=$healthTrendWindow) + Prediction(t=$degradationThreshold)" -ForegroundColor DarkGray
+Write-Host ""
 
+# Init CSV log (extended columns)
 if (-not (Test-Path $LogFile)) {
-    "Timestamp,Adapter,DownloadMbps,UploadMbps,ThroughputMbps,Avg5,Avg30,Avg60,GatewayLatency,InternetLatency,DNSLatency,PacketLoss,Health01,HealthScore,UtilizationPct,Status,ErrorRate,Quarantined,Disabled" | Set-Content $LogFile -Encoding UTF8
+    "Timestamp,Adapter,DownloadMbps,UploadMbps,GwLatency,GwLatencyEWMA,InetLatency,InetLatencyEWMA,Jitter,PacketLoss,HealthScore,SuccessRate,Stability,Trend" | Set-Content $LogFile -Encoding UTF8
 }
-
-Write-Host ""
-Write-Host "  [InterfaceMonitor v5.0] Adaptive health monitoring every ${Interval}s" -ForegroundColor Yellow
-Write-Host "  Throughput counters: 1s | Fast/Medium/Deep checks: 3s/10s/30s" -ForegroundColor DarkGray
-Write-Host "  Health model: latency(30) + throughput(30) + errors(20) + stability(10) + signal(10)" -ForegroundColor DarkGray
-Write-Host ""
 
 function Update-HealthState {
     try {
+        try {
+            $liveCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+            $activeMode = if ($liveCfg -and $liveCfg.mode) { $liveCfg.mode } else { 'maxspeed' }
+            $script:ewmaAlphaMap = Get-ConfiguredEwmaAlphaMap -LiveConfig $liveCfg
+        } catch {}
+
         if (-not (Test-Path $InterfacesFile)) {
             return $null
         }
 
         $ifaceData = Get-Content $InterfacesFile -Raw | ConvertFrom-Json
-        $ifaces = @($ifaceData.interfaces)
-        if ($ifaces.Count -eq 0) {
-            return @{
-                timestamp = (Get-Date).ToString('o')
-                version = '5.0'
-                uptime = [math]::Round(((Get-Date) - $script:startTime).TotalMinutes, 2)
-                adapters = @()
-                rebalance = @{ trigger = $false }
-                upstreamBottleneck = @{ detected = $false; reason = 'no_adapters' }
-            }
-        }
-
-        $counterSnapshot = Get-PerformanceCounterSamples -Interfaces $ifaces
         $healthResults = @()
 
-        foreach ($iface in $ifaces) {
+        foreach ($iface in $ifaceData.interfaces) {
             $ifHash = @{}
             $iface.PSObject.Properties | ForEach-Object { $ifHash[$_.Name] = $_.Value }
-            $health = Measure-InterfaceHealth -Iface $ifHash -CounterSnapshot $counterSnapshot
+
+            $health = Measure-InterfaceHealth -Interface $ifHash -Mode $activeMode
             $healthResults += $health
 
-            $script:csvBuffer.Add("$(Get-Date -Format 'o'),$($health.Name),$($health.DownloadMbps),$($health.UploadMbps),$($health.ThroughputMbps),$($health.ThroughputAvg5),$($health.ThroughputAvg30),$($health.ThroughputAvg60),$($health.GatewayLatency),$($health.InternetLatency),$($health.DNSLatency),$($health.PacketLoss),$($health.HealthScore01),$($health.HealthScore),$($health.UtilizationPct),$($health.Status),$($health.ErrorRate),$($health.IsQuarantined),$($health.IsDisabled)") | Out-Null
+            # Optional UI Console Output
+            # Write-Host "$($health.Name) health: $($health.HealthScore)"
+            
+            # CSV log (extended)
+            $logLine = "$(Get-Date -Format 'o'),$($health.Name),$($health.DownloadMbps),$($health.UploadMbps),$($health.GatewayLatency),$($health.GatewayLatencyEWMA),$($health.InternetLatency),$($health.InternetLatencyEWMA),$($health.Jitter),$($health.PacketLoss),$($health.HealthScore),$($health.SuccessRate),$($health.StabilityScore),$($health.HealthTrend)"
+            Add-Content $LogFile $logLine -ErrorAction SilentlyContinue
         }
 
-        # Refresh adapter-bound public IPs every 2 minutes for bottleneck diagnostics
-        if (((Get-Date) - $script:lastPublicIpRefresh).TotalSeconds -ge 120) {
-            foreach ($item in $healthResults) {
-                $state = Ensure-AdapterState -Name ([string]$item.Name)
-                $sourceIp = [string]$item.IPAddress
-                if (-not [string]::IsNullOrWhiteSpace($sourceIp) -and -not $item.IsDisabled) {
-                    $ip = Get-AdapterBoundPublicIP -SourceIP $sourceIp
-                    if ($ip) {
-                        $state.publicIp = $ip
-                        $state.publicIpCheckedAt = Get-Date
-                    }
-                }
-            }
-            $script:lastPublicIpRefresh = Get-Date
-        }
-
-        foreach ($item in $healthResults) {
-            $state = Ensure-AdapterState -Name ([string]$item.Name)
-            if ($state.publicIp) {
-                $item.PublicIP = [string]$state.publicIp
-            }
-        }
-
-        $rebalance = Update-RebalanceHint -Adapters $healthResults
-        if ($rebalance.trigger) {
-            $newSig = (($rebalance.overUtilized -join ',') + '|' + ($rebalance.underUtilized -join ','))
-            if (-not $script:rebalanceHint.signature -or $script:rebalanceHint.signature -ne $newSig) {
-                Write-Event -Type 'rebalance' -Adapter '' -Message "Rebalance hint: over-utilized [$($rebalance.overUtilized -join ', ')] under-utilized [$($rebalance.underUtilized -join ', ')]" -Level 'info'
-            }
-            $script:rebalanceHint = @{ signature = $newSig; at = (Get-Date).ToString('o') }
-        }
-
-        $upstreamBottleneck = Get-SharedBottleneckState -Adapters $healthResults
-        if ($upstreamBottleneck.detected) {
-            $sig = "bottleneck:$($upstreamBottleneck.reason):$($upstreamBottleneck.sameGateway):$($upstreamBottleneck.samePublicIp)"
-            if (-not $script:globalAnomalyCounter.ContainsKey($sig)) {
-                Write-Event -Type 'bottleneck' -Adapter '' -Message "Potential shared upstream bottleneck detected (reason=$($upstreamBottleneck.reason), sameGateway=$($upstreamBottleneck.sameGateway), samePublicIp=$($upstreamBottleneck.samePublicIp))." -Level 'warn'
-            }
-            $script:globalAnomalyCounter[$sig] = (Get-Date).ToString('o')
-        }
-
+        # Write enriched health data
         $healthOutput = @{
-            timestamp = (Get-Date).ToString('o')
-            version = '5.0'
-            uptime = [math]::Round(((Get-Date) - $script:startTime).TotalMinutes, 2)
-            adapters = $healthResults
-            rebalance = $rebalance
-            upstreamBottleneck = $upstreamBottleneck
-            checkCadenceSec = @{
-                throughputSample = $script:throughputSampleSec
-                fast = $script:fastCheckSec
-                medium = $script:mediumCheckSec
-                deep = $script:deepCheckSec
-            }
+            timestamp   = (Get-Date).ToString('o')
+            version     = '4.0'
+            uptime      = [math]::Round(((Get-Date) - $script:startTime).TotalMinutes, 1)
+            adapters    = $healthResults
+            degradation = $script:degradationWarnings
         }
+        Write-AtomicJson -Path $HealthFile -Data $healthOutput -Depth 4
 
-        Write-AtomicJson -Path $HealthFile -Data $healthOutput -Depth 8
-
+        # Rotate CSV and Events log every 50 loops
         $script:loopCount++
-        if (($script:loopCount % 5) -eq 0 -or ((Get-Date) - $script:lastCsvFlush).TotalSeconds -ge 5) {
-            Flush-CsvBuffer
-            $script:lastCsvFlush = Get-Date
-        }
-
-        if (($script:loopCount % 50) -eq 0) {
+        if ($script:loopCount % 50 -eq 0) {
             Rotate-CSVLog
             try { & (Join-Path $projectDir "core\LogRotation.ps1") } catch {}
         }
-
+        
         return $healthOutput
+
     } catch {
         Write-Host "  [InterfaceMonitor] Error: $_" -ForegroundColor Red
         return $null
     }
 }
+
+

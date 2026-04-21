@@ -19,7 +19,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$Port = 0
+    [int]$Port = 9090
 )
 
 $dashDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
@@ -32,22 +32,6 @@ $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
 $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
-$script:AuthFailureByIp = [hashtable]::Synchronized(@{})
-$script:AuthRateLock = [object]::new()
-$script:AuthFailWindowSeconds = 60
-$script:AuthFailLimit = 10
-$script:AuthBlockSeconds = 300
-$script:DashboardInstanceMutex = New-Object System.Threading.Mutex($false, "Global\NetFusion-Dashboard")
-$script:DashboardInstanceHeld = $false
-try {
-    $script:DashboardInstanceHeld = $script:DashboardInstanceMutex.WaitOne(0, $false)
-} catch [System.Threading.AbandonedMutexException] {
-    $script:DashboardInstanceHeld = $true
-}
-if (-not $script:DashboardInstanceHeld) {
-    Write-Host "  [Dashboard] Another dashboard instance is already running." -ForegroundColor Yellow
-    exit 1
-}
 
 function Write-AtomicJson {
     param(
@@ -141,92 +125,18 @@ function Compare-FixedToken {
     return ($diff -eq 0)
 }
 
-function Get-Utf8NoBomEncoding {
-    return [System.Text.UTF8Encoding]::new($false)
-}
-
-function Write-DashboardTokenFilesAtomically {
-    param(
-        [string]$Token,
-        [string]$Hash
-    )
-
-    $enc = Get-Utf8NoBomEncoding
-    $tokenTemp = Join-Path $configDir ([System.IO.Path]::GetRandomFileName())
-    $hashTemp = Join-Path $configDir ([System.IO.Path]::GetRandomFileName())
-
-    $tokenExisted = Test-Path $tokenPath
-    $hashExisted = Test-Path $tokenHashPath
-    $tokenOriginal = $null
-    $hashOriginal = $null
-
-    if ($tokenExisted) {
-        try { $tokenOriginal = [System.IO.File]::ReadAllText($tokenPath, $enc) } catch {}
-    }
-    if ($hashExisted) {
-        try { $hashOriginal = [System.IO.File]::ReadAllText($tokenHashPath, $enc) } catch {}
-    }
-
-    try {
-        [System.IO.File]::WriteAllText($tokenTemp, $Token, $enc)
-        [System.IO.File]::WriteAllText($hashTemp, $Hash, $enc)
-
-        if ($tokenExisted) {
-            [System.IO.File]::Replace($tokenTemp, $tokenPath, $null, $true)
-        } else {
-            [System.IO.File]::Move($tokenTemp, $tokenPath)
-        }
-
-        if ($hashExisted) {
-            [System.IO.File]::Replace($hashTemp, $tokenHashPath, $null, $true)
-        } else {
-            [System.IO.File]::Move($hashTemp, $tokenHashPath)
-        }
-    } catch {
-        # Roll back to original state if either replacement fails.
-        try {
-            if ($tokenExisted) {
-                [System.IO.File]::WriteAllText($tokenPath, [string]$tokenOriginal, $enc)
-            } else {
-                Remove-Item $tokenPath -Force -ErrorAction SilentlyContinue
-            }
-        } catch {}
-
-        try {
-            if ($hashExisted) {
-                [System.IO.File]::WriteAllText($tokenHashPath, [string]$hashOriginal, $enc)
-            } else {
-                Remove-Item $tokenHashPath -Force -ErrorAction SilentlyContinue
-            }
-        } catch {}
-
-        throw
-    } finally {
-        Remove-Item $tokenTemp -Force -ErrorAction SilentlyContinue
-        Remove-Item $hashTemp -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Ensure-DashboardToken {
     $existing = ''
     if (Test-Path $tokenPath) {
         try { $existing = (Get-Content $tokenPath -Raw -ErrorAction Stop).Trim() } catch {}
     }
-    $tokenRegenerated = $false
     if ([string]::IsNullOrWhiteSpace($existing) -or $existing.Length -lt 24 -or $existing -in $legacyDashboardTokens) {
         $existing = New-RandomSecret -Length 32
-        $tokenRegenerated = $true
+        Set-Content $tokenPath -Value $existing -NoNewline -Force -Encoding UTF8
     }
 
     $hash = Get-TokenHash -Token $existing
-    $storedHash = ''
-    if (Test-Path $tokenHashPath) {
-        try { $storedHash = (Get-Content $tokenHashPath -Raw -ErrorAction Stop).Trim() } catch {}
-    }
-    $needsWrite = $tokenRegenerated -or [string]::IsNullOrWhiteSpace($storedHash) -or -not (Compare-FixedToken -Left $storedHash -Right $hash)
-    if ($needsWrite) {
-        Write-DashboardTokenFilesAtomically -Token $existing -Hash $hash
-    }
+    Set-Content $tokenHashPath -Value $hash -NoNewline -Force -Encoding UTF8
     return $existing
 }
 
@@ -279,7 +189,7 @@ function Test-DashboardTokenValue {
     }
     if ([string]::IsNullOrWhiteSpace($storedHash)) {
         $storedHash = Get-TokenHash -Token $global:DashToken
-        try { Write-DashboardTokenFilesAtomically -Token $global:DashToken -Hash $storedHash } catch {}
+        try { Set-Content $tokenHashPath -Value $storedHash -NoNewline -Force -Encoding UTF8 } catch {}
     }
 
     return (Compare-FixedToken -Left (Get-TokenHash -Token $Token) -Right $storedHash)
@@ -317,147 +227,6 @@ function Get-RequestAuthContext {
         Source = $source
         HeaderTokenPresent = -not [string]::IsNullOrWhiteSpace($headerToken)
         QueryTokenPresent = -not [string]::IsNullOrWhiteSpace($queryToken)
-    }
-}
-
-function Get-ClientIpAddress {
-    param([System.Net.Sockets.TcpClient]$Client)
-    try {
-        $remote = $Client.Client.RemoteEndPoint -as [System.Net.IPEndPoint]
-        if ($remote) { return $remote.Address.ToString() }
-    } catch {}
-    return 'unknown'
-}
-
-function Test-AuthRateLimited {
-    param([string]$ClientIP)
-
-    if ([string]::IsNullOrWhiteSpace($ClientIP)) { $ClientIP = 'unknown' }
-    $now = Get-Date
-
-    [System.Threading.Monitor]::Enter($script:AuthRateLock)
-    try {
-        if (-not $script:AuthFailureByIp.ContainsKey($ClientIP)) {
-            $script:AuthFailureByIp[$ClientIP] = @{
-                failures = [System.Collections.Generic.List[datetime]]::new()
-                blockedUntil = [datetime]::MinValue
-            }
-        }
-
-        $entry = $script:AuthFailureByIp[$ClientIP]
-        $cutoff = $now.AddSeconds(-$script:AuthFailWindowSeconds)
-        for ($i = $entry.failures.Count - 1; $i -ge 0; $i--) {
-            if ($entry.failures[$i] -lt $cutoff) { $entry.failures.RemoveAt($i) }
-        }
-
-        if ($entry.blockedUntil -gt $now) {
-            return @{
-                IsBlocked = $true
-                RetryAfterSec = [int][math]::Max(1, [math]::Ceiling(($entry.blockedUntil - $now).TotalSeconds))
-            }
-        }
-
-        if ($entry.blockedUntil -ne [datetime]::MinValue) {
-            $entry.blockedUntil = [datetime]::MinValue
-            $entry.failures.Clear()
-        }
-
-        return @{
-            IsBlocked = $false
-            RetryAfterSec = 0
-        }
-    } finally {
-        [System.Threading.Monitor]::Exit($script:AuthRateLock)
-    }
-}
-
-function Register-AuthFailure {
-    param([string]$ClientIP)
-
-    if ([string]::IsNullOrWhiteSpace($ClientIP)) { $ClientIP = 'unknown' }
-    $now = Get-Date
-
-    [System.Threading.Monitor]::Enter($script:AuthRateLock)
-    try {
-        if (-not $script:AuthFailureByIp.ContainsKey($ClientIP)) {
-            $script:AuthFailureByIp[$ClientIP] = @{
-                failures = [System.Collections.Generic.List[datetime]]::new()
-                blockedUntil = [datetime]::MinValue
-            }
-        }
-
-        $entry = $script:AuthFailureByIp[$ClientIP]
-        $cutoff = $now.AddSeconds(-$script:AuthFailWindowSeconds)
-        for ($i = $entry.failures.Count - 1; $i -ge 0; $i--) {
-            if ($entry.failures[$i] -lt $cutoff) { $entry.failures.RemoveAt($i) }
-        }
-
-        $entry.failures.Add($now)
-        if ($entry.failures.Count -ge $script:AuthFailLimit) {
-            $entry.blockedUntil = $now.AddSeconds($script:AuthBlockSeconds)
-            $entry.failures.Clear()
-        }
-    } finally {
-        [System.Threading.Monitor]::Exit($script:AuthRateLock)
-    }
-}
-
-function Clear-AuthFailureHistory {
-    param([string]$ClientIP)
-
-    if ([string]::IsNullOrWhiteSpace($ClientIP)) { return }
-
-    [System.Threading.Monitor]::Enter($script:AuthRateLock)
-    try {
-        if ($script:AuthFailureByIp.ContainsKey($ClientIP)) {
-            [void]$script:AuthFailureByIp.Remove($ClientIP)
-        }
-    } finally {
-        [System.Threading.Monitor]::Exit($script:AuthRateLock)
-    }
-}
-
-function Read-HttpRequestText {
-    param(
-        [System.IO.Stream]$Stream,
-        [int]$MaxBytes = 131072
-    )
-
-    $buffer = New-Object byte[] 8192
-    $ms = New-Object System.IO.MemoryStream
-    try {
-        $headerEnd = -1
-        $contentLength = 0
-        $targetLength = 0
-
-        while ($ms.Length -lt $MaxBytes) {
-            $read = $Stream.Read($buffer, 0, $buffer.Length)
-            if ($read -le 0) { break }
-
-            $ms.Write($buffer, 0, $read)
-            $raw = [System.Text.Encoding]::UTF8.GetString($ms.GetBuffer(), 0, [int]$ms.Length)
-
-            if ($headerEnd -lt 0) {
-                $headerEnd = $raw.IndexOf("`r`n`r`n")
-                if ($headerEnd -ge 0) {
-                    $headerText = $raw.Substring(0, $headerEnd + 4)
-                    if ($headerText -match '(?im)^Content-Length:\s*(\d+)\s*$') {
-                        $contentLength = [int]$Matches[1]
-                    } else {
-                        $contentLength = 0
-                    }
-                    $targetLength = $headerEnd + 4 + $contentLength
-                    if ($ms.Length -ge $targetLength) { break }
-                }
-            } elseif ($targetLength -gt 0 -and $ms.Length -ge $targetLength) {
-                break
-            }
-        }
-
-        if ($ms.Length -le 0) { return '' }
-        return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
-    } finally {
-        try { $ms.Dispose() } catch {}
     }
 }
 
@@ -504,58 +273,6 @@ function Test-IsMutationAuthorized {
     return (Test-IsLocalReferer $Headers['referer'])
 }
 
-function Get-DataFreshness {
-    param(
-        [string]$Path,
-        [AllowNull()][object]$Data,
-        [string]$TimestampField = 'timestamp',
-        [int]$StaleAfterSec = 8
-    )
-
-    $ageSec = [double]::PositiveInfinity
-    $source = 'none'
-
-    if ($Data -and $Data.PSObject.Properties[$TimestampField] -and $Data.$TimestampField) {
-        try {
-            $ts = [datetime]$Data.$TimestampField
-            $ageSec = [double]((Get-Date) - $ts).TotalSeconds
-            $source = 'payload'
-        } catch {}
-    }
-
-    if ([double]::IsInfinity($ageSec) -and (Test-Path $Path)) {
-        try {
-            $ageSec = [double]((Get-Date) - (Get-Item $Path).LastWriteTime).TotalSeconds
-            $source = 'file'
-        } catch {}
-    }
-
-    if ([double]::IsInfinity($ageSec)) { $ageSec = 999999.0 }
-    if ($ageSec -lt 0) { $ageSec = 0.0 }
-
-    return @{
-        ageSec = [math]::Round($ageSec, 2)
-        isStale = ($ageSec -gt $StaleAfterSec)
-        staleAfterSec = [int]$StaleAfterSec
-        source = $source
-    }
-}
-
-function Format-IsoTimestamp {
-    param([AllowNull()][object]$Value)
-
-    if ($null -eq $Value) { return '' }
-    try {
-        if ($Value -is [datetime]) {
-            return ([datetime]$Value).ToString('o')
-        }
-        $parsed = [datetime]$Value
-        return $parsed.ToString('o')
-    } catch {
-        return (Normalize-DisplayText $Value 64)
-    }
-}
-
 function Get-ClientInterfaces {
     $data = Read-JsonFile (Join-Path $configDir "interfaces.json")
     $interfaces = @()
@@ -570,54 +287,28 @@ function Get-ClientInterfaces {
             }
         }
     }
-    $sourceTs = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
-    return @{ timestamp = $sourceTs; version = '6.2'; count = $interfaces.Count; interfaces = $interfaces }
+    return @{ timestamp = (Get-Date).ToString('o'); version = '6.2'; count = $interfaces.Count; interfaces = $interfaces }
 }
 
 function Get-ClientHealth {
-    $healthPath = Join-Path $configDir "health.json"
-    $data = Read-JsonFile $healthPath
+    $data = Read-JsonFile (Join-Path $configDir "health.json")
     $adapters = @()
     $degradation = @{}
-    $rebalance = @{ trigger = $false; overUtilized = @(); underUtilized = @(); reason = '' }
-    $upstreamBottleneck = @{ detected = $false; reason = '' }
     if ($data -and $data.adapters) {
         foreach ($a in @($data.adapters)) {
-            $healthScore = if ($null -ne $a.HealthScore) { [double]$a.HealthScore } else { 0.0 }
-            $healthScore01 = if ($null -ne $a.HealthScore01) { [double]$a.HealthScore01 } else { [math]::Round($healthScore / 100.0, 3) }
             $adapters += @{
                 Name = Normalize-DisplayText $a.Name 64
                 Type = Normalize-DisplayText $a.Type 24
-                HealthScore = $healthScore
-                HealthScore01 = $healthScore01
+                HealthScore = if ($null -ne $a.HealthScore) { [double]$a.HealthScore } else { 0 }
                 InternetLatency = if ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
                 InternetLatencyEWMA = if ($null -ne $a.InternetLatencyEWMA) { [double]$a.InternetLatencyEWMA } elseif ($null -ne $a.InternetLatency) { [double]$a.InternetLatency } else { 999 }
-                GatewayLatency = if ($null -ne $a.GatewayLatency) { [double]$a.GatewayLatency } else { 999 }
-                DNSLatency = if ($null -ne $a.DNSLatency) { [double]$a.DNSLatency } else { 999 }
-                PacketLoss = if ($null -ne $a.PacketLoss) { [double]$a.PacketLoss } else { 0 }
                 Jitter = if ($null -ne $a.Jitter) { [double]$a.Jitter } else { 0 }
                 DownloadMbps = if ($null -ne $a.DownloadMbps) { [double]$a.DownloadMbps } else { 0 }
                 UploadMbps = if ($null -ne $a.UploadMbps) { [double]$a.UploadMbps } else { 0 }
-                ThroughputMbps = if ($null -ne $a.ThroughputMbps) { [double]$a.ThroughputMbps } else { 0 }
-                ThroughputAvg5 = if ($null -ne $a.ThroughputAvg5) { [double]$a.ThroughputAvg5 } else { 0 }
-                ThroughputAvg30 = if ($null -ne $a.ThroughputAvg30) { [double]$a.ThroughputAvg30 } else { 0 }
-                ThroughputAvg60 = if ($null -ne $a.ThroughputAvg60) { [double]$a.ThroughputAvg60 } else { 0 }
-                ThroughputHistory = if ($a.ThroughputHistory) { @($a.ThroughputHistory) } else { @() }
-                EstimatedCapacityMbps = if ($null -ne $a.EstimatedCapacityMbps) { [double]$a.EstimatedCapacityMbps } else { 0 }
-                UtilizationPct = if ($null -ne $a.UtilizationPct) { [double]$a.UtilizationPct } else { 0 }
-                ErrorRate = if ($null -ne $a.ErrorRate) { [double]$a.ErrorRate } else { 0 }
                 SuccessRate = if ($null -ne $a.SuccessRate) { [double]$a.SuccessRate } else { 100 }
                 StabilityScore = if ($null -ne $a.StabilityScore) { [double]$a.StabilityScore } else { 80 }
                 HealthTrend = if ($null -ne $a.HealthTrend) { [double]$a.HealthTrend } else { 0 }
                 IsDegrading = [bool]$a.IsDegrading
-                IsQuarantined = [bool]$a.IsQuarantined
-                IsDisabled = [bool]$a.IsDisabled
-                ShouldAvoidNewFlows = [bool]$a.ShouldAvoidNewFlows
-                ForceDrain = [bool]$a.ForceDrain
-                ReintroLimitFlows = if ($null -ne $a.ReintroLimitFlows) { [int]$a.ReintroLimitFlows } else { 0 }
-                ActiveFlows = if ($null -ne $a.ActiveFlows) { [int]$a.ActiveFlows } else { 0 }
-                Status = Normalize-DisplayText $a.Status 24
-                PublicIP = Normalize-DisplayText $a.PublicIP 64
             }
         }
     }
@@ -631,44 +322,11 @@ function Get-ClientHealth {
             }
         }
     }
-    if ($data -and $data.rebalance) {
-        $rebalance = @{
-            trigger = [bool]$data.rebalance.trigger
-            overUtilized = if ($data.rebalance.overUtilized) { @($data.rebalance.overUtilized | ForEach-Object { Normalize-DisplayText $_ 64 }) } else { @() }
-            underUtilized = if ($data.rebalance.underUtilized) { @($data.rebalance.underUtilized | ForEach-Object { Normalize-DisplayText $_ 64 }) } else { @() }
-            reason = Normalize-DisplayText $data.rebalance.reason 96
-        }
-    }
-    if ($data -and $data.upstreamBottleneck) {
-        $upstreamBottleneck = @{
-            detected = [bool]$data.upstreamBottleneck.detected
-            reason = Normalize-DisplayText $data.upstreamBottleneck.reason 96
-            sameGateway = [bool]$data.upstreamBottleneck.sameGateway
-            samePublicIp = [bool]$data.upstreamBottleneck.samePublicIp
-            ratioCombinedToSingle = if ($null -ne $data.upstreamBottleneck.ratioCombinedToSingle) { [double]$data.upstreamBottleneck.ratioCombinedToSingle } else { 0 }
-            combinedThroughputMbps = if ($null -ne $data.upstreamBottleneck.combinedThroughputMbps) { [double]$data.upstreamBottleneck.combinedThroughputMbps } else { 0 }
-            maxSingleThroughputMbps = if ($null -ne $data.upstreamBottleneck.maxSingleThroughputMbps) { [double]$data.upstreamBottleneck.maxSingleThroughputMbps } else { 0 }
-        }
-    }
-    $freshness = Get-DataFreshness -Path $healthPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
-    return @{
-        timestamp = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
-        version = '6.2'
-        uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }
-        adapters = $adapters
-        degradation = $degradation
-        rebalance = $rebalance
-        upstreamBottleneck = $upstreamBottleneck
-        ageSec = [double]$freshness.ageSec
-        isStale = [bool]$freshness.isStale
-        staleAfterSec = [int]$freshness.staleAfterSec
-        freshnessSource = Normalize-DisplayText $freshness.source 24
-    }
+    return @{ timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; version = '6.2'; uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }; adapters = $adapters; degradation = $degradation }
 }
 
 function Get-ClientProxy {
-    $proxyPath = Join-Path $configDir "proxy-stats.json"
-    $data = Read-JsonFile $proxyPath
+    $data = Read-JsonFile (Join-Path $configDir "proxy-stats.json")
     $adapters = @()
     $activePerAdapter = @{}
     $connectionTypes = @{}
@@ -684,49 +342,12 @@ function Get-ClientProxy {
                 latency = if ($null -ne $a.latency) { [double]$a.latency } else { 999 }
                 jitter = if ($null -ne $a.jitter) { [double]$a.jitter } else { 0 }
                 isDegrading = [bool]$a.isDegrading
-                activeFlowCount = if ($null -ne $a.activeFlowCount) { [int]$a.activeFlowCount } elseif ($null -ne $a.flowCount) { [int]$a.flowCount } else { 0 }
-                flowCount = if ($null -ne $a.flowCount) { [int]$a.flowCount } elseif ($null -ne $a.activeFlowCount) { [int]$a.activeFlowCount } else { 0 }
-                measuredLoadMbps = if ($null -ne $a.measuredLoadMbps) { [double]$a.measuredLoadMbps } else { 0 }
-                estimatedCapacityMbps = if ($null -ne $a.estimatedCapacityMbps) { [double]$a.estimatedCapacityMbps } else { 0 }
-                effectiveCapacityMbps = if ($null -ne $a.effectiveCapacityMbps) { [double]$a.effectiveCapacityMbps } else { 0 }
-                availableCapacityMbps = if ($null -ne $a.availableCapacityMbps) { [double]$a.availableCapacityMbps } else { 0 }
-                utilizationPct = if ($null -ne $a.utilizationPct) { [double]$a.utilizationPct } else { 0 }
-                avgFlowThroughputMbps = if ($null -ne $a.avgFlowThroughputMbps) { [double]$a.avgFlowThroughputMbps } elseif ($null -ne $a.averageFlowThroughputMbps) { [double]$a.averageFlowThroughputMbps } else { 0 }
-                bytesWindow = if ($null -ne $a.bytesWindow) { [double]$a.bytesWindow } elseif ($null -ne $a.totalBytesWindow) { [double]$a.totalBytesWindow } else { 0 }
-                score01 = if ($null -ne $a.score01) { [double]$a.score01 } elseif ($null -ne $a.health01) { [double]$a.health01 } else { 0 }
-                errorRate = if ($null -ne $a.errorRate) { [double]$a.errorRate } else { 0 }
-                shouldAvoidNewFlows = [bool]$a.shouldAvoidNewFlows
-                forceDrain = [bool]$a.forceDrain
-                isQuarantined = [bool]$a.isQuarantined
-                isDisabled = [bool]$a.isDisabled
             }
         }
     }
     if ($data -and $data.activePerAdapter) { foreach ($prop in $data.activePerAdapter.PSObject.Properties) { $activePerAdapter[(Normalize-DisplayText $prop.Name 64)] = [int]$prop.Value } }
     if ($data -and $data.connectionTypes) { foreach ($prop in $data.connectionTypes.PSObject.Properties) { $connectionTypes[(Normalize-DisplayText $prop.Name 24)] = [int]$prop.Value } }
-    $freshness = Get-DataFreshness -Path $proxyPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
-    return @{
-        running = if ($data) { [bool]$data.running } else { $false }
-        timestamp = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
-        totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }
-        totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }
-        activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }
-        activePerAdapter = $activePerAdapter
-        adapterCount = $adapters.Count
-        adapters = $adapters
-        connectionTypes = $connectionTypes
-        safeMode = if ($data) { [bool]$data.safeMode } else { $false }
-        currentMaxThreads = if ($data -and $null -ne $data.currentMaxThreads) { [int]$data.currentMaxThreads } else { 0 }
-        rebalance = if ($data -and $data.rebalance) { $data.rebalance } else { @{ trigger = $false } }
-        upstreamBottleneck = if ($data -and $data.upstreamBottleneck) { $data.upstreamBottleneck } else { @{ detected = $false } }
-        totalMeasuredLoadMbps = if ($data -and $null -ne $data.totalMeasuredLoadMbps) { [double]$data.totalMeasuredLoadMbps } else { 0 }
-        totalEstimatedCapacityMbps = if ($data -and $null -ne $data.totalEstimatedCapacityMbps) { [double]$data.totalEstimatedCapacityMbps } else { 0 }
-        connectionRegistrySize = if ($data -and $null -ne $data.connectionRegistrySize) { [int]$data.connectionRegistrySize } else { 0 }
-        ageSec = [double]$freshness.ageSec
-        isStale = [bool]$freshness.isStale
-        staleAfterSec = [int]$freshness.staleAfterSec
-        freshnessSource = Normalize-DisplayText $freshness.source 24
-    }
+    return @{ running = if ($data) { [bool]$data.running } else { $false }; timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }; totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }; totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }; activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }; activePerAdapter = $activePerAdapter; adapterCount = $adapters.Count; adapters = $adapters; connectionTypes = $connectionTypes; safeMode = if ($data) { [bool]$data.safeMode } else { $false }; currentMaxThreads = if ($data -and $null -ne $data.currentMaxThreads) { [int]$data.currentMaxThreads } else { 0 } }
 }
 
 function Get-ClientConfig {
@@ -967,15 +588,6 @@ Write-Host "    Local Auto-Login + Reduced Telemetry Surface      " -ForegroundC
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
-if ($Port -le 0) {
-    $cfg = Read-JsonFile (Join-Path $configDir "config.json")
-    if ($cfg -and $cfg.dashboardPort) {
-        $Port = [int]$cfg.dashboardPort
-    } else {
-        $Port = 9090
-    }
-}
-
 $listener = $null
 try {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
@@ -1005,8 +617,10 @@ try {
         $stream.ReadTimeout = 5000
 
         try {
-            $requestText = Read-HttpRequestText -Stream $stream -MaxBytes 131072
-            if ([string]::IsNullOrWhiteSpace($requestText)) { $stream.Close(); $client.Close(); continue }
+            $buffer = New-Object byte[] 65536
+            $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+            if ($bytesRead -le 0) { $stream.Close(); $client.Close(); continue }
+            $requestText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)
 
             $firstLine = ($requestText -split "`r`n")[0]
             $reqParts = $firstLine -split ' '
@@ -1021,7 +635,6 @@ try {
             $headers = Parse-Headers -RequestText $requestText
             $queryParams = Parse-QueryParams -Path $path
             $authContext = Get-RequestAuthContext -Headers $headers -QueryParams $queryParams
-            $clientIp = Get-ClientIpAddress -Client $client
             $bodyText = Get-RequestBody -RequestText $requestText
             $autoLoginCookie = Get-AutoLoginCookie
 
@@ -1046,23 +659,10 @@ try {
                 continue
             }
 
-            if ($authContext.IsAuthenticated) {
-                Clear-AuthFailureHistory -ClientIP $clientIp
-            } else {
-                $rateLimit = Test-AuthRateLimited -ClientIP $clientIp
-                if ($rateLimit.IsBlocked) {
-                    $retryAfter = [int][math]::Max(1, $rateLimit.RetryAfterSec)
-                    $body = [System.Text.Encoding]::UTF8.GetBytes("{""error"":""rate_limited"",""retryAfterSec"":$retryAfter}")
-                    Send-TcpResponse -Stream $stream -StatusCode 429 -StatusText 'Too Many Requests' -ContentType 'application/json; charset=utf-8' -Body $body -ExtraHeaders @{ 'Retry-After' = $retryAfter }
-                    continue
-                }
-            }
-
             if (-not $authContext.IsAuthenticated) {
                 if ($parsedPath -eq '/favicon.ico') {
                     Send-TcpResponse -Stream $stream -StatusCode 204 -StatusText 'No Content' -ContentType 'text/plain; charset=utf-8' -Body ([byte[]]@())
                 } else {
-                    Register-AuthFailure -ClientIP $clientIp
                     Send-AuthenticationChallenge -Stream $stream
                 }
                 continue
@@ -1200,11 +800,5 @@ try {
     }
 } finally {
     if ($listener) { $listener.Stop() }
-    if ($script:DashboardInstanceHeld -and $script:DashboardInstanceMutex) {
-        try { $script:DashboardInstanceMutex.ReleaseMutex() } catch {}
-    }
-    if ($script:DashboardInstanceMutex) {
-        try { $script:DashboardInstanceMutex.Dispose() } catch {}
-    }
     Write-Host "`n  Dashboard stopped." -ForegroundColor Yellow
 }

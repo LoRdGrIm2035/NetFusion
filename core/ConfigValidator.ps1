@@ -49,7 +49,7 @@ try {
 }
 
 $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
-$script:warnings = 0
+$warnings = 0
 
 function Check-Number($obj, $prop, $min, $max, $default) {
     if ($null -eq $obj.$prop) {
@@ -109,17 +109,7 @@ Check-Number $config 'proxyPort' 1024 65535 8080
 Check-Number $config 'dashboardPort' 1024 65535 9090
 Check-Enum $config 'mode' $validModes 'maxspeed'
 Check-Bool $config 'dashboardAllowLAN' $false
-$legacyQuic = $config.PSObject.Properties['blockQUICOnSecondaryAdapters']
-$newQuic = $config.PSObject.Properties['blockQUICForUnproxiedTraffic']
-if (-not $newQuic -and $legacyQuic) {
-    $config | Add-Member -MemberType NoteProperty -Name 'blockQUICForUnproxiedTraffic' -Value ([bool]$legacyQuic.Value) -Force
-    $script:configChanged = $true
-}
-Check-Bool $config 'blockQUICForUnproxiedTraffic' $true
-if ($legacyQuic) {
-    [void]$config.PSObject.Properties.Remove('blockQUICOnSecondaryAdapters')
-    $script:configChanged = $true
-}
+Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
 if ($config.proxyPort -eq $config.dashboardPort) {
     Write-Host "  [Config] WARNING: 'dashboardPort' cannot match 'proxyPort'. Using 9090." -ForegroundColor Yellow
     $config.dashboardPort = 9090
@@ -129,119 +119,11 @@ if ($config.proxyPort -eq $config.dashboardPort) {
 
 # Validate proxy settings
 if ($config.proxy) {
-    Check-Number $config.proxy 'minThreads' 8 512 64
-    Check-Number $config.proxy 'maxThreads' 16 1024 768
+    Check-Number $config.proxy 'minThreads' 4 128 64
+    Check-Number $config.proxy 'maxThreads' 8 256 256
     Check-Number $config.proxy 'bufferSize' 8192 1048576 65536
-    Check-Number $config.proxy 'jobTimeoutSec' 10 86400 120
+    Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
     Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 300
-    Check-Number $config.proxy 'connectTimeout' 1000 30000 7000
-    Check-Number $config.proxy 'socketIoTimeout' 5000 300000 45000
-    Check-Number $config.proxy 'listenerBacklog' 128 8192 2048
-    Check-Number $config.proxy 'staleJobTimeoutSec' 0 86400 0
-    Check-Number $config.proxy 'httpsBulkPromotionHostThreshold' 1 32 1
-    Check-Number $config.proxy 'httpsBulkPromotionGlobalThreshold' 1 128 4
-    Check-Number $config.proxy 'retryWeightFloor' 0.1 3.0 0.25
-    Check-Number $config.proxy 'bulkHeadroomWeight' 0.0 1.0 0.35
-    Check-Number $config.proxy 'bulkPressureThreshold' 4 512 10
-    if ($null -eq $config.proxy.retryPolicy) {
-        $config.proxy | Add-Member -MemberType NoteProperty -Name retryPolicy -Value 'leastLoaded' -Force
-        $script:configChanged = $true
-    } else {
-        $retryPolicyNorm = ([string]$config.proxy.retryPolicy).Trim().ToLowerInvariant()
-        if ($retryPolicyNorm -eq 'leastloaded') {
-            if ($config.proxy.retryPolicy -ne 'leastLoaded') {
-                $config.proxy.retryPolicy = 'leastLoaded'
-                $script:configChanged = $true
-            }
-        } elseif ($retryPolicyNorm -eq 'weightedrandom') {
-            if ($config.proxy.retryPolicy -ne 'weightedRandom') {
-                $config.proxy.retryPolicy = 'weightedRandom'
-                $script:configChanged = $true
-            }
-        } else {
-            Write-Host "  [Config] WARNING: 'retryPolicy' ($($config.proxy.retryPolicy)) invalid. Using leastLoaded." -ForegroundColor Yellow
-            $config.proxy.retryPolicy = 'leastLoaded'
-            $script:warnings++
-            $script:configChanged = $true
-        }
-    }
-    if ($config.proxy.maxThreads -lt $config.proxy.minThreads) {
-        $config.proxy.maxThreads = $config.proxy.minThreads
-        $script:configChanged = $true
-    }
-}
-
-if ($config.routing) {
-    Check-Bool $config.routing 'enforceECMP' $false
-    Check-Number $config.routing 'metricRefreshSec' 6 300 30
-    Check-Number $config.routing 'ecmpRefreshSec' 30 600 60
-    if ($config.routing.PSObject.Properties['ethernetPriority']) {
-        [void]$config.routing.PSObject.Properties.Remove('ethernetPriority')
-        $script:configChanged = $true
-    }
-}
-
-if ($config.profiles) {
-    foreach ($profileProp in $config.profiles.PSObject.Properties) {
-        $profile = $profileProp.Value
-        if ($profile -and $profile.PSObject.Properties['ethernetBoost']) {
-            [void]$profile.PSObject.Properties.Remove('ethernetBoost')
-            $script:configChanged = $true
-        }
-    }
-}
-
-if ($config.selfHealing) {
-    Check-Bool $config.selfHealing 'dhcpAutoRepair' $false
-    Check-Number $config.selfHealing 'dhcpRepairIntervalSec' 30 600 120
-}
-
-# Throughput-profile guardrails: keep high-performance modes from inheriting
-# conservative thread and stickiness values that cap multi-adapter aggregation.
-$throughputMode = $config.mode -in @('maxspeed', 'download')
-if ($throughputMode -and $config.proxy) {
-    if ($config.proxy.maxThreads -lt 512) {
-        Write-Host "  [Config] WARNING: maxspeed/download requires higher thread headroom. Raising proxy.maxThreads to 512." -ForegroundColor Yellow
-        $config.proxy.maxThreads = 512
-        $script:warnings++
-        $script:configChanged = $true
-    }
-    if ($config.proxy.minThreads -lt 96) {
-        $config.proxy.minThreads = 96
-        $script:configChanged = $true
-    }
-    if ($config.proxy.sessionAffinityTTL -gt 120) {
-        $config.proxy.sessionAffinityTTL = 120
-        $script:configChanged = $true
-    }
-    if ($config.proxy.httpsBulkPromotionHostThreshold -gt 1) {
-        $config.proxy.httpsBulkPromotionHostThreshold = 1
-        $script:configChanged = $true
-    }
-    if ($config.proxy.httpsBulkPromotionGlobalThreshold -gt 4) {
-        $config.proxy.httpsBulkPromotionGlobalThreshold = 4
-        $script:configChanged = $true
-    }
-    if ($config.proxy.bulkPressureThreshold -gt 10) {
-        $config.proxy.bulkPressureThreshold = 10
-        $script:configChanged = $true
-    }
-    if ($config.proxy.maxThreads -lt $config.proxy.minThreads) {
-        $config.proxy.maxThreads = $config.proxy.minThreads
-        $script:configChanged = $true
-    }
-    if (-not $config.routing) {
-        $config | Add-Member -MemberType NoteProperty -Name routing -Value ([pscustomobject]@{}) -Force
-        $script:configChanged = $true
-    }
-    $routingEnforcePresent = $config.routing.PSObject.Properties['enforceECMP'] -ne $null
-    if (-not $routingEnforcePresent) {
-        $config.routing | Add-Member -MemberType NoteProperty -Name enforceECMP -Value $true -Force
-        $script:configChanged = $true
-    } elseif (-not [bool]$config.routing.enforceECMP) {
-        $config.routing.enforceECMP = $true
-        $script:configChanged = $true
-    }
 }
 
 # Validate circuit breaker
@@ -265,11 +147,11 @@ if ($config.trafficRules) {
     }
 }
 
-if ($script:warnings -gt 0 -or $script:configChanged) {
+if ($warnings -gt 0 -or $script:configChanged) {
     try {
         Write-AtomicJson -Path $configPath -Data $config -Depth 5
-        if ($script:warnings -gt 0) {
-            Write-Host "  [ConfigValidator] Sanitized config.json ($script:warnings warnings fixed)." -ForegroundColor DarkGray
+        if ($warnings -gt 0) {
+            Write-Host "  [ConfigValidator] Sanitized config.json ($warnings warnings fixed)." -ForegroundColor DarkGray
         } else {
             Write-Host "  [ConfigValidator] Normalized config.json." -ForegroundColor DarkGray
         }

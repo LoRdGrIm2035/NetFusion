@@ -238,7 +238,13 @@ canvas{display:block;width:100%!important;height:100%!important}
     <div class="card">
       <div class="card-h" style="flex-wrap:wrap;gap:6px">
         <span class="card-t">Throughput History (60s)</span>
-        <div class="chart-legend" id="throughputLegend"></div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div><span id="legA">A</span>↓<span class="leg-val" id="lvADL" style="color:#3b82f6">0</span></div>
+          <div class="legend-item"><div class="legend-dot dot-ring" style="border-color:#06b6d4"></div>↑<span class="leg-val" id="lvAUL" style="color:#06b6d4">0</span></div>
+          <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div><span id="legB">B</span>↓<span class="leg-val" id="lvBDL" style="color:#8b5cf6">0</span></div>
+          <div class="legend-item"><div class="legend-dot dot-ring" style="border-color:#a855f7"></div>↑<span class="leg-val" id="lvBUL" style="color:#a855f7">0</span></div>
+          <div class="legend-item" style="border-left:1px solid var(--border);padding-left:6px"><div class="legend-dot" style="background:#10b981;width:10px;height:3px;border-radius:1px"></div>Σ↓<span class="leg-val" id="lvTDL" style="color:#10b981">0</span></div>
+        </div>
       </div>
       <div class="chart-wrap"><canvas id="tpChart"></canvas></div>
     </div>
@@ -281,23 +287,16 @@ canvas{display:block;width:100%!important;height:100%!important}
 
 <script>
 const API='';let curMode='maxspeed';
-const CP=60;
-const tpData={
-  combined_dl:new Array(CP).fill(0),
-  combined_ul:new Array(CP).fill(0),
-  adapters:{},
-  order:[]
-};
+const CP=60;const tpData={a_dl:new Array(CP).fill(0),a_ul:new Array(CP).fill(0),b_dl:new Array(CP).fill(0),b_ul:new Array(CP).fill(0),t_dl:new Array(CP).fill(0),t_ul:new Array(CP).fill(0)};
 const connHist=new Array(CP).fill(0);
-const SERIES_COLORS=['#3b82f6','#8b5cf6','#f97316','#ef4444','#14b8a6','#a855f7','#22c55e','#06b6d4','#eab308','#ec4899'];
+let adapterNames=['Adapter A','Adapter B'];
 const actLog=[];const MAX_LOG=50;
 
 async function fetchJ(u){
   try{
     const r=await fetch(u+API,{credentials:'same-origin'});
-    if(r.status===401||r.status===403){window.location.replace('/');return null}
-    if(!r.ok)return null;
-    return await r.json()
+    if(r.status===403){window.location.replace('/');return null}
+    return r.ok?await r.json():null
   }catch{return null}
 }
 function hc(s){return s>=70?'var(--green)':s>=40?'var(--yellow)':s>0?'var(--red)':'var(--text3)'}
@@ -306,46 +305,6 @@ function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;',
 function safeText(v,f=''){const t=String(v??'').trim();return t?escapeHtml(t):f}
 function safeClassToken(v,f='interactive'){const t=String(v??f).toLowerCase().replace(/[^a-z0-9_-]/g,'');return t||f}
 function setPill(id,cls,text){const el=document.getElementById(id);el.className=cls;el.innerHTML=`<span class="dot"></span>${escapeHtml(text)}`}
-function toAgeSec(ts){
-  const parsed=Date.parse(ts||'');
-  if(Number.isNaN(parsed))return null;
-  return Math.max(0,(Date.now()-parsed)/1000);
-}
-function ensureAdapterSeries(name){
-  if(!tpData.adapters[name]){
-    tpData.adapters[name]={dl:new Array(CP).fill(0),ul:new Array(CP).fill(0)};
-    tpData.order.push(name);
-  }
-  return tpData.adapters[name];
-}
-function getSeriesColor(idx){return SERIES_COLORS[idx%SERIES_COLORS.length]}
-function colorByName(name){
-  const s=String(name||'');
-  let h=0;
-  for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0}
-  const idx=Math.abs(h)%SERIES_COLORS.length;
-  return SERIES_COLORS[idx];
-}
-function updateThroughputLegend(adapters){
-  const el=document.getElementById('throughputLegend');
-  if(!el)return;
-  const rows=[];
-  adapters.forEach((a,idx)=>{
-    const name=safeText(a.name||a.Name||'Adapter','Adapter');
-    const key=a.name||a.Name||`Adapter-${idx+1}`;
-    const s=tpData.adapters[key]||{dl:[0],ul:[0]};
-    const dl=s.dl[s.dl.length-1]||0;
-    const ul=s.ul[s.ul.length-1]||0;
-    const c=getSeriesColor(idx);
-    rows.push(`<div class="legend-item"><div class="legend-dot" style="background:${c}"></div>${name} ↓<span class="leg-val" style="color:${c}">${dl.toFixed(dl>=10?0:1)}</span></div>`);
-    rows.push(`<div class="legend-item"><div class="legend-dot dot-ring" style="border-color:${c}"></div>↑<span class="leg-val" style="color:${c}">${ul.toFixed(ul>=10?0:1)}</span></div>`);
-  });
-  const cdl=tpData.combined_dl[tpData.combined_dl.length-1]||0;
-  const cul=tpData.combined_ul[tpData.combined_ul.length-1]||0;
-  rows.push(`<div class="legend-item" style="border-left:1px solid var(--border);padding-left:6px"><div class="legend-dot" style="background:#10b981;width:10px;height:3px;border-radius:1px"></div>Σ↓<span class="leg-val" style="color:#10b981">${cdl.toFixed(cdl>=10?0:1)}</span></div>`);
-  rows.push(`<div class="legend-item"><div class="legend-dot dot-ring" style="border-color:#10b981"></div>Σ↑<span class="leg-val" style="color:#10b981">${cul.toFixed(cul>=10?0:1)}</span></div>`);
-  el.innerHTML=rows.join('');
-}
 
 // ===== CHART HELPERS =====
 function hexRgba(h,a){const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16);return`rgba(${r},${g},${b},${a})`}
@@ -363,11 +322,7 @@ function drawThroughput(){
   const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);
   const pL=44,pR=12,pT=8,pB=22,cw=w-pL-pR,ch=h-pT-pB;
   ctx.clearRect(0,0,w,h);
-  const all=[...tpData.combined_dl,...tpData.combined_ul];
-  tpData.order.forEach(n=>{
-    const s=tpData.adapters[n];
-    if(s){all.push(...s.dl,...s.ul)}
-  });
+  const all=[...tpData.a_dl,...tpData.a_ul,...tpData.b_dl,...tpData.b_ul,...tpData.t_dl];
   let mx=Math.max(...all,.5);mx=Math.ceil(mx*1.25)||1;
   // Grid
   const gN=5;ctx.textAlign='right';ctx.textBaseline='middle';
@@ -377,22 +332,21 @@ function drawThroughput(){
   const tMarks=[{t:'-60s',p:0},{t:'-45s',p:.25},{t:'-30s',p:.5},{t:'-15s',p:.75},{t:'now',p:1}];
   tMarks.forEach(m=>{const x=pL+cw*m.p;ctx.fillText(m.t,x,h-4);if(m.p>0&&m.p<1){ctx.beginPath();ctx.moveTo(x,pT);ctx.lineTo(x,pT+ch);ctx.strokeStyle='rgba(30,41,59,.12)';ctx.lineWidth=1;ctx.stroke()}})
   ctx.textAlign='left';ctx.fillStyle='#64748b';ctx.font='8px Inter';ctx.fillText('Mbps',pL+4,pT+10);
-  tpData.order.forEach((name,idx)=>{
-    const s=tpData.adapters[name];if(!s)return;
-    const c=getSeriesColor(idx);
-    const pDL=getPts(s.dl,pL,pT,cw,ch,mx),pUL=getPts(s.ul,pL,pT,cw,ch,mx);
-    gFill(ctx,pDL,c,pT,ch);
-    sLine(ctx,pUL,c,1.2,[4,3]);
-    sLine(ctx,pDL,c,1.9,[]);
-    const L=CP-1;
-    pDot(ctx,pDL[L],c,s.dl[L]);pDot(ctx,pUL[L],c,s.ul[L]);
-  });
-  const pCDL=getPts(tpData.combined_dl,pL,pT,cw,ch,mx);
-  const pCUL=getPts(tpData.combined_ul,pL,pT,cw,ch,mx);
-  sLine(ctx,pCUL,'#10b981',1.6,[3,3]);
-  sLine(ctx,pCDL,'#10b981',2.7,[6,3]);
+  // Points
+  const pAD=getPts(tpData.a_dl,pL,pT,cw,ch,mx),pAU=getPts(tpData.a_ul,pL,pT,cw,ch,mx);
+  const pBD=getPts(tpData.b_dl,pL,pT,cw,ch,mx),pBU=getPts(tpData.b_ul,pL,pT,cw,ch,mx);
+  const pTD=getPts(tpData.t_dl,pL,pT,cw,ch,mx);
+  // Gradient fills (downloads)
+  gFill(ctx,pAD,'#3b82f6',pT,ch);gFill(ctx,pBD,'#8b5cf6',pT,ch);
+  // Lines: uploads thin dashed → downloads solid → combined dashed on top
+  sLine(ctx,pAU,'#06b6d4',1.5,[4,3]);sLine(ctx,pBU,'#a855f7',1.5,[4,3]);
+  sLine(ctx,pAD,'#3b82f6',2,[]);sLine(ctx,pBD,'#8b5cf6',2,[]);
+  sLine(ctx,pTD,'#10b981',2.5,[6,3]);
+  // Pulse dots at current values
   const L=CP-1;
-  pDot(ctx,pCDL[L],'#10b981',tpData.combined_dl[L]);
+  pDot(ctx,pAD[L],'#3b82f6',tpData.a_dl[L]);pDot(ctx,pAU[L],'#06b6d4',tpData.a_ul[L]);
+  pDot(ctx,pBD[L],'#8b5cf6',tpData.b_dl[L]);pDot(ctx,pBU[L],'#a855f7',tpData.b_ul[L]);
+  pDot(ctx,pTD[L],'#10b981',tpData.t_dl[L]);
 }
 // ===== MINI CHART (Connections) =====
 function drawChart(canvasId,datasets,colors){
@@ -413,22 +367,19 @@ function drawChart(canvasId,datasets,colors){
 function renderAdapters(list){
   const el=document.getElementById('adapters');
   if(!list||!list.length){el.innerHTML='<div style="color:var(--text3);font-size:12px;text-align:center;padding:20px">No adapters detected</div>';return}
+  if(list[0])adapterNames[0]=list[0].name||list[0].Name||'A';
+  if(list[1])adapterNames[1]=list[1].name||list[1].Name||'B';
+  document.getElementById('legA').textContent=adapterNames[0];
+  document.getElementById('legB').textContent=adapterNames[1]+' ';
   // find best adapter
   let bestIdx=0,bestScore=-1;list.forEach((a,i)=>{const s=a.health??a.HealthScore??0;if(s>bestScore){bestScore=s;bestIdx=i}});
   el.innerHTML=list.map((a,idx)=>{
     const tRaw=a.type||a.Type||'Unknown',nRaw=a.name||a.Name||'?';
     const hp=a.health??a.HealthScore??0,hcl=hc(hp);
-    const hp01=a.health01??a.HealthScore01??(hp/100);
     const dl=a.downloadMbps??a.DownloadMbps??0,ul=a.uploadMbps??a.UploadMbps??0;
     const lat=a.latencyEWMA??a.InternetLatencyEWMA??a.latency??999;
     const jit=a.jitter??a.Jitter??0,sr=a.successRate??a.SuccessRate??100;
-    const cap=a.estimatedCapacityMbps??a.EstimatedCapacityMbps??0;
-    const util=a.utilizationPct??a.UtilizationPct??0;
-    const flows=a.activeFlowCount??a.ActiveFlowCount??a.activeFlows??a.ActiveFlows??a.flowCount??a.FlowCount??a.connections??0;
-    const st=(a.status??a.Status??'').toString();
     const deg=a.isDegrading??a.IsDegrading??false;
-    const quarantined=Boolean(a.isQuarantined??a.IsQuarantined??false);
-    const disabled=Boolean(a.isDisabled??a.IsDisabled??false);
     const ssid=a.ssid??a.SSID??'';
     const lnk=a.linkSpeedMbps??a.LinkSpeedMbps??0;
     const wifiGen=a.wifiGenerationLabel??a.WiFiGenerationLabel??'';
@@ -437,15 +388,13 @@ function renderAdapters(list){
     const isBest=idx===bestIdx&&list.length>1;
     const ssidTag=ssid?`<span style="font-size:9px;color:var(--text3);font-weight:400;margin-left:4px">${safeText(ssid)} • ${lnk>0?lnk.toFixed(0)+'Mbps link':''}</span>`:'';
     const genTag=wifiGen?`<span class="wifi-gen">${safeText(wifiGen)}</span>`:'';
-    return`<div class="ifc"><div class="ifc-top"><div class="ifc-name"><span class="ifc-type ${tc}">${safeText(t,'Unknown')}</span>${n}${ssidTag}${genTag}${isBest?'<span class="ifc-best">★ BEST</span>':''}${deg?'<span class="degrading">DEGRADING</span>':''}${quarantined?'<span class="degrading">QUAR</span>':''}${disabled?'<span class="degrading">DISABLED</span>':''}</div><div class="ifc-score" style="color:${hcl}">${hp}</div></div><div class="ifc-grid"><div class="im"><div class="v" style="color:var(--green)">${dl}</div><div class="l">DL Mbps</div></div><div class="im"><div class="v" style="color:var(--accent3)">${ul}</div><div class="l">UL Mbps</div></div><div class="im"><div class="v">${lat<999?lat:'--'}</div><div class="l">Latency</div></div><div class="im"><div class="v">${jit}</div><div class="l">Jitter</div></div><div class="im"><div class="v">${sr}%</div><div class="l">Success</div></div><div class="im"><div class="v">${flows}</div><div class="l">Flows</div></div><div class="im"><div class="v">${cap>0?cap.toFixed(cap>=100?0:1):'--'}</div><div class="l">Cap Mbps</div></div><div class="im"><div class="v">${util.toFixed(util>=10?0:1)}%</div><div class="l">Util</div></div></div><div class="hbar"><div class="hfill" style="width:${Math.max(0,Math.min(100,hp01*100))}%;background:${hcl}"></div></div><div style="font-size:9px;color:var(--text3);margin-top:4px">State: ${safeText(st||'n/a','n/a')}</div></div>`
+    return`<div class="ifc"><div class="ifc-top"><div class="ifc-name"><span class="ifc-type ${tc}">${safeText(t,'Unknown')}</span>${n}${ssidTag}${genTag}${isBest?'<span class="ifc-best">★ BEST</span>':''}${deg?'<span class="degrading">DEGRADING</span>':''}</div><div class="ifc-score" style="color:${hcl}">${hp}</div></div><div class="ifc-grid"><div class="im"><div class="v" style="color:var(--green)">${dl}</div><div class="l">DL Mbps</div></div><div class="im"><div class="v" style="color:var(--accent3)">${ul}</div><div class="l">UL Mbps</div></div><div class="im"><div class="v">${lat<999?lat:'--'}</div><div class="l">Latency</div></div><div class="im"><div class="v">${jit}</div><div class="l">Jitter</div></div><div class="im"><div class="v">${sr}%</div><div class="l">Success</div></div></div><div class="hbar"><div class="hfill" style="width:${hp}%;background:${hcl}"></div></div></div>`
   }).join('');
 }
 
 function updateProxy(proxy){
-  const proxyStale=Boolean(proxy?.isStale);
-  const proxyRunning=Boolean(proxy?.running)&&!proxyStale;
-  const active=proxyRunning?(proxy?.activeConnections||0):0;
-  const total=proxyRunning?(proxy?.totalConnections||0):0;
+  const active=proxy?.activeConnections||0;
+  const total=proxy?.totalConnections||0;
   document.getElementById('ppActive').textContent=active;
   document.getElementById('ppTotal').textContent=total;
   connHist.push(active);connHist.shift();
@@ -457,26 +406,22 @@ function updateProxy(proxy){
   // proxy status
   const psEl=document.getElementById('proxyStatus');
   const pillProxy=document.getElementById('pillProxy');
-  if(proxyStale){psEl.textContent='Stale';psEl.style.background='rgba(245,158,11,.08)';psEl.style.color='var(--yellow)';pillProxy.className='pill pill-warn';pillProxy.innerHTML='<span class="dot"></span>Proxy Telemetry Stale'}
-  else if(proxyRunning){psEl.textContent='Running';psEl.style.background='rgba(16,185,129,.08)';psEl.style.color='var(--green)';pillProxy.className='pill pill-ok';pillProxy.innerHTML='<span class="dot"></span>Proxy Active'}
+  if(proxy?.running){psEl.textContent='Running';psEl.style.background='rgba(16,185,129,.08)';psEl.style.color='var(--green)';pillProxy.className='pill pill-ok';pillProxy.innerHTML='<span class="dot"></span>Proxy Active'}
   else{psEl.textContent='Stopped';psEl.style.background='rgba(239,68,68,.08)';psEl.style.color='var(--red)';pillProxy.className='pill pill-err';pillProxy.innerHTML='<span class="dot"></span>Proxy Down'}
   // per-adapter bar
   const apa=proxy?.activePerAdapter||{};const adapters=proxy?.adapters||[];
   const barWrap=document.getElementById('ppBarWrap');
-  if(proxyRunning&&adapters.length>0){
-    const colorFor=(name,idx)=>colorByName(name||String(idx));
-    const getConn=(a)=>Number(a.activeFlowCount??a.flowCount??a.connections??0);
-    const totalConns=adapters.reduce((s,a)=>s+getConn(a),0)||1;
+  if(adapters.length>0){
+    const colors=['var(--accent)','var(--accent2)','var(--green)','var(--orange)'];
+    const totalConns=adapters.reduce((s,a)=>s+(a.connections||0),0)||1;
     let barHTML='<div class="pp-bar-label"><span>Connections per Adapter</span><span>'+total+' total</span></div><div class="pp-bar">';
-    adapters.forEach((a,i)=>{const c=getConn(a);const pct=((c)/totalConns*100).toFixed(1);const color=colorFor(a.name,i);barHTML+=`<div class="pp-bar-seg" style="width:${pct}%;background:${color}" title="${safeText(a.name)}: ${c}"></div>`});
+    adapters.forEach((a,i)=>{const pct=((a.connections||0)/totalConns*100).toFixed(1);barHTML+=`<div class="pp-bar-seg" style="width:${pct}%;background:${colors[i%4]}" title="${safeText(a.name)}: ${a.connections||0}"></div>`});
     barHTML+='</div><div style="display:flex;gap:10px;margin-top:4px;flex-wrap:wrap">';
-    adapters.forEach((a,i)=>{const safeName=safeText(a.name,'?');const c=getConn(a);const color=colorFor(a.name,i);barHTML+=`<span style="font-size:9px;color:var(--text2);display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:${color};display:inline-block"></span>${safeName}: ${c} (active: ${apa[a.name]||0})</span>`});
+    adapters.forEach((a,i)=>{const safeName=safeText(a.name,'?');barHTML+=`<span style="font-size:9px;color:var(--text2);display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:${colors[i%4]};display:inline-block"></span>${safeName}: ${a.connections||0} (active: ${apa[a.name]||0})</span>`});
     barHTML+='</div>';barWrap.innerHTML=barHTML;
-  }else{
-    barWrap.innerHTML=`<div style="font-size:10px;color:var(--text3);padding:6px 0">${proxyStale?'Proxy telemetry is stale':'Proxy is not active'}</div>`;
   }
   // connection types
-  const ct=proxyRunning?(proxy?.connectionTypes||{}):{};
+  const ct=proxy?.connectionTypes||{};
   const typesEl=document.getElementById('ppTypes');
   const typeColors={bulk:'var(--accent)',interactive:'var(--text3)',streaming:'var(--accent2)',gaming:'var(--green)'};
   typesEl.innerHTML=Object.entries(ct).filter(([k,v])=>v>0).map(([k,v])=>`<div class="pp-type"><span class="pp-dot" style="background:${typeColors[k]||'var(--text3)'}"></span>${safeText(k)}: ${v}</div>`).join('');
@@ -485,30 +430,19 @@ function updateProxy(proxy){
 }
 
 function updateChart(adapters){
-  const seen=new Set();
-  let cdl=0,cul=0;
-  adapters.forEach((a,idx)=>{
-    const name=a.name||a.Name||`Adapter-${idx+1}`;
-    const dl=parseFloat(a.downloadMbps??a.DownloadMbps??0);
-    const ul=parseFloat(a.uploadMbps??a.UploadMbps??0);
-    const s=ensureAdapterSeries(name);
-    s.dl.push(dl);s.dl.shift();
-    s.ul.push(ul);s.ul.shift();
-    seen.add(name);
-    cdl+=dl;cul+=ul;
-  });
-
-  // keep chart continuity for adapters currently not present in this poll
-  tpData.order.forEach(name=>{
-    if(seen.has(name))return;
-    const s=tpData.adapters[name];if(!s)return;
-    s.dl.push(0);s.dl.shift();
-    s.ul.push(0);s.ul.shift();
-  });
-
-  tpData.combined_dl.push(cdl);tpData.combined_dl.shift();
-  tpData.combined_ul.push(cul);tpData.combined_ul.shift();
-  updateThroughputLegend(adapters);
+  const dlA=parseFloat(adapters[0]?.downloadMbps??adapters[0]?.DownloadMbps??0);
+  const ulA=parseFloat(adapters[0]?.uploadMbps??adapters[0]?.UploadMbps??0);
+  const dlB=parseFloat(adapters[1]?.downloadMbps??adapters[1]?.DownloadMbps??0);
+  const ulB=parseFloat(adapters[1]?.uploadMbps??adapters[1]?.UploadMbps??0);
+  tpData.a_dl.push(dlA);tpData.a_dl.shift();tpData.a_ul.push(ulA);tpData.a_ul.shift();
+  tpData.b_dl.push(dlB);tpData.b_dl.shift();tpData.b_ul.push(ulB);tpData.b_ul.shift();
+  tpData.t_dl.push(dlA+dlB);tpData.t_dl.shift();tpData.t_ul.push(ulA+ulB);tpData.t_ul.shift();
+  const f=v=>v>=10?v.toFixed(0):v>=1?v.toFixed(1):v>0?v.toFixed(2):'0';
+  document.getElementById('lvADL').textContent=f(dlA);
+  document.getElementById('lvAUL').textContent=f(ulA);
+  document.getElementById('lvBDL').textContent=f(dlB);
+  document.getElementById('lvBUL').textContent=f(ulB);
+  document.getElementById('lvTDL').textContent=f(dlA+dlB);
   drawThroughput();
 }
 
@@ -536,11 +470,7 @@ function renderEvts(evts){
   const el=document.getElementById('events');
   if(!evts||!evts.length){el.innerHTML='<div style="color:var(--text3);font-size:11px;text-align:center;padding:14px">No events yet</div>';return}
   el.innerHTML=evts.slice(0,30).map(e=>{
-    let t='--';
-    if(e.timestamp){
-      const parsed=Date.parse(e.timestamp);
-      t=Number.isNaN(parsed)?String(e.timestamp):new Date(parsed).toLocaleTimeString();
-    }
+    const t=e.timestamp?new Date(e.timestamp).toLocaleTimeString():'--';
     return`<div class="evt"><span class="evt-t">${safeText(t,'--')}</span><span class="evt-tp et-${safeClassToken(e.type,'system')}">${safeText(e.type,'sys')}</span><span class="evt-m">${safeText(e.message,'')}</span></div>`
   }).join('');
 }
@@ -552,53 +482,83 @@ function renderLearning(data){
   el.innerHTML=Object.entries(data.adapterProfiles).map(([k,p])=>`<div class="learn-item"><div class="li-name">${safeText(p.name||k,'?')}</div><div class="li-val" style="color:${hc(p.avgHealth||0)}">${Math.round(p.avgHealth||0)}</div><div class="li-sub">Avg Health · ${p.totalSamples||0} samples · R:${Math.round(p.reliability||0)}%</div></div>`).join('');
 }
 
-function applyNoTelemetryState(reason){
-  const msg=reason||'Live telemetry unavailable';
-  renderAdapters([]);
-  updateChart([]);
-  updateActivityLog([]);
-  updateProxy({running:false,isStale:true,activeConnections:0,totalConnections:0,adapters:[],activePerAdapter:{},connectionTypes:{}});
-  document.getElementById('sTotalDL').innerHTML='0.00<span class="unit">Mbps</span>';
-  document.getElementById('sTotalUL').innerHTML='0.00<span class="unit">Mbps</span>';
-  document.getElementById('sAdapters').innerHTML='0<span class="unit">/ 0</span>';
-  document.getElementById('sUptime').innerHTML='--<span class="unit">min</span>';
-  document.getElementById('connType').textContent='--';
-  const alert=document.getElementById('alert');
-  alert.className='alert show breaker';
-  alert.textContent='Telemetry unavailable: dashboard is waiting for fresh runtime data.';
-  setPill('pillSystem','pill pill-warn','No Live Data');
-  setPill('pillInternet','pill pill-warn','Telemetry Missing');
-  setPill('pillAdapters','pill pill-warn','0 Adapters');
-  const modeLabel=(curMode&&curMode.length)?(curMode.charAt(0).toUpperCase()+curMode.slice(1)):'Unknown';
-  setPill('pillMode','pill pill-info',modeLabel);
-  document.getElementById('ssUptime').textContent='Uptime: -- • '+msg+' • '+new Date().toLocaleTimeString();
+// ===== MAIN UPDATE (SSE) =====
+let lastAdapters = [];
+function processStats(stats){
+  if(stats){
+    let adapters=stats.health?.adapters||[];
+    if(adapters.length===0 && lastAdapters.length>0) adapters = lastAdapters;
+    else lastAdapters = adapters;
+    
+    // Merge WiFi generation data from interfaces.json
+    const ifaces=stats.interfaces?.interfaces||[];
+    if(ifaces.length>0){
+      adapters.forEach(a=>{
+        const nm=a.name||a.Name||'';
+        const ifc=ifaces.find(i=>(i.Name||'')==nm);
+        if(ifc){
+          a.wifiGenerationLabel=ifc.WiFiGenerationLabel||'';
+          a.wifiGeneration=ifc.WiFiGeneration||0;
+          if(!a.ssid&&!a.SSID&&ifc.SSID) a.ssid=ifc.SSID;
+          if(!a.linkSpeedMbps&&!a.LinkSpeedMbps&&ifc.LinkSpeedMbps) a.linkSpeedMbps=ifc.LinkSpeedMbps;
+        }
+      });
+    }
+    
+    renderAdapters(adapters);updateChart(adapters);updateActivityLog(adapters);
+    // DL/UL totals
+    let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.uploadMbps??a.UploadMbps??0)}
+    document.getElementById('sTotalDL').innerHTML=fmt(tdl)+'<span class="unit">Mbps</span>';
+    document.getElementById('sTotalUL').innerHTML=fmt(tul)+'<span class="unit">Mbps</span>';
+    document.getElementById('sAdapters').innerHTML=adapters.length+'<span class="unit">/ '+adapters.length+'</span>';
+    setPill('pillAdapters','pill pill-info',adapters.length+' Adapters');
+
+    // Proxy data
+    const proxy=stats.proxy;updateProxy(proxy);
+    const ct=proxy?.connectionTypes||{};
+    const parts=[];for(const[k,v] of Object.entries(ct)){if(v>0)parts.push(k+':'+v)}
+    document.getElementById('connType').textContent=parts.join(' | ')||'--';
+
+    // Mode
+    const mode=stats.config?.mode||'maxspeed';
+    if(mode!==curMode){curMode=mode;document.querySelectorAll('.mbtn').forEach(b=>b.classList.toggle('on',b.dataset.mode===mode))}
+    setPill('pillMode','pill pill-info',mode.charAt(0).toUpperCase()+mode.slice(1));
+
+    // Safety
+    const safety=stats.safety;
+    const alert=document.getElementById('alert');
+    const safeB=document.getElementById('safeBtn');
+    const pillSys=document.getElementById('pillSystem');
+    const pillNet=document.getElementById('pillInternet');
+    if(safety){
+      if(safety.uptime){const m=Math.round(safety.uptime);const t=m>=60?Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')+'m':m+'m';document.getElementById('ssUptime').textContent='Uptime: '+t;document.getElementById('sUptime').innerHTML=m+'<span class="unit">min</span>'}
+      if(safety.safeMode){
+        alert.className='alert show safe';alert.textContent='⚠ SAFE MODE — All optimization disabled. Internet using default Windows routing.';
+        safeB.classList.add('on');safeB.innerHTML='&#9888; Safe Mode ON';
+        setPill('pillSystem','pill pill-warn','Safe Mode');
+        setPill('pillInternet','pill pill-ok','Internet Safe');
+      }else if(safety.circuitBreakerOpen){
+        alert.className='alert show breaker';alert.textContent='⚡ CIRCUIT BREAKER — Auto-recovery in progress. Internet is safe.';
+        safeB.classList.remove('on');safeB.innerHTML='&#9888; Safe Mode';
+        setPill('pillSystem','pill pill-warn','Recovering');
+        setPill('pillInternet','pill pill-ok','Internet Safe');
+      }else{
+        alert.className='alert';
+        safeB.classList.remove('on');safeB.innerHTML='&#9888; Safe Mode';
+        setPill('pillSystem','pill pill-ok','Running');
+        setPill('pillInternet','pill pill-ok','Internet Safe');
+      }
+    }else{
+      setPill('pillSystem','pill pill-err','No Data');
+    }
+  }
 }
 
 // ===== MAIN UPDATE =====
 async function updateAll(){
-  const [stats,ev,dc,lr]=await Promise.all([
-    fetchJ('/api/stats'),
-    fetchJ('/api/events'),
-    fetchJ('/api/decisions'),
-    fetchJ('/api/learning')
-  ]);
+  const stats=await fetchJ('/api/stats');
   if(stats){
-    const proxyRaw=stats.proxy||{};
-    const healthRaw=stats.health||{};
-    const proxyAge=Number.isFinite(proxyRaw.ageSec)?proxyRaw.ageSec:toAgeSec(proxyRaw.timestamp);
-    const healthAge=Number.isFinite(healthRaw.ageSec)?healthRaw.ageSec:toAgeSec(healthRaw.timestamp);
-    const proxyStale=Boolean(proxyRaw.isStale)||(Number.isFinite(proxyAge)&&proxyAge>8);
-    const healthStale=Boolean(healthRaw.isStale)||(Number.isFinite(healthAge)&&healthAge>8);
-    const staleData=proxyStale||healthStale;
-    const rawAdapters=healthRaw.adapters||[];
-    const adapters=healthStale
-      ? rawAdapters.map(a=>Object.assign({},a,{
-          downloadMbps:0,DownloadMbps:0,uploadMbps:0,UploadMbps:0,
-          throughputMbps:0,ThroughputMbps:0,throughputAvg5:0,ThroughputAvg5:0,
-          throughputAvg30:0,ThroughputAvg30:0,throughputAvg60:0,ThroughputAvg60:0,
-          utilizationPct:0,UtilizationPct:0,status:'stale',Status:'stale'
-        }))
-      : rawAdapters;
+    const adapters=stats.health?.adapters||[];
     // Merge WiFi generation from interfaces
     const ifaces=stats.interfaces?.interfaces||[];
     if(ifaces.length>0){
@@ -618,36 +578,13 @@ async function updateAll(){
     let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.uploadMbps??a.UploadMbps??0)}
     document.getElementById('sTotalDL').innerHTML=fmt(tdl)+'<span class="unit">Mbps</span>';
     document.getElementById('sTotalUL').innerHTML=fmt(tul)+'<span class="unit">Mbps</span>';
-    const enabledAdapters=adapters.filter(a=>!(a.isDisabled??a.IsDisabled));
-    const healthyAdapters=enabledAdapters.filter(a=>(a.health??a.HealthScore??0)>=50);
-    document.getElementById('sAdapters').innerHTML=healthyAdapters.length+'<span class="unit">/ '+adapters.length+'</span>';
+    document.getElementById('sAdapters').innerHTML=adapters.length+'<span class="unit">/ '+adapters.length+'</span>';
     setPill('pillAdapters','pill pill-info',adapters.length+' Adapters');
 
     // Proxy data
-    const proxy=Object.assign({},proxyRaw,{isStale:proxyStale,ageSec:proxyAge});
-    const activePer=proxy?.activePerAdapter||{};
-    adapters.forEach(a=>{
-      const n=a.name||a.Name||'';
-      if(!n)return;
-      if(Object.prototype.hasOwnProperty.call(activePer,n)){
-        const flows=Number(activePer[n]||0);
-        a.activeFlowCount=flows;
-        a.ActiveFlowCount=flows;
-        a.activeFlows=flows;
-        a.ActiveFlows=flows;
-      }
-    });
-    updateProxy(proxy);
+    const proxy=stats.proxy;updateProxy(proxy);
     const ct=proxy?.connectionTypes||{};
     const parts=[];for(const[k,v] of Object.entries(ct)){if(v>0)parts.push(k+':'+v)}
-    const bottleneck=stats.health?.upstreamBottleneck||proxy?.upstreamBottleneck||{};
-    if(bottleneck?.detected){
-      parts.push('bottleneck:'+String(bottleneck.reason||'shared-upstream'));
-    }
-    const rebalance=stats.health?.rebalance||proxy?.rebalance||{};
-    if(rebalance?.trigger){
-      parts.push('rebalance:active');
-    }
     document.getElementById('connType').textContent=parts.join(' | ')||'--';
 
     // Mode
@@ -659,15 +596,11 @@ async function updateAll(){
     const safety=stats.safety;
     const alert=document.getElementById('alert');
     const safeB=document.getElementById('safeBtn');
-    let uptimeText='Uptime: --';
+    const pillSys=document.getElementById('pillSystem');
+    const pillNet=document.getElementById('pillInternet');
     if(safety){
-      if(safety.uptime){const m=Math.round(safety.uptime);const t=m>=60?Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')+'m':m+'m';uptimeText='Uptime: '+t;document.getElementById('sUptime').innerHTML=m+'<span class="unit">min</span>'}
-      if(staleData){
-        alert.className='alert show breaker';alert.textContent='Telemetry stale: verifying live state. Traffic safety remains active.';
-        safeB.classList.remove('on');safeB.innerHTML='&#9888; Safe Mode';
-        setPill('pillSystem','pill pill-warn','Telemetry Stale');
-        setPill('pillInternet',proxy?.running?'pill pill-ok':'pill pill-warn',proxy?.running?'Internet Safe':'Check Telemetry');
-      }else if(safety.safeMode){
+      if(safety.uptime){const m=Math.round(safety.uptime);const t=m>=60?Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')+'m':m+'m';document.getElementById('ssUptime').textContent='Uptime: '+t;document.getElementById('sUptime').innerHTML=m+'<span class="unit">min</span>'}
+      if(safety.safeMode){
         alert.className='alert show safe';alert.textContent='⚠ SAFE MODE — All optimization disabled. Internet using default Windows routing.';
         safeB.classList.add('on');safeB.innerHTML='&#9888; Safe Mode ON';
         setPill('pillSystem','pill pill-warn','Safe Mode');
@@ -686,16 +619,10 @@ async function updateAll(){
     }else{
       setPill('pillSystem','pill pill-err','No Data');
     }
-    const freshness=[];
-    if(Number.isFinite(proxyAge))freshness.push('P:'+Math.round(proxyAge)+'s');
-    if(Number.isFinite(healthAge))freshness.push('H:'+Math.round(healthAge)+'s');
-    document.getElementById('ssUptime').textContent=uptimeText+' • Live '+new Date().toLocaleTimeString()+(freshness.length?' • '+freshness.join(' '):'');
-  }else{
-    applyNoTelemetryState('Dashboard API unavailable');
   }
-  if(ev?.events)renderEvts(ev.events);
-  if(dc?.decisions)renderDecs(dc.decisions);
-  if(lr)renderLearning(lr);
+  const ev=await fetchJ('/api/events');if(ev?.events)renderEvts(ev.events);
+  const dc=await fetchJ('/api/decisions');if(dc?.decisions)renderDecs(dc.decisions);
+  const lr=await fetchJ('/api/learning');if(lr)renderLearning(lr);
 }
 
 // ===== CONTROLS =====
