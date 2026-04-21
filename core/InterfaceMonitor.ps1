@@ -47,6 +47,7 @@ $script:lastCsvFlush = Get-Date
 $script:lastCounterSample = [datetime]::MinValue
 $script:lastPublicIpRefresh = [datetime]::MinValue
 $script:perfCounterCache = @{}
+$script:netAdapterCounterCache = @{}
 $script:globalAnomalyCounter = @{}
 $script:rebalanceHint = @{}
 $script:InterfaceMonitorLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
@@ -139,6 +140,78 @@ function Normalize-InstanceToken {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
     return (($Value -replace '[^a-zA-Z0-9]', '').ToLowerInvariant())
+}
+
+function Get-NetAdapterRateSamples {
+    param([array]$Interfaces)
+
+    $now = Get-Date
+    $snapshot = @{}
+    $hadData = $false
+
+    foreach ($iface in @($Interfaces)) {
+        $name = [string]$iface.Name
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+        $stats = $null
+        try {
+            $stats = Get-NetAdapterStatistics -Name $name -ErrorAction Stop
+        } catch {}
+
+        if (-not $stats) {
+            $snapshot[$name] = @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 }
+            continue
+        }
+
+        $hadData = $true
+        $rxBytes = [int64]$stats.ReceivedBytes
+        $txBytes = [int64]$stats.SentBytes
+        $row = @{
+            timestamp = $now
+            rxBytes = $rxBytes
+            txBytes = $txBytes
+            rxMbps = 0.0
+            txMbps = 0.0
+            totalMbps = 0.0
+        }
+
+        if ($script:netAdapterCounterCache.ContainsKey($name)) {
+            $prev = $script:netAdapterCounterCache[$name]
+            try {
+                $elapsedSec = [double](($now - [datetime]$prev.timestamp).TotalSeconds)
+                if ($elapsedSec -gt 0.15) {
+                    $rxDelta = [double]($rxBytes - [int64]$prev.rxBytes)
+                    $txDelta = [double]($txBytes - [int64]$prev.txBytes)
+                    if ($rxDelta -lt 0) { $rxDelta = 0.0 }
+                    if ($txDelta -lt 0) { $txDelta = 0.0 }
+
+                    $rxMbps = [math]::Round((($rxDelta * 8.0) / 1000000.0) / $elapsedSec, 3)
+                    $txMbps = [math]::Round((($txDelta * 8.0) / 1000000.0) / $elapsedSec, 3)
+                    $totalMbps = [math]::Round($rxMbps + $txMbps, 3)
+
+                    $row.rxMbps = [double]$rxMbps
+                    $row.txMbps = [double]$txMbps
+                    $row.totalMbps = [double]$totalMbps
+                } else {
+                    $row.rxMbps = if ($null -ne $prev.rxMbps) { [double]$prev.rxMbps } else { 0.0 }
+                    $row.txMbps = if ($null -ne $prev.txMbps) { [double]$prev.txMbps } else { 0.0 }
+                    $row.totalMbps = if ($null -ne $prev.totalMbps) { [double]$prev.totalMbps } else { [double]$row.rxMbps + [double]$row.txMbps }
+                }
+            } catch {}
+        }
+
+        $script:netAdapterCounterCache[$name] = $row
+        $snapshot[$name] = @{
+            rxMbps = [double]$row.rxMbps
+            txMbps = [double]$row.txMbps
+            totalMbps = [double]$row.totalMbps
+        }
+    }
+
+    return [pscustomobject]@{
+        hadData = [bool]$hadData
+        snapshot = $snapshot
+    }
 }
 
 function Ensure-AdapterState {
@@ -383,6 +456,24 @@ function Get-PerformanceCounterSamples {
     $script:lastCounterSample = $now
     $snapshot = @{}
 
+    # Primary path: use adapter byte counters directly so per-adapter Rx/Tx values
+    # remain accurate even when performance-counter instance names are ambiguous.
+    try {
+        $native = Get-NetAdapterRateSamples -Interfaces $Interfaces
+        if ($native -and $native.hadData -and $native.snapshot -and $native.snapshot.Count -gt 0) {
+            foreach ($iface in @($Interfaces)) {
+                $name = [string]$iface.Name
+                if ($native.snapshot.ContainsKey($name)) {
+                    $snapshot[$name] = $native.snapshot[$name]
+                } else {
+                    $snapshot[$name] = @{ rxMbps = 0.0; txMbps = 0.0; totalMbps = 0.0 }
+                }
+            }
+            $script:perfCounterCache = $snapshot
+            return $snapshot
+        }
+    } catch {}
+
     try {
         $counterPaths = @(
             '\Network Interface(*)\Bytes Received/sec',
@@ -412,7 +503,8 @@ function Get-PerformanceCounterSamples {
             $nameTok = Normalize-InstanceToken -Value $name
             $descTok = Normalize-InstanceToken -Value $desc
 
-            $best = $null
+            $best = @{ rx = 0.0; tx = 0.0; total = 0.0 }
+            $bestTotal = [double]::NegativeInfinity
             foreach ($entry in $instanceMap.GetEnumerator()) {
                 $instTok = Normalize-InstanceToken -Value ([string]$entry.Key)
                 if ([string]::IsNullOrWhiteSpace($instTok)) { continue }
@@ -420,13 +512,12 @@ function Get-PerformanceCounterSamples {
                     ($nameTok -and ($instTok.Contains($nameTok) -or $nameTok.Contains($instTok))) -or
                     ($descTok -and ($instTok.Contains($descTok) -or $descTok.Contains($instTok)))
                 ) {
-                    $best = $entry.Value
-                    break
+                    $entryTotal = if ($null -ne $entry.Value.total) { [double]$entry.Value.total } else { [double]$entry.Value.rx + [double]$entry.Value.tx }
+                    if ($entryTotal -gt $bestTotal) {
+                        $best = $entry.Value
+                        $bestTotal = $entryTotal
+                    }
                 }
-            }
-
-            if (-not $best) {
-                $best = @{ rx = 0.0; tx = 0.0; total = 0.0 }
             }
 
             $snapshot[$name] = @{

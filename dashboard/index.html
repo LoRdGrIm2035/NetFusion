@@ -319,6 +319,13 @@ function ensureAdapterSeries(name){
   return tpData.adapters[name];
 }
 function getSeriesColor(idx){return SERIES_COLORS[idx%SERIES_COLORS.length]}
+function colorByName(name){
+  const s=String(name||'');
+  let h=0;
+  for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0}
+  const idx=Math.abs(h)%SERIES_COLORS.length;
+  return SERIES_COLORS[idx];
+}
 function updateThroughputLegend(adapters){
   const el=document.getElementById('throughputLegend');
   if(!el)return;
@@ -529,7 +536,11 @@ function renderEvts(evts){
   const el=document.getElementById('events');
   if(!evts||!evts.length){el.innerHTML='<div style="color:var(--text3);font-size:11px;text-align:center;padding:14px">No events yet</div>';return}
   el.innerHTML=evts.slice(0,30).map(e=>{
-    const t=e.timestamp?new Date(e.timestamp).toLocaleTimeString():'--';
+    let t='--';
+    if(e.timestamp){
+      const parsed=Date.parse(e.timestamp);
+      t=Number.isNaN(parsed)?String(e.timestamp):new Date(parsed).toLocaleTimeString();
+    }
     return`<div class="evt"><span class="evt-t">${safeText(t,'--')}</span><span class="evt-tp et-${safeClassToken(e.type,'system')}">${safeText(e.type,'sys')}</span><span class="evt-m">${safeText(e.message,'')}</span></div>`
   }).join('');
 }
@@ -539,6 +550,28 @@ function renderLearning(data){
   if(!data||!data.adapterProfiles||Object.keys(data.adapterProfiles).length===0){el.innerHTML='<div style="color:var(--text3);font-size:11px;grid-column:1/-1;text-align:center;padding:14px">Collecting data...</div>';document.getElementById('learnBadge').textContent=(data?.totalSessions||0)+' sessions';return}
   document.getElementById('learnBadge').textContent=(data.totalSessions||0)+' sessions';
   el.innerHTML=Object.entries(data.adapterProfiles).map(([k,p])=>`<div class="learn-item"><div class="li-name">${safeText(p.name||k,'?')}</div><div class="li-val" style="color:${hc(p.avgHealth||0)}">${Math.round(p.avgHealth||0)}</div><div class="li-sub">Avg Health · ${p.totalSamples||0} samples · R:${Math.round(p.reliability||0)}%</div></div>`).join('');
+}
+
+function applyNoTelemetryState(reason){
+  const msg=reason||'Live telemetry unavailable';
+  renderAdapters([]);
+  updateChart([]);
+  updateActivityLog([]);
+  updateProxy({running:false,isStale:true,activeConnections:0,totalConnections:0,adapters:[],activePerAdapter:{},connectionTypes:{}});
+  document.getElementById('sTotalDL').innerHTML='0.00<span class="unit">Mbps</span>';
+  document.getElementById('sTotalUL').innerHTML='0.00<span class="unit">Mbps</span>';
+  document.getElementById('sAdapters').innerHTML='0<span class="unit">/ 0</span>';
+  document.getElementById('sUptime').innerHTML='--<span class="unit">min</span>';
+  document.getElementById('connType').textContent='--';
+  const alert=document.getElementById('alert');
+  alert.className='alert show breaker';
+  alert.textContent='Telemetry unavailable: dashboard is waiting for fresh runtime data.';
+  setPill('pillSystem','pill pill-warn','No Live Data');
+  setPill('pillInternet','pill pill-warn','Telemetry Missing');
+  setPill('pillAdapters','pill pill-warn','0 Adapters');
+  const modeLabel=(curMode&&curMode.length)?(curMode.charAt(0).toUpperCase()+curMode.slice(1)):'Unknown';
+  setPill('pillMode','pill pill-info',modeLabel);
+  document.getElementById('ssUptime').textContent='Uptime: -- • '+msg+' • '+new Date().toLocaleTimeString();
 }
 
 // ===== MAIN UPDATE =====
@@ -657,6 +690,8 @@ async function updateAll(){
     if(Number.isFinite(proxyAge))freshness.push('P:'+Math.round(proxyAge)+'s');
     if(Number.isFinite(healthAge))freshness.push('H:'+Math.round(healthAge)+'s');
     document.getElementById('ssUptime').textContent=uptimeText+' • Live '+new Date().toLocaleTimeString()+(freshness.length?' • '+freshness.join(' '):'');
+  }else{
+    applyNoTelemetryState('Dashboard API unavailable');
   }
   if(ev?.events)renderEvts(ev.events);
   if(dc?.decisions)renderDecs(dc.decisions);

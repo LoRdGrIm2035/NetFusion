@@ -354,7 +354,7 @@ Use the list below when NetFusion does not behave the way you expect. Each issue
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 |
-Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\\.254\\.' } |
+Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
 Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
 ```
 
@@ -362,7 +362,7 @@ Format-Table InterfaceAlias,IPAddress,PrefixOrigin,AddressState -AutoSize
 
 ```powershell
 Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
-Where-Object { $_.InterfaceAlias } |
+Where-Object InterfaceAlias -match 'Wi-Fi|Ethernet' |
 Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
 ```
 
@@ -383,9 +383,8 @@ Format-Table InterfaceAlias,NextHop,RouteMetric -AutoSize
 4. Verify real adapter counters instead of relying only on the browser speed display.
 
 ```powershell
-Get-NetAdapter |
-Where-Object Status -eq 'Up' |
-ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
+Get-NetAdapterStatistics -Name 'Wi-Fi 3'
+Get-NetAdapterStatistics -Name 'Wi-Fi 4'
 ```
 
 ### 3. Browser traffic is not balancing well
@@ -399,83 +398,134 @@ ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
 4. Compare adapter counters while the workload is running.
 
 ```powershell
-Get-NetAdapter |
-Where-Object Status -eq 'Up' |
-ForEach-Object { Get-NetAdapterStatistics -Name $_.Name }
+Get-NetAdapterStatistics -Name 'Wi-Fi 3'
+Get-NetAdapterStatistics -Name 'Wi-Fi 4'
 ```
 
 ### 4. An adapter has no gateway or falls back to APIPA
 
-1. Identify affected adapters dynamically.
+1. Check the adapter IP and route state.
 
 ```powershell
-Get-NetAdapter |
-Where-Object Status -eq 'Up' |
-ForEach-Object {
-  [pscustomobject]@{
-    Name = $_.Name
-    IPv4 = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-      Where-Object IPAddress -notlike '169.254.*' |
-      Select-Object -ExpandProperty IPAddress -First 1)
-    Gateway = (Get-NetRoute -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-      Sort-Object RouteMetric |
-      Select-Object -ExpandProperty NextHop -First 1)
-  }
-} | Format-Table -AutoSize
+Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 ```
 
-2. Run recovery helpers as Administrator when an adapter has no usable IPv4 or gateway.
+2. If the adapter has no valid address or no usable route, run one of the recovery helpers as Administrator.
 
-- `test-wifi4-fix.ps1`
 - `fix-wifi4.ps1`
 - `fix-wifi4-arp.ps1`
 
-3. Re-check adapter IP and route state after the helper finishes.
-
-4. If an adapter still has no valid gateway, repair DHCP/static settings for that adapter and reconnect it before retrying NetFusion.
-
-### 5. Adjust per-adapter default route metrics safely
-
-Use this when you need deterministic routing preference for specific interfaces without deleting existing routes.
-
-1. Open PowerShell as Administrator.
-
-2. Select the target adapter.
+3. Re-check the adapter after the recovery script finishes.
 
 ```powershell
-$adapterAlias = 'YOUR_ADAPTER_NAME'
-$if = Get-NetIPInterface -InterfaceAlias $adapterAlias -AddressFamily IPv4 -ErrorAction Stop
+Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 ```
 
-3. Inspect current route and metric state.
+4. If the adapter still has no working gateway, inspect the DHCP state and renew or reconnect the adapter before retrying NetFusion.
+
+### 5. Override a Wi-Fi adapter default gateway manually
+
+Use this when Windows received a gateway from DHCP, but you still want to force a different default route for one specific adapter.
+
+1. Open PowerShell as Administrator.
+   If Windows returns `Access is denied`, the shell is not elevated.
+
+2. List the available adapters and confirm the exact adapter name.
 
 ```powershell
-Get-NetIPInterface -InterfaceAlias $adapterAlias -AddressFamily IPv4 |
-Format-Table InterfaceAlias,InterfaceIndex,Dhcp,AutomaticMetric,InterfaceMetric,ConnectionState -AutoSize
+Get-NetAdapter | Format-Table Name,InterfaceDescription,Status,MacAddress,LinkSpeed -AutoSize
+```
 
-Get-NetRoute -InterfaceAlias $adapterAlias -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+3. Check the current IPv4 address, DHCP state, interface index, and default gateway for the adapter you want to change.
+
+```powershell
+Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 |
+Format-Table InterfaceAlias,InterfaceIndex,Dhcp,ConnectionState -AutoSize
+
+Get-NetIPAddress -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 |
+Format-Table IPAddress,PrefixLength,PrefixOrigin,AddressState -AutoSize
+
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+Format-Table ifIndex,InterfaceAlias,NextHop,RouteMetric,PolicyStore -AutoSize
+```
+
+4. Store the interface index in a variable.
+
+```powershell
+$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4).InterfaceIndex
+```
+
+5. Remove the current default route from that adapter.
+
+```powershell
+Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
+```
+
+6. Add the new default route.
+
+```powershell
+New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
+```
+
+7. Verify that the new gateway is now active for that adapter.
+
+```powershell
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
 Sort-Object RouteMetric |
 Format-Table ifIndex,InterfaceAlias,NextHop,RouteMetric,PolicyStore -AutoSize
 ```
 
-4. Set interface metric (adapter-specific, no default route deletion).
+8. Repeat the same process for each adapter you want to override.
+   Replace the adapter name, old gateway, and new gateway with the values for that specific device.
+
+Per-device examples:
+
+For `Wi-Fi 2`:
 
 ```powershell
-Set-NetIPInterface -InterfaceIndex $if.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 20
+$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4).InterfaceIndex
+Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
+New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
+Get-NetRoute -InterfaceAlias 'Wi-Fi 2' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
 
-5. Verify applied state.
+For `Wi-Fi 3`:
 
 ```powershell
-Get-NetIPInterface -InterfaceIndex $if.InterfaceIndex -AddressFamily IPv4 |
-Format-Table InterfaceAlias,InterfaceIndex,AutomaticMetric,InterfaceMetric -AutoSize
+$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4).InterfaceIndex
+Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
+New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
+Get-NetRoute -InterfaceAlias 'Wi-Fi 3' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
+```
+
+For `Wi-Fi 4`:
+
+```powershell
+$if = (Get-NetIPInterface -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4).InterfaceIndex
+Remove-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
+New-NetRoute -InterfaceIndex $if -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
+Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
 
 Important notes:
 
-- This changes route preference only; it does not change DHCP lease contents.
-- Avoid deleting default routes unless you are doing controlled manual recovery.
-- Verify gateway reachability before lowering metrics aggressively.
+- This is a manual route override, not a DHCP lease change.
+- If the adapter is still on DHCP, the old gateway can come back after reconnecting, rebooting, or renewing the lease.
+- If the new gateway IP is not reachable on that subnet, the adapter can lose connectivity.
+- Test the replacement gateway before changing routes if you are not sure it is alive.
+
+```powershell
+Test-NetConnection 192.168.1.253
+```
+
+- If you prefer adapter names instead of interface indexes, this also works:
+
+```powershell
+Remove-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.254' -Confirm:$false
+New-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop '192.168.1.253' -RouteMetric 15
+```
 
 ## Known Limits
 
@@ -502,3 +552,4 @@ Important notes:
 ## License
 
 This project is licensed under the [MIT License](./LICENSE).
+

@@ -52,6 +52,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     connectionCounts = [hashtable]::Synchronized(@{})
     successCounts    = [hashtable]::Synchronized(@{})
     failCounts       = [hashtable]::Synchronized(@{})
+    connectFailureStreak = [hashtable]::Synchronized(@{})
     totalConnections = 0
     totalFails       = 0
     activeConnections = 0        # v5.1: live active connection count
@@ -553,11 +554,16 @@ function Update-AdaptersAndWeights {
         $w = 1.0
         $score01 = 0.55
         $measuredLoad = 0.0
+        $measuredDownload = 0.0
+        $measuredUpload = 0.0
         $estimatedCapacity = 0.0
+        $estimatedUpload = 0.0
         $effectiveCapacity = 0.0
         $availableCapacity = 0.0
         $utilizationPct = 0.0
         $errorRate = 0.0
+        $proxyFailureRate = 0.0
+        $connectFailureStreak = 0
         $isQuarantined = $false
         $isDisabled = $false
         $shouldAvoidNew = $false
@@ -576,12 +582,17 @@ function Update-AdaptersAndWeights {
 
             switch ($s.currentMode) {
                 'maxspeed' {
-                    $capacityFactor = if ($h.EstimatedCapacityMbps -gt 0) { [math]::Max(0.4, [math]::Min(2.5, [double]$h.EstimatedCapacityMbps / 100.0)) } else { 1.0 }
-                    $w = [math]::Max(0.8, ($score01 * 3.5) + $capacityFactor)
+                    $capacityFactor = if ($h.EstimatedCapacityMbps -gt 0) {
+                        [math]::Max(0.7, [math]::Min(2.2, [math]::Sqrt([double]$h.EstimatedCapacityMbps / 100.0)))
+                    } else {
+                        1.0
+                    }
+                    $w = [math]::Max(0.75, ((0.6 + ($score01 * 2.8)) * $capacityFactor))
                 }
                 'download' {
                     $baseSpeed = if ($h.EstimatedCapacityMbps -gt 0) { [double]$h.EstimatedCapacityMbps } elseif ($a.Speed -gt 0) { [double]$a.Speed } else { 100.0 }
-                    $w = [math]::Max(0.5, (($baseSpeed / 100.0) * [math]::Max(0.2, $score01)))
+                    $capacityFactor = [math]::Max(0.6, [math]::Min(2.4, [math]::Sqrt($baseSpeed / 100.0)))
+                    $w = [math]::Max(0.55, ($capacityFactor * [math]::Max(0.2, $score01) * 2.0))
                 }
                 'streaming' {
                     $lat = if ($h.LatencyEWMA -lt 998) { $h.LatencyEWMA } else { 200 }
@@ -600,11 +611,13 @@ function Update-AdaptersAndWeights {
             if ($h.Trend -lt -2) { $w *= 0.7 }
             elseif ($h.Trend -gt 1) { $w *= 1.15 }
 
+            if ($h.DownloadMbps -gt 0) { $measuredDownload = [double]$h.DownloadMbps }
+            if ($h.UploadMbps -gt 0) { $measuredUpload = [double]$h.UploadMbps }
             if ($h.ThroughputAvg5 -gt $measuredLoad) { $measuredLoad = [double]$h.ThroughputAvg5 }
             if ($h.ThroughputAvg30 -gt $measuredLoad) { $measuredLoad = [double]$h.ThroughputAvg30 }
             if ($h.ThroughputMbps -gt $measuredLoad) { $measuredLoad = [double]$h.ThroughputMbps }
-            if ($h.DownloadMbps -gt $measuredLoad) { $measuredLoad = [double]$h.DownloadMbps }
-            if ($h.UploadMbps -gt $measuredLoad) { $measuredLoad = [double]$h.UploadMbps }
+            if ($measuredDownload -gt $measuredLoad) { $measuredLoad = [double]$measuredDownload }
+            if ($measuredUpload -gt $measuredLoad) { $measuredLoad = [double]$measuredUpload }
 
             if ($h.EstimatedCapacityMbps -gt 0) {
                 $estimatedCapacity = [double]$h.EstimatedCapacityMbps
@@ -613,9 +626,25 @@ function Update-AdaptersAndWeights {
             } else {
                 $estimatedCapacity = 80.0
             }
+            if ($h.EstimatedUpMbps -gt 0) {
+                $estimatedUpload = [double]$h.EstimatedUpMbps
+            } elseif ($h.UploadMbps -gt 0) {
+                $estimatedUpload = [double]$h.UploadMbps
+            } elseif ($s.uploadBandwidthEstimates.ContainsKey($a.Name) -and [double]$s.uploadBandwidthEstimates[$a.Name] -gt 0) {
+                $estimatedUpload = [double]$s.uploadBandwidthEstimates[$a.Name]
+            } else {
+                $estimatedUpload = [math]::Max(5.0, [double]$estimatedCapacity * 0.35)
+            }
 
             $errorRate = if ($null -ne $h.ErrorRate -and [double]$h.ErrorRate -gt 0) { [double]$h.ErrorRate } else { 0.0 }
-            $effectiveCapacity = [math]::Max(1.0, $estimatedCapacity * [math]::Max(0.05, $score01) * [math]::Max(0.1, [double]$w))
+            $healthCapacityFactor = 0.35 + (0.75 * $score01)
+            if ($isQuarantined) { $healthCapacityFactor *= 0.25 }
+            elseif ($shouldAvoidNew) { $healthCapacityFactor *= 0.65 }
+            if ($errorRate -gt 0.15) {
+                $healthCapacityFactor *= [math]::Max(0.3, (1.0 - ([math]::Min(0.8, $errorRate) * 1.2)))
+            }
+            $healthCapacityFactor = [math]::Max(0.15, [math]::Min(1.25, $healthCapacityFactor))
+            $effectiveCapacity = [math]::Max(1.0, $estimatedCapacity * $healthCapacityFactor)
             $availableCapacity = [math]::Max(0.0, $effectiveCapacity - $measuredLoad)
             $utilizationPct = if ($effectiveCapacity -gt 0) { [math]::Round([math]::Min(100.0, [math]::Max(0.0, ($measuredLoad / $effectiveCapacity) * 100.0)), 2) } else { 0.0 }
         }
@@ -636,8 +665,32 @@ function Update-AdaptersAndWeights {
             $s.successCounts[$a.Name] = 0
             $s.failCounts[$a.Name] = 0
         }
+        if (-not $s.connectFailureStreak.ContainsKey($a.Name)) {
+            $s.connectFailureStreak[$a.Name] = 0
+        }
         if (-not $s.activePerAdapter.ContainsKey($a.Name)) {
             $s.activePerAdapter[$a.Name] = 0
+        }
+
+        $proxySuccess = [int]$s.successCounts[$a.Name]
+        $proxyFails = [int]$s.failCounts[$a.Name]
+        $proxyAttempts = $proxySuccess + $proxyFails
+        if ($proxyAttempts -gt 0) {
+            $proxyFailureRate = [double]$proxyFails / [double]$proxyAttempts
+        }
+        $connectFailureStreak = [int]$s.connectFailureStreak[$a.Name]
+
+        if ($proxyAttempts -ge 8 -and $proxyFailureRate -gt 0.25) {
+            $w *= [math]::Max(0.08, (1.0 - ([math]::Min(0.9, $proxyFailureRate) * 1.25)))
+            if ($proxyFailureRate -ge 0.6) {
+                $shouldAvoidNew = $true
+            }
+        }
+        if ($connectFailureStreak -ge 3) {
+            $w *= [math]::Max(0.05, (1.0 - ([math]::Min(10, $connectFailureStreak) * 0.12)))
+            if ($connectFailureStreak -ge 6) {
+                $shouldAvoidNew = $true
+            }
         }
 
         $activeFlowCount = [int]$s.activePerAdapter[$a.Name]
@@ -661,11 +714,16 @@ function Update-AdaptersAndWeights {
             totalBytesWindow = [math]::Round($rollingBytesWindow, 0)
             averageFlowThroughputMbps = [math]::Round($avgFlowThroughput, 3)
             measuredLoadMbps = [math]::Round($measuredLoad, 3)
+            measuredDownloadMbps = [math]::Round($measuredDownload, 3)
+            measuredUploadMbps = [math]::Round($measuredUpload, 3)
             estimatedCapacityMbps = [math]::Round($estimatedCapacity, 3)
+            estimatedUploadMbps = [math]::Round($estimatedUpload, 3)
             effectiveCapacityMbps = [math]::Round($effectiveCapacity, 3)
             availableCapacityMbps = [math]::Round($availableCapacity, 3)
             utilizationPct = [math]::Round($utilizationPct, 2)
             errorRate = [math]::Round($errorRate, 4)
+            proxyFailureRate = [math]::Round($proxyFailureRate, 4)
+            connectFailureStreak = [int]$connectFailureStreak
             health01 = [math]::Round($score01, 4)
             isQuarantined = $isQuarantined
             isDisabled = $isDisabled
@@ -761,7 +819,10 @@ function Update-ProxyStats {
             throughputAvg30 = if ($h) { $h.ThroughputAvg30 } else { 0 }
             throughputAvg60 = if ($h) { $h.ThroughputAvg60 } else { 0 }
             measuredLoadMbps = [math]::Round($measuredLoad, 3)
+            measuredDownloadMbps = if ($flow -and $null -ne $flow.measuredDownloadMbps) { $flow.measuredDownloadMbps } elseif ($h) { $h.DownloadMbps } else { 0 }
+            measuredUploadMbps = if ($flow -and $null -ne $flow.measuredUploadMbps) { $flow.measuredUploadMbps } elseif ($h) { $h.UploadMbps } else { 0 }
             estimatedCapacityMbps = if ($flow) { $flow.estimatedCapacityMbps } elseif ($h) { $h.EstimatedCapacityMbps } else { 0 }
+            estimatedUploadMbps = if ($flow -and $null -ne $flow.estimatedUploadMbps) { $flow.estimatedUploadMbps } elseif ($h -and $h.EstimatedUpMbps) { $h.EstimatedUpMbps } else { 0 }
             effectiveCapacityMbps = if ($flow) { $flow.effectiveCapacityMbps } else { 0 }
             availableCapacityMbps = if ($flow) { $flow.availableCapacityMbps } else { 0 }
             utilizationPct = if ($flow) { $flow.utilizationPct } elseif ($h) { $h.UtilizationPct } else { 0 }
@@ -769,6 +830,8 @@ function Update-ProxyStats {
             totalBytesWindow = if ($flow) { $flow.totalBytesWindow } else { 0 }
             averageFlowThroughputMbps = if ($flow) { $flow.averageFlowThroughputMbps } else { 0 }
             errorRate = if ($flow) { $flow.errorRate } else { 0 }
+            proxyFailureRate = if ($flow -and $null -ne $flow.proxyFailureRate) { $flow.proxyFailureRate } else { 0 }
+            connectFailureStreak = if ($flow -and $null -ne $flow.connectFailureStreak) { $flow.connectFailureStreak } else { 0 }
             shouldAvoidNewFlows = if ($flow) { $flow.shouldAvoidNewFlows } else { $false }
             forceDrain = if ($flow) { $flow.forceDrain } else { $false }
             isQuarantined = if ($flow) { $flow.isQuarantined } else { $false }
@@ -1365,7 +1428,10 @@ $HandlerScript = {
         $health = $ProxyState.adapterHealth[$name]
 
         $measuredLoad = 0.0
+        $measuredDownload = 0.0
+        $measuredUpload = 0.0
         $estimatedCapacity = 80.0
+        $estimatedUpload = 10.0
         $effectiveCapacity = 10.0
         $available = 0.0
         $utilizationPct = 0.0
@@ -1376,10 +1442,15 @@ $HandlerScript = {
         $isDisabled = $false
         $reintroLimit = 0
         $latency = 999.0
+        $proxyFailureRate = 0.0
+        $connectFailureStreak = 0
 
         if ($flow) {
             if ($flow.measuredLoadMbps -gt 0) { $measuredLoad = [double]$flow.measuredLoadMbps }
+            if ($flow.measuredDownloadMbps -gt 0) { $measuredDownload = [double]$flow.measuredDownloadMbps }
+            if ($flow.measuredUploadMbps -gt 0) { $measuredUpload = [double]$flow.measuredUploadMbps }
             if ($flow.estimatedCapacityMbps -gt 0) { $estimatedCapacity = [double]$flow.estimatedCapacityMbps }
+            if ($flow.estimatedUploadMbps -gt 0) { $estimatedUpload = [double]$flow.estimatedUploadMbps }
             if ($flow.effectiveCapacityMbps -gt 0) { $effectiveCapacity = [double]$flow.effectiveCapacityMbps }
             if ($flow.availableCapacityMbps -gt 0) { $available = [double]$flow.availableCapacityMbps }
             if ($flow.utilizationPct -gt 0) { $utilizationPct = [double]$flow.utilizationPct }
@@ -1389,13 +1460,18 @@ $HandlerScript = {
             $isQuarantined = $flow.isQuarantined -eq $true
             $isDisabled = $flow.isDisabled -eq $true
             $reintroLimit = if ($flow.reintroLimitFlows) { [int]$flow.reintroLimitFlows } else { 0 }
+            if ($null -ne $flow.proxyFailureRate -and [double]$flow.proxyFailureRate -gt 0) { $proxyFailureRate = [double]$flow.proxyFailureRate }
+            if ($null -ne $flow.connectFailureStreak -and [int]$flow.connectFailureStreak -gt 0) { $connectFailureStreak = [int]$flow.connectFailureStreak }
         }
 
         if ($health) {
             if ($health.ThroughputAvg5 -gt $measuredLoad) { $measuredLoad = [double]$health.ThroughputAvg5 }
             if ($health.ThroughputAvg30 -gt $measuredLoad) { $measuredLoad = [double]$health.ThroughputAvg30 }
             if ($health.ThroughputMbps -gt $measuredLoad) { $measuredLoad = [double]$health.ThroughputMbps }
+            if ($health.DownloadMbps -gt $measuredDownload) { $measuredDownload = [double]$health.DownloadMbps }
+            if ($health.UploadMbps -gt $measuredUpload) { $measuredUpload = [double]$health.UploadMbps }
             if ($health.EstimatedCapacityMbps -gt $estimatedCapacity) { $estimatedCapacity = [double]$health.EstimatedCapacityMbps }
+            if ($health.EstimatedUpMbps -gt $estimatedUpload) { $estimatedUpload = [double]$health.EstimatedUpMbps }
             if ($health.Score01 -gt 0) { $health01 = [double]$health.Score01 }
             if ($health.LatencyEWMA -gt 0) { $latency = [double]$health.LatencyEWMA }
             if ($health.ShouldAvoidNewFlows) { $shouldAvoid = $true }
@@ -1406,7 +1482,8 @@ $HandlerScript = {
         }
 
         if ($effectiveCapacity -le 0) {
-            $effectiveCapacity = [math]::Max(1.0, $estimatedCapacity * [math]::Max(0.05, $health01) * [math]::Max(0.1, $BaseWeight))
+            $healthCapacityFactor = [math]::Max(0.15, [math]::Min(1.25, (0.35 + (0.75 * $health01))))
+            $effectiveCapacity = [math]::Max(1.0, $estimatedCapacity * $healthCapacityFactor)
         }
         if ($available -le 0) {
             $available = [math]::Max(0.0, $effectiveCapacity - $measuredLoad)
@@ -1421,7 +1498,10 @@ $HandlerScript = {
             ActiveFlows = $active
             BaseWeight = [double]$BaseWeight
             MeasuredLoadMbps = [double]$measuredLoad
+            MeasuredDownloadMbps = [double]$measuredDownload
+            MeasuredUploadMbps = [double]$measuredUpload
             EstimatedCapacityMbps = [double]$estimatedCapacity
+            EstimatedUploadMbps = [double]$estimatedUpload
             EffectiveCapacityMbps = [double]$effectiveCapacity
             AvailableCapacityMbps = [double]$available
             UtilizationPct = [double]$utilizationPct
@@ -1432,6 +1512,8 @@ $HandlerScript = {
             IsDisabled = $isDisabled
             ReintroLimitFlows = [int]$reintroLimit
             Latency = [double]$latency
+            ProxyFailureRate = [double]$proxyFailureRate
+            ConnectFailureStreak = [int]$connectFailureStreak
         }
     }
 
@@ -1455,6 +1537,29 @@ $HandlerScript = {
         if ($eligible.Count -eq 0) { $eligible = $candidates }
         $healthy = @($eligible | Where-Object { -not $_.ShouldAvoidNew -and -not $_.IsQuarantined -and $_.Health01 -ge 0.3 })
         if ($healthy.Count -eq 0) { $healthy = $eligible }
+        $stableHealthy = @($healthy | Where-Object { $_.ConnectFailureStreak -lt 6 -or $_.ActiveFlows -gt 0 })
+        if ($stableHealthy.Count -gt 0) { $healthy = $stableHealthy }
+
+        foreach ($c in $healthy) {
+            $directionCapacity = if ($ConnectionType -eq 'upload' -and $c.EstimatedUploadMbps -gt 0) {
+                [double]$c.EstimatedUploadMbps
+            } else {
+                [double]$c.EffectiveCapacityMbps
+            }
+            if ($directionCapacity -lt 1.0) { $directionCapacity = [math]::Max(1.0, [double]$c.EffectiveCapacityMbps) }
+
+            $directionLoad = if ($ConnectionType -eq 'upload') {
+                [double]$c.MeasuredUploadMbps
+            } elseif ($ConnectionType -eq 'download') {
+                [double]$c.MeasuredDownloadMbps
+            } else {
+                [double]$c.MeasuredLoadMbps
+            }
+            if ($directionLoad -lt 0) { $directionLoad = 0.0 }
+
+            Add-Member -InputObject $c -NotePropertyName DirectionCapacityMbps -NotePropertyValue $directionCapacity -Force
+            Add-Member -InputObject $c -NotePropertyName DirectionLoadMbps -NotePropertyValue $directionLoad -Force
+        }
 
         # Minimum-flow guarantee: each healthy adapter receives at least one active flow.
         $zeroFlowHealthy = @($healthy | Where-Object { $_.ActiveFlows -le 0 })
@@ -1464,15 +1569,47 @@ $HandlerScript = {
 
         $minActiveHealthy = [int](($healthy | Measure-Object -Property ActiveFlows -Minimum).Minimum)
         if ($minActiveHealthy -lt 0) { $minActiveHealthy = 0 }
-        $minCapacityHealthy = [double](($healthy | Measure-Object -Property EffectiveCapacityMbps -Minimum).Minimum)
+        $minCapacityHealthy = [double](($healthy | Measure-Object -Property DirectionCapacityMbps -Minimum).Minimum)
         if ($minCapacityHealthy -lt 1.0) { $minCapacityHealthy = 1.0 }
+        $totalCapacityHealthy = [double](($healthy | Measure-Object -Property DirectionCapacityMbps -Sum).Sum)
+        if ($totalCapacityHealthy -le 0) { $totalCapacityHealthy = 1.0 }
+        $totalActiveHealthy = [double](($healthy | Measure-Object -Property ActiveFlows -Sum).Sum)
+        if ($totalActiveHealthy -lt 0) { $totalActiveHealthy = 0.0 }
 
-        $throughputBias = if ($ConnectionType -in @('bulk', 'streaming', 'interactive')) { 1.0 } else { 0.6 }
+        $throughputBias = if ($ConnectionType -in @('bulk', 'streaming', 'interactive', 'upload')) { 1.0 } else { 0.6 }
         $latencyBias = if ($ConnectionType -eq 'gaming') { 1.25 } elseif ($ConnectionType -eq 'streaming') { 0.45 } else { 0.15 }
         $flowPenaltyFactor = if ($ConnectionType -eq 'gaming') { 0.30 } else { 0.55 }
         $rebalanceHint = $null
         if ($ProxyState.rebalanceState.ContainsKey('hint')) {
             $rebalanceHint = $ProxyState.rebalanceState['hint']
+        }
+
+        # Capacity-share floor:
+        # If a healthy adapter is significantly under its expected capacity-proportional share,
+        # route new flows there first to prevent starvation.
+        if ($healthy.Count -gt 1 -and $ConnectionType -in @('bulk', 'streaming', 'interactive', 'upload')) {
+            $shareFloor = if ($ConnectionType -in @('bulk', 'upload')) { 0.08 } else { 0.05 }
+            $shareTolerance = if ($ConnectionType -in @('bulk', 'upload')) { 0.95 } else { 0.75 }
+            $underTarget = @()
+            foreach ($c in $healthy) {
+                $targetShare = [double]$c.DirectionCapacityMbps / $totalCapacityHealthy
+                $actualShare = if ($totalActiveHealthy -gt 0) { [double]$c.ActiveFlows / $totalActiveHealthy } else { 0.0 }
+                $minimumShare = [math]::Max($shareFloor, $targetShare * $shareTolerance)
+                if ($actualShare + 0.0001 -lt $minimumShare -and $c.AvailableCapacityMbps -gt 0) {
+                    $underTarget += [pscustomobject]@{
+                        Candidate = $c
+                        Deficit = [double]($targetShare - $actualShare)
+                        Headroom = [double]$c.AvailableCapacityMbps
+                    }
+                }
+            }
+
+            if ($underTarget.Count -gt 0) {
+                $promoted = $underTarget | Sort-Object @{ Expression = 'Deficit'; Descending = $true }, @{ Expression = 'Headroom'; Descending = $true } | Select-Object -First 1
+                if ($promoted -and $promoted.Candidate) {
+                    return $promoted.Candidate
+                }
+            }
         }
 
         $best = $null
@@ -1481,12 +1618,15 @@ $HandlerScript = {
             if ($c.ReintroLimitFlows -gt 0 -and $c.ActiveFlows -ge $c.ReintroLimitFlows) {
                 continue
             }
+            if ($c.ConnectFailureStreak -ge 8 -and $healthy.Count -gt 1) {
+                continue
+            }
 
             # Capacity-aware fairness cap:
             # Faster links are allowed to carry proportionally more concurrent flows,
             # while still preventing total starvation of slower healthy links.
             if ($healthy.Count -gt 1) {
-                $capacityRatio = [math]::Max(1.0, [double]$c.EffectiveCapacityMbps / $minCapacityHealthy)
+                $capacityRatio = [math]::Max(1.0, [double]$c.DirectionCapacityMbps / $minCapacityHealthy)
                 $dynamicMultiplier = [math]::Min(24.0, [math]::Max(3.0, $capacityRatio * 1.6))
                 $maxAllowed = [math]::Max(1, [int][math]::Ceiling(($minActiveHealthy + 1) * $dynamicMultiplier))
                 if ($c.ActiveFlows -gt $maxAllowed) {
@@ -1494,14 +1634,31 @@ $HandlerScript = {
                 }
             }
 
-            $flowNormalization = [math]::Max(1.0, [double]$c.EffectiveCapacityMbps / 25.0)
+            $flowNormalization = [math]::Max(1.0, [double]$c.DirectionCapacityMbps / 25.0)
             $flowPenalty = ([double]$c.ActiveFlows / $flowNormalization) * $flowPenaltyFactor
             $latScore = if ($c.Latency -lt 998) { 1000.0 / [math]::Max(1.0, $c.Latency) } else { 0.1 }
-            $headroomRatio = if ($c.EffectiveCapacityMbps -gt 0) { [math]::Max(0.0, [math]::Min(1.0, [double]$c.AvailableCapacityMbps / [double]$c.EffectiveCapacityMbps)) } else { 0.0 }
-            $capacityScore = [math]::Max(0.0, $c.AvailableCapacityMbps) + ([double]$c.EffectiveCapacityMbps * 0.10 * $headroomRatio)
+            $directionHeadroom = [math]::Max(0.0, [double]$c.DirectionCapacityMbps - [double]$c.DirectionLoadMbps)
+            $headroomRatio = if ($c.DirectionCapacityMbps -gt 0) { [math]::Max(0.0, [math]::Min(1.0, $directionHeadroom / [double]$c.DirectionCapacityMbps)) } else { 0.0 }
+            $capacityScore =
+                ([double]$headroomRatio * 100.0) +
+                ([math]::Log10([math]::Max(1.0, [double]$c.DirectionCapacityMbps)) * 10.0 * $throughputBias)
             $healthBoost = [math]::Max(0.05, $c.Health01)
-            $score = (($capacityScore * $throughputBias) + ($latScore * $latencyBias)) * $healthBoost
+            $targetShare = [double]$c.DirectionCapacityMbps / $totalCapacityHealthy
+            $actualShare = if ($totalActiveHealthy -gt 0) { [double]$c.ActiveFlows / $totalActiveHealthy } else { 0.0 }
+            $sharePenalty = 0.0
+            $shareBoost = 0.0
+            if ($actualShare -gt $targetShare) {
+                $sharePenalty = (($actualShare - $targetShare) / [math]::Max(0.01, $targetShare)) * 6.0
+            } elseif ($targetShare -gt $actualShare) {
+                $shareBoost = (($targetShare - $actualShare) / [math]::Max(0.01, $targetShare)) * 3.5
+            }
+
+            $score = ($capacityScore + ($latScore * $latencyBias)) * $healthBoost
             $score -= $flowPenalty
+            $score -= $sharePenalty
+            $score += $shareBoost
+            $failurePenalty = ([double]$c.ProxyFailureRate * 16.0) + ([math]::Min(12.0, [double]$c.ConnectFailureStreak * 1.6))
+            $score -= $failurePenalty
 
             if ($rebalanceHint -and $rebalanceHint.trigger) {
                 $over = @()
@@ -1703,6 +1860,7 @@ $HandlerScript = {
         if ($method -ne 'CONNECT' -and $isBulkHint -and ($isUploadMethod -or $uploadContentLength -gt 0 -or $requestContentLength -ge 262144 -or $isChunkedRequest -or $hasTusResumable -or $hasContentRange)) {
             Set-UploadHostHint -ProxyState $State -TargetHost $targetHost -Reason 'http-upload-signal' -ClientToRemoteBytes ([math]::Max($requestContentLength, $uploadContentLength)) -RemoteToClientBytes 0
         }
+        $isUploadFlow = $recentUploadHint -or $isUploadMethod -or $uploadContentLength -gt 0 -or $requestContentLength -ge 262144 -or $isChunkedRequest -or $hasTusResumable -or $hasContentRange
 
         # v5.1: Track host concurrency for dynamic download manager detection
         $hostKey = $targetHost
@@ -1726,6 +1884,10 @@ $HandlerScript = {
             $connType = 'gaming' 
         } elseif ($rPort -in $voicePorts) { 
             $connType = 'voice' 
+        } elseif ($isUploadFlow -and $State.currentMode -in @('maxspeed', 'download', 'balanced')) {
+            # Upload-heavy workloads should be distributed using upload-capacity signals,
+            # not sticky interactive steering.
+            $connType = 'upload'
         } elseif ($isBulkHint) {
             $connType = 'bulk'
         } elseif ($rPort -in $bulkPorts) { 
@@ -1794,7 +1956,7 @@ $HandlerScript = {
             $sessionKey = "$targetHost`:$rPort"
             $cachedAdapter = $null
 
-            if ($connType -eq 'bulk') {
+            if ($connType -in @('bulk', 'upload')) {
                 $skipAffinity = $true
             } else {
                 $skipAffinity = $false
@@ -2009,6 +2171,8 @@ $HandlerScript = {
                 if ($connected -and $remoteClient.Connected) {
                     $State.connectionCounts[$adapter.Name]++
                     $State.successCounts[$adapter.Name]++
+                    if (-not $State.connectFailureStreak.ContainsKey($adapter.Name)) { $State.connectFailureStreak[$adapter.Name] = 0 }
+                    else { $State.connectFailureStreak[$adapter.Name] = 0 }
                     if ($connectionId -and $State.connectionRegistry.ContainsKey($connectionId)) {
                         $State.connectionRegistry[$connectionId].remote = $remoteClient
                     }
@@ -2023,6 +2187,8 @@ $HandlerScript = {
                 $remoteClient = $null
             }
             $State.failCounts[$adapter.Name]++; $State.totalFails++
+            if (-not $State.connectFailureStreak.ContainsKey($adapter.Name)) { $State.connectFailureStreak[$adapter.Name] = 1 }
+            else { $State.connectFailureStreak[$adapter.Name] = [int]$State.connectFailureStreak[$adapter.Name] + 1 }
         }
 
         if (-not $remoteClient) {

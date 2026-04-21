@@ -417,6 +417,50 @@ function Clear-AuthFailureHistory {
     }
 }
 
+function Read-HttpRequestText {
+    param(
+        [System.IO.Stream]$Stream,
+        [int]$MaxBytes = 131072
+    )
+
+    $buffer = New-Object byte[] 8192
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        $headerEnd = -1
+        $contentLength = 0
+        $targetLength = 0
+
+        while ($ms.Length -lt $MaxBytes) {
+            $read = $Stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+
+            $ms.Write($buffer, 0, $read)
+            $raw = [System.Text.Encoding]::UTF8.GetString($ms.GetBuffer(), 0, [int]$ms.Length)
+
+            if ($headerEnd -lt 0) {
+                $headerEnd = $raw.IndexOf("`r`n`r`n")
+                if ($headerEnd -ge 0) {
+                    $headerText = $raw.Substring(0, $headerEnd + 4)
+                    if ($headerText -match '(?im)^Content-Length:\s*(\d+)\s*$') {
+                        $contentLength = [int]$Matches[1]
+                    } else {
+                        $contentLength = 0
+                    }
+                    $targetLength = $headerEnd + 4 + $contentLength
+                    if ($ms.Length -ge $targetLength) { break }
+                }
+            } elseif ($targetLength -gt 0 -and $ms.Length -ge $targetLength) {
+                break
+            }
+        }
+
+        if ($ms.Length -le 0) { return '' }
+        return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    } finally {
+        try { $ms.Dispose() } catch {}
+    }
+}
+
 function Parse-Headers {
     param([string]$RequestText)
     $headers = @{}
@@ -497,6 +541,21 @@ function Get-DataFreshness {
     }
 }
 
+function Format-IsoTimestamp {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return '' }
+    try {
+        if ($Value -is [datetime]) {
+            return ([datetime]$Value).ToString('o')
+        }
+        $parsed = [datetime]$Value
+        return $parsed.ToString('o')
+    } catch {
+        return (Normalize-DisplayText $Value 64)
+    }
+}
+
 function Get-ClientInterfaces {
     $data = Read-JsonFile (Join-Path $configDir "interfaces.json")
     $interfaces = @()
@@ -511,7 +570,8 @@ function Get-ClientInterfaces {
             }
         }
     }
-    return @{ timestamp = (Get-Date).ToString('o'); version = '6.2'; count = $interfaces.Count; interfaces = $interfaces }
+    $sourceTs = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
+    return @{ timestamp = $sourceTs; version = '6.2'; count = $interfaces.Count; interfaces = $interfaces }
 }
 
 function Get-ClientHealth {
@@ -592,7 +652,7 @@ function Get-ClientHealth {
     }
     $freshness = Get-DataFreshness -Path $healthPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
     return @{
-        timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }
+        timestamp = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
         version = '6.2'
         uptime = if ($data -and $null -ne $data.uptime) { [double]$data.uptime } else { 0 }
         adapters = $adapters
@@ -647,7 +707,7 @@ function Get-ClientProxy {
     $freshness = Get-DataFreshness -Path $proxyPath -Data $data -TimestampField 'timestamp' -StaleAfterSec 8
     return @{
         running = if ($data) { [bool]$data.running } else { $false }
-        timestamp = if ($data -and $data.timestamp) { Normalize-DisplayText $data.timestamp 48 } else { (Get-Date).ToString('o') }
+        timestamp = if ($data -and $data.timestamp) { Format-IsoTimestamp $data.timestamp } else { (Get-Date).ToString('o') }
         totalConnections = if ($data -and $null -ne $data.totalConnections) { [int]$data.totalConnections } else { 0 }
         totalFailures = if ($data -and $null -ne $data.totalFailures) { [int]$data.totalFailures } else { 0 }
         activeConnections = if ($data -and $null -ne $data.activeConnections) { [int]$data.activeConnections } else { 0 }
@@ -945,10 +1005,8 @@ try {
         $stream.ReadTimeout = 5000
 
         try {
-            $buffer = New-Object byte[] 65536
-            $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
-            if ($bytesRead -le 0) { $stream.Close(); $client.Close(); continue }
-            $requestText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)
+            $requestText = Read-HttpRequestText -Stream $stream -MaxBytes 131072
+            if ([string]::IsNullOrWhiteSpace($requestText)) { $stream.Close(); $client.Close(); continue }
 
             $firstLine = ($requestText -split "`r`n")[0]
             $reqParts = $firstLine -split ' '
