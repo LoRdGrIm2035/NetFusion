@@ -18,6 +18,7 @@ if errorlevel 1 (
     exit /b
 )
 cd /d "%~dp0"
+set "NF_STATE=%~dp0core\NetworkState.ps1"
 echo  [OK] Running as Administrator
 echo.
 
@@ -29,12 +30,10 @@ if exist "%~dp0config\active-fw-rules.json" (
     powershell -ExecutionPolicy Bypass -File "%~dp0core\Cleanup-OnCrash.ps1"
     echo      Cleaned up orphaned firewall rules.
 )
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action RestoreIfDirty
 if exist "%~dp0config\safety-state.json" del /q "%~dp0config\safety-state.json"
 if exist "%~dp0config\routes-applied.flag" del /q "%~dp0config\routes-applied.flag"
-powershell -ExecutionPolicy Bypass -Command "& { $f = '%~dp0config\safety-state.json'; @{ safeMode = $false; circuitBreakerOpen = $false; proxyHealthy = $false; version = '6.2'; lastEvent = 'Normal startup requested'; startTime = (Get-Date).ToString('o') } | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8 }"
-
-:: Stale proxy guard: if ProxyEnable=1 from a crash, clear it immediately
-powershell -ExecutionPolicy Bypass -Command "$k='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $pe=(Get-ItemProperty $k -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable; if($pe -eq 1){Write-Host '  [!] Stale proxy detected from previous crash -- clearing...' -ForegroundColor Yellow; Set-ItemProperty $k 'ProxyEnable' 0 -Type DWord -Force; Remove-ItemProperty $k 'ProxyServer' -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $k 'ProxyOverride' -Force -ErrorAction SilentlyContinue; Write-Host '      Proxy cleared. Fresh init starting.' -ForegroundColor Green}"
+powershell -ExecutionPolicy Bypass -Command "& { $f = '%~dp0config\safety-state.json'; @{ safeMode = $false; circuitBreakerOpen = $false; proxyHealthy = $false; version = '6.2'; lastEvent = 'Normal startup requested'; startTime = ([System.DateTimeOffset]::UtcNow.ToString('o')) } | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8 }"
 
 :: =========================================================
 :: HIGH-SPEED CONSOLIDATED LAUNCH
@@ -43,7 +42,15 @@ powershell -ExecutionPolicy Bypass -Command "$k='HKCU:\Software\Microsoft\Window
 :: [1] ConfigValidator
 echo  [1/4] ConfigValidator          [schema check]
 powershell -ExecutionPolicy Bypass -Command "Set-Location '%~dp0'; & '.\core\ConfigValidator.ps1'"
-if errorlevel 1 ( echo  [ABORT] Configuration invalid. & pause & exit /b )
+if errorlevel 1 ( echo  [ABORT] Configuration invalid. & pause & exit /b 1 )
+
+echo        ...Saving original network state...
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action Save
+if errorlevel 1 (
+    echo  [ABORT] Failed to save original routes, metrics, and proxy state.
+    pause
+    exit /b 1
+)
 
 :: [2] NetFusion Engine (Replaces 6 previous background processes)
 echo  [2/4] NetFusion Core Engine    [proxy + router + monitor]
@@ -51,15 +58,30 @@ start "" /min powershell -WindowStyle Hidden -ExecutionPolicy Bypass -NoExit -Co
 
 :: Force Gateway safety check BEFORE enabling internet proxy
 echo        ...Waiting for Core Engine proxy thread binding (Port 8080)...
-powershell -Command "$d=(Get-Date).AddSeconds(15); while($true) { if((Get-Date) -gt $d){ Write-Host '  [!] TIMEOUT: Engine Proxy Binding Failed' -ForegroundColor Red; Start-Process '%~dp0NetFusion-STOP.bat'; exit 1 }; try { $t=New-Object Net.Sockets.TcpClient; $t.NoDelay=$true; $t.ReceiveBufferSize=524288; $t.SendBufferSize=524288; $a=$t.BeginConnect('127.0.0.1',8080,$null,$null); if($a.AsyncWaitHandle.WaitOne(500,$false)){ $t.Close(); break } } catch{}; Start-Sleep -Milliseconds 500 }"
-if errorlevel 1 exit /b
+powershell -ExecutionPolicy Bypass -NoProfile -Command "$deadline=[System.DateTimeOffset]::UtcNow.AddSeconds(15); while($true) { if([System.DateTimeOffset]::UtcNow -gt $deadline){ Write-Host '  [!] TIMEOUT: Engine Proxy Binding Failed' -ForegroundColor Red; exit 1 }; try { $t=New-Object Net.Sockets.TcpClient; $t.NoDelay=$true; $t.ReceiveBufferSize=524288; $t.SendBufferSize=524288; $a=$t.BeginConnect('127.0.0.1',8080,$null,$null); if($a.AsyncWaitHandle.WaitOne(500,$false) -and $t.Connected){ try{$t.EndConnect($a)}catch{}; $t.Close(); exit 0 }; $t.Close() } catch {}; Start-Sleep -Milliseconds 500 }"
+if errorlevel 1 goto :START_FAIL
+
+echo        ...Ensuring secondary adapter routes exist without touching the primary...
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action EnsureRoutes
+if errorlevel 1 goto :START_FAIL
+
+echo        ...Verifying local proxy can reach the internet before system proxy enable...
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action TestInternet -ThroughProxy -ProxyPort 8080 -Quiet
+if errorlevel 1 goto :START_FAIL
 
 :: [3] Watchdog & Proxy Application
 echo  [3/4] Failsafe Watchdog        [system proxy injection]
 start "" /min powershell -WindowStyle Hidden -ExecutionPolicy Bypass -NoExit -Command "$Host.UI.RawUI.WindowTitle='NF-Watchdog'; Set-Location '%~dp0'; & '.\core\NetFusionWatchdog.ps1'"
 
 :: Safely inject proxy NOW that we proved the Port is active.
-powershell -Command "$inetKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; Set-ItemProperty $inetKey 'ProxyEnable' 1 -Type DWord -Force; Set-ItemProperty $inetKey 'ProxyServer' '127.0.0.1:8080' -Type String -Force; Set-ItemProperty $inetKey 'ProxyOverride' '<local>;127.0.0.1;localhost;::1' -Type String -Force; $idmKey = 'HKCU:\Software\DownloadManager'; if (Test-Path $idmKey) { Set-ItemProperty $idmKey 'nProxyMode' 2 -Type DWord -Force; Set-ItemProperty $idmKey 'UseHttpProxy' 1 -Type DWord -Force; Set-ItemProperty $idmKey 'HttpProxyAddr' '127.0.0.1' -Type String -Force; Set-ItemProperty $idmKey 'HttpProxyPort' 8080 -Type DWord -Force; Set-ItemProperty $idmKey 'nHttpPrChbSt' 1 -Type DWord -Force; Set-ItemProperty $idmKey 'UseHttpsProxy' 1 -Type DWord -Force; Set-ItemProperty $idmKey 'HttpsProxyAddr' '127.0.0.1' -Type String -Force; Set-ItemProperty $idmKey 'HttpsProxyPort' 8080 -Type DWord -Force; Set-ItemProperty $idmKey 'nHttpsPrChbSt' 1 -Type DWord -Force }"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action SetProxy -ProxyPort 8080
+if errorlevel 1 goto :START_FAIL
+
+echo        ...Verifying internet after proxy enable...
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action TestInternet -ThroughProxy -ProxyPort 8080 -Quiet
+if errorlevel 1 goto :START_FAIL
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action TestInternet -Quiet
+if errorlevel 1 goto :START_FAIL
 
 :: [4] DashboardServer
 echo  [4/4] Dashboard UI Server      [web telemetry stream]
@@ -80,3 +102,15 @@ powershell -Command "Start-Sleep -Seconds 1; Start-Process \"http://127.0.0.1:90
 echo  Press any key to safely close this console...
 echo.
 pause
+exit /b 0
+
+:START_FAIL
+echo  [FAIL] Startup verification failed. Restoring saved network state...
+taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":9090" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":8080" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action Restore
+pause
+exit /b 1

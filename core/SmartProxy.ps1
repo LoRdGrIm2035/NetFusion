@@ -3,7 +3,7 @@
     SmartProxy v6.2 -- Production-grade intelligent connection orchestration engine.
 .DESCRIPTION
     Local HTTP/HTTPS proxy with safety-first design:
-      - Session affinity: same host maps to same adapter within TTL window
+      - Connection-level weighted round-robin with soft host hints
       - Adaptive thread pool: scales aggressively for burst traffic
       - Connection-type detection (bulk/interactive/streaming/gaming)
       - Per-connection adaptive scheduling with health-aware weights
@@ -37,6 +37,8 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 if (-not ('NetFusion.StreamCopier' -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
+using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -45,64 +47,120 @@ namespace NetFusion
 {
     public static class StreamCopier
     {
-        public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
-        {
-            CopyStream(source, dest, -1, ref bytesTransferred);
-        }
+        private const int BufferSize = 262144;
 
-        public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
+        private static async Task CopyStreamCoreAsync(NetworkStream source, NetworkStream dest, long bytesToCopy, Action<int> onBytesTransferred, CancellationToken ct)
         {
-            byte[] buffer = new byte[262144];
-            int read;
-
-            if (bytesToCopy < 0)
+            byte[] buffer = new byte[BufferSize];
+            long remaining = bytesToCopy;
+            while (!ct.IsCancellationRequested)
             {
-                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                if (bytesToCopy >= 0 && remaining <= 0)
                 {
-                    dest.Write(buffer, 0, read);
-                    Interlocked.Add(ref bytesTransferred, read);
+                    break;
                 }
 
-                return;
-            }
-
-            long remaining = bytesToCopy;
-            while (remaining > 0)
-            {
-                int toRead = (int)Math.Min(buffer.Length, remaining);
-                read = source.Read(buffer, 0, toRead);
+                int toRead = bytesToCopy < 0 ? buffer.Length : (int)Math.Min(buffer.Length, remaining);
+                int read = await source.ReadAsync(buffer, 0, toRead, ct).ConfigureAwait(false);
                 if (read <= 0)
                 {
                     break;
                 }
 
-                dest.Write(buffer, 0, read);
-                Interlocked.Add(ref bytesTransferred, read);
-                remaining -= read;
+                await dest.WriteAsync(buffer, 0, read, ct).ConfigureAwait(false);
+                if (onBytesTransferred != null)
+                {
+                    onBytesTransferred(read);
+                }
+
+                if (bytesToCopy >= 0)
+                {
+                    remaining -= read;
+                }
+            }
+        }
+
+        public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
+        {
+            using (var cts = new CancellationTokenSource())
+            {
+                long transferred = 0;
+                try
+                {
+                    CopyStreamCoreAsync(source, dest, -1, n => Interlocked.Add(ref transferred, n), cts.Token).GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                Interlocked.Add(ref bytesTransferred, transferred);
+            }
+        }
+
+        public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
+        {
+            using (var cts = new CancellationTokenSource())
+            {
+                long transferred = 0;
+                try
+                {
+                    CopyStreamCoreAsync(source, dest, bytesToCopy, n => Interlocked.Add(ref transferred, n), cts.Token).GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                Interlocked.Add(ref bytesTransferred, transferred);
             }
         }
 
         public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes)
         {
-            long c2r = 0;
-            long r2c = 0;
-
-            var t1 = Task.Run(() => CopyStream(client, remote, ref c2r));
-            var t2 = Task.Run(() => CopyStream(remote, client, ref r2c));
-
-            try
+            using (var cts = new CancellationTokenSource())
             {
-                Task.WaitAny(new Task[] { t1, t2 }, 85000);
+                long c2r = 0;
+                long r2c = 0;
+                var uploadTask = CopyStreamCoreAsync(client, remote, -1, n => Interlocked.Add(ref c2r, n), cts.Token);
+                var downloadTask = CopyStreamCoreAsync(remote, client, -1, n => Interlocked.Add(ref r2c, n), cts.Token);
+
                 try
                 {
-                    Task.WaitAll(new Task[] { t1, t2 }, 5000);
+                    Task.WhenAny(uploadTask, downloadTask).GetAwaiter().GetResult();
                 }
                 catch
                 {
                 }
 
-                if (!t1.IsCompleted || !t2.IsCompleted)
+                try
                 {
+                    Task.WhenAll(uploadTask, downloadTask).Wait(5000);
+                }
+                catch
+                {
+                }
+
+                if (!uploadTask.IsCompleted || !downloadTask.IsCompleted)
+                {
+                    try
+                    {
+                        cts.Cancel();
+                    }
+                    catch
+                    {
+                    }
+
                     try
                     {
                         client.Close();
@@ -121,19 +179,87 @@ namespace NetFusion
 
                     try
                     {
-                        Task.WaitAll(new Task[] { t1, t2 }, 1000);
+                        Task.WhenAll(uploadTask, downloadTask).Wait(1000);
                     }
                     catch
                     {
                     }
                 }
+
+                Interlocked.Add(ref clientToRemoteBytes, c2r);
+                Interlocked.Add(ref remoteToClientBytes, r2c);
+            }
+        }
+    }
+
+    public static class SocketConnector
+    {
+        public static TcpClient CreateBoundConnection(string localSourceIp, string remoteHost, int remotePort, int timeoutMs, int interfaceIndex)
+        {
+            var client = new TcpClient();
+            try
+            {
+                client.NoDelay = true;
+                client.ReceiveBufferSize = 524288;
+                client.SendBufferSize = 524288;
+                client.Client.Bind(new IPEndPoint(IPAddress.Parse(localSourceIp), 0));
+
+                if (interfaceIndex > 0)
+                {
+                    try
+                    {
+                        client.Client.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, interfaceIndex);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                var connectTask = client.ConnectAsync(remoteHost, remotePort);
+                var timeoutTask = Task.Delay(timeoutMs);
+                if (Task.WhenAny(connectTask, timeoutTask).GetAwaiter().GetResult() == timeoutTask)
+                {
+                    client.Close();
+                    throw new TimeoutException("Connection via " + localSourceIp + " timed out");
+                }
+
+                connectTask.GetAwaiter().GetResult();
+                return client;
             }
             catch
             {
+                try
+                {
+                    client.Close();
+                }
+                catch
+                {
+                }
+
+                throw;
+            }
+        }
+    }
+
+    public static class WeightedRoundRobin
+    {
+        private static long _counter = -1;
+
+        public static int NextIndex(int[] schedule)
+        {
+            if (schedule == null || schedule.Length == 0)
+            {
+                return -1;
             }
 
-            Interlocked.Add(ref clientToRemoteBytes, c2r);
-            Interlocked.Add(ref remoteToClientBytes, r2c);
+            long next = Interlocked.Increment(ref _counter);
+            long slot = next % schedule.Length;
+            if (slot < 0)
+            {
+                slot += schedule.Length;
+            }
+
+            return schedule[(int)slot];
         }
     }
 }
@@ -144,6 +270,7 @@ namespace NetFusion
 $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
     weights          = @()
+    rrSchedule       = @()
     connectionCounts = [hashtable]::Synchronized(@{})
     successCounts    = [hashtable]::Synchronized(@{})
     failCounts       = [hashtable]::Synchronized(@{})
@@ -182,9 +309,9 @@ $global:ProxyState = [hashtable]::Synchronized(@{
         'gaming'      = 8192     # 8KB for gaming (low latency)
         'default'     = 131072   # 128KB default
     }
-    # v5.0 Session Affinity
-    sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()    # { "host:port" -> @{ adapter=Name; time=DateTime } }
-    sessionTTL     = 120    # 2 minutes (reduced from 5min so degraded adapters re-evaluated faster)
+    # v6.2 Soft host hint cache (used only when weights are effectively equal)
+    sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()    # { "host:port" -> @{ adapter=Name; time=Ticks } }
+    sessionTTL     = 120
     # v5.0 Safety
     safeMode       = $false
     portClasses    = @{
@@ -328,6 +455,53 @@ function Get-ProxyAdapters {
     return $adapters
 }
 
+function New-WeightedRoundRobinSchedule {
+    param(
+        [double[]]$Weights,
+        [int]$MinimumSlots = 16,
+        [int]$MaximumSlots = 64
+    )
+
+    if (-not $Weights -or $Weights.Count -eq 0) {
+        return @()
+    }
+
+    $slotCount = [math]::Max($MinimumSlots, $Weights.Count * 8)
+    $slotCount = [math]::Min($MaximumSlots, $slotCount)
+    $totalWeight = 0.0
+    foreach ($weight in $Weights) {
+        $totalWeight += [double]$weight
+    }
+
+    if ($totalWeight -le 0.0) {
+        return @(0..([math]::Max(0, $Weights.Count - 1)))
+    }
+
+    $accumulators = @()
+    for ($i = 0; $i -lt $Weights.Count; $i++) {
+        $accumulators += 0.0
+    }
+
+    $schedule = [System.Collections.Generic.List[int]]::new()
+    for ($slot = 0; $slot -lt $slotCount; $slot++) {
+        $bestIndex = 0
+        $bestScore = [double]::NegativeInfinity
+
+        for ($i = 0; $i -lt $Weights.Count; $i++) {
+            $accumulators[$i] = [double]$accumulators[$i] + [double]$Weights[$i]
+            if ([double]$accumulators[$i] -gt $bestScore) {
+                $bestIndex = $i
+                $bestScore = [double]$accumulators[$i]
+            }
+        }
+
+        $schedule.Add($bestIndex)
+        $accumulators[$bestIndex] = [double]$accumulators[$bestIndex] - $totalWeight
+    }
+
+    return ,$schedule.ToArray()
+}
+
 function Update-AdaptersAndWeights {
     $s = $global:ProxyState
     $s.adapters = @(Get-ProxyAdapters)
@@ -417,26 +591,37 @@ function Update-AdaptersAndWeights {
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
-        $theoreticalBandwidthMbps = if ($null -ne $a.Speed -and [double]$a.Speed -gt 0) { [double]$a.Speed } else { 10.0 }
-        $measuredBandwidthMbps = 0.0
+        $linkSpeedMbps = if ($null -ne $a.Speed -and [double]$a.Speed -gt 0) { [double]$a.Speed } else { 0.0 }
         if ($h) {
-            if ($null -ne $h.EstimatedDownMbps -and [double]$h.EstimatedDownMbps -gt $measuredBandwidthMbps) { $measuredBandwidthMbps = [double]$h.EstimatedDownMbps }
-            if ($null -ne $h.EstimatedUpMbps -and [double]$h.EstimatedUpMbps -gt $measuredBandwidthMbps) { $measuredBandwidthMbps = [double]$h.EstimatedUpMbps }
-            if ($null -ne $h.DownloadMbps -and [double]$h.DownloadMbps -gt $measuredBandwidthMbps) { $measuredBandwidthMbps = [double]$h.DownloadMbps }
-            if ($null -ne $h.UploadMbps -and [double]$h.UploadMbps -gt $measuredBandwidthMbps) { $measuredBandwidthMbps = [double]$h.UploadMbps }
-            if ($null -ne $h.LinkSpeedMbps -and [double]$h.LinkSpeedMbps -gt $theoreticalBandwidthMbps) { $theoreticalBandwidthMbps = [double]$h.LinkSpeedMbps }
-        }
-        $bandwidthMbps = if ($measuredBandwidthMbps -gt 1.0) { $measuredBandwidthMbps } else { $theoreticalBandwidthMbps }
-
-        $w = [math]::Max(($bandwidthMbps / 10.0), 1.0)
-        if ($h) {
-            $latency = if ($null -ne $h.LatencyEWMA) { [double]$h.LatencyEWMA } elseif ($null -ne $h.Latency) { [double]$h.Latency } else { 999.0 }
-            if ($latency -gt 50.0) {
-                $w *= [math]::Max(0.5, 1.0 - (($latency - 50.0) / 200.0))
+            if ($null -ne $h.LinkSpeedMbps -and [double]$h.LinkSpeedMbps -gt $linkSpeedMbps) {
+                $linkSpeedMbps = [double]$h.LinkSpeedMbps
             }
         }
+        if ($linkSpeedMbps -le 0.0) {
+            $linkSpeedMbps = 100.0
+        }
 
-        $weights += [math]::Max(0.1, $w)
+        $penalty = 0.0
+        if ($h) {
+            $latency = if ($null -ne $h.LatencyEWMA) { [double]$h.LatencyEWMA } elseif ($null -ne $h.Latency) { [double]$h.Latency } else { 999.0 }
+            $jitter = if ($null -ne $h.Jitter) { [double]$h.Jitter } else { 0.0 }
+
+            $latencyPenalty = 0.0
+            if ($latency -gt 40.0) {
+                $latencyPenalty = [math]::Min(0.20, (($latency - 40.0) / 200.0))
+            }
+
+            $jitterPenalty = 0.0
+            if ($jitter -gt 5.0) {
+                $jitterPenalty = [math]::Min(0.10, (($jitter - 5.0) / 100.0))
+            }
+
+            $penalty = [math]::Min(0.30, ($latencyPenalty + $jitterPenalty))
+        }
+
+        $w = [math]::Max(1.0, [math]::Round($linkSpeedMbps * (1.0 - $penalty), 2))
+
+        $weights += $w
         if (-not $s.connectionCounts.ContainsKey($a.Name)) {
             $s.connectionCounts[$a.Name] = 0
             $s.successCounts[$a.Name] = 0
@@ -444,6 +629,7 @@ function Update-AdaptersAndWeights {
         }
     }
     $s.weights = $weights
+    $s.rrSchedule = New-WeightedRoundRobinSchedule -Weights ([double[]]$weights)
 }
 
 function Update-ProxyStats {
@@ -720,6 +906,7 @@ $HandlerScript = {
 
     $connAdapter = $null  # track which adapter this connection uses
     $hostKey = $null
+    $sessionKey = $null
     $remoteClient = $null
     $clientStream = $null
     $remoteStream = $null
@@ -932,10 +1119,12 @@ $HandlerScript = {
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
         $State.totalConnections++
         $State.activeConnections++
+        $sessionKey = if ($targetHost) { "{0}:{1}" -f $targetHost, $rPort } else { $null }
 
         $adapter = $avail[0]
         $selectionReason = 'default'
         $affinityMode = 'none'
+        $weightsNearlyEqual = $false
 
         if ($isSafeMode) {
             # Safe mode: use first adapter only (most reliable, default Windows behavior)
@@ -943,23 +1132,31 @@ $HandlerScript = {
         } elseif ($avail.Count -eq 1) {
             $selectionReason = 'only-adapter'
         } else {
-            $totalWeight = 0.0
-            foreach ($wItem in $aw) { $totalWeight += [double]$wItem }
-            if ($totalWeight -gt 0) {
-                $rand = Get-Random -Minimum 0.0 -Maximum $totalWeight
-                $cumulative = 0.0
-                for ($i = 0; $i -lt $avail.Count; $i++) {
-                    $cumulative += [double]$aw[$i]
-                    if ($rand -lt $cumulative) {
-                        $adapter = $avail[$i]
-                        break
+            $preferredIndex = [NetFusion.WeightedRoundRobin]::NextIndex([int[]]$State.rrSchedule)
+            if ($preferredIndex -lt 0 -or $preferredIndex -ge $avail.Count) {
+                $preferredIndex = 0
+            }
+
+            $adapter = $avail[$preferredIndex]
+            $selectionReason = 'weighted-round-robin(per-connection)'
+
+            if ($aw.Count -gt 1) {
+                $maxWeight = [double](($aw | Measure-Object -Maximum).Maximum)
+                $minWeight = [double](($aw | Measure-Object -Minimum).Minimum)
+                $weightsNearlyEqual = ([math]::Abs($maxWeight - $minWeight) -le [math]::Max(5.0, ($maxWeight * 0.05)))
+            }
+
+            if ($weightsNearlyEqual -and $sessionKey) {
+                $hintEntry = $null
+                if ($State.sessionMap.TryGetValue($sessionKey, [ref]$hintEntry) -and $hintEntry -and $hintEntry.adapter) {
+                    $hintedAdapter = $avail | Where-Object { $_.Name -eq [string]$hintEntry.adapter } | Select-Object -First 1
+                    if ($hintedAdapter) {
+                        $adapter = $hintedAdapter
+                        $selectionReason = 'soft-host-hint(equal-weights)'
+                        $affinityMode = 'soft'
                     }
                 }
-            } else {
-                $adapter = $avail[0]
             }
-            $selectionReason = "weighted-random(per-connection)"
-            $affinityMode = "none"
         }
 
         # Log decision
@@ -975,24 +1172,24 @@ $HandlerScript = {
 
         # ===== Connect to remote via chosen adapter (with failover) =====
         $remoteClient = $null
-        $maxRetries = [math]::Min($avail.Count, 3)
-        $usedNames = @()
-
-        for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
-            if ($attempt -gt 0) {
-                $filteredAdapters = @(); $filteredWeights = @()
-                for ($fi = 0; $fi -lt $avail.Count; $fi++) {
-                    if ($avail[$fi].Name -notin $usedNames) { $filteredAdapters += $avail[$fi]; $filteredWeights += $aw[$fi] }
-                }
-                if ($filteredAdapters.Count -eq 0) { break }
-                $ftw = 0; $filteredWeights | ForEach-Object { $ftw += $_ }
-                $adapter = $filteredAdapters[0]
-                if ($ftw -gt 0) {
-                    $fr = Get-Random -Minimum 0.0 -Maximum $ftw; $fc = 0
-                    for ($fi = 0; $fi -lt $filteredAdapters.Count; $fi++) { $fc += $filteredWeights[$fi]; if ($fr -lt $fc) { $adapter = $filteredAdapters[$fi]; break } }
+        $candidateAdapters = @($adapter)
+        $fallbackAdapters = @(
+            for ($fi = 0; $fi -lt $avail.Count; $fi++) {
+                if ($avail[$fi].Name -eq $adapter.Name) { continue }
+                [pscustomobject]@{
+                    Adapter = $avail[$fi]
+                    Weight = [double]$aw[$fi]
                 }
             }
-            $usedNames += $adapter.Name
+        )
+        if ($fallbackAdapters.Count -gt 0) {
+            $candidateAdapters += @($fallbackAdapters | Sort-Object Weight -Descending | Select-Object -ExpandProperty Adapter)
+        }
+
+        $maxRetries = [math]::Min($candidateAdapters.Count, 3)
+
+        for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
+            $adapter = $candidateAdapters[$attempt]
 
             $rHost = $targetHost
 
@@ -1003,45 +1200,30 @@ $HandlerScript = {
                     continue
                 }
 
-                if ($connAdapter -ne $adapter.Name) {
-                    if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
-                        $State.activePerAdapter[$connAdapter] = [math]::Max(0, [int]$State.activePerAdapter[$connAdapter] - 1)
+                $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
+                $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, 5000, $ifIndex)
+                $remoteClient.SendTimeout = 15000
+                $remoteClient.ReceiveTimeout = 15000
+
+                if (-not $State.activePerAdapter.ContainsKey($adapter.Name)) { $State.activePerAdapter[$adapter.Name] = 0 }
+                $State.activePerAdapter[$adapter.Name] = [int]$State.activePerAdapter[$adapter.Name] + 1
+                $connAdapter = $adapter.Name
+
+                if ($sessionKey) {
+                    $sessionEntry = @{
+                        adapter = $adapter.Name
+                        time = [System.DateTimeOffset]::UtcNow.Ticks
                     }
-                    if (-not $State.activePerAdapter.ContainsKey($adapter.Name)) { $State.activePerAdapter[$adapter.Name] = 0 }
-                    $State.activePerAdapter[$adapter.Name] = [int]$State.activePerAdapter[$adapter.Name] + 1
-                    $connAdapter = $adapter.Name
+                    try {
+                        $State.sessionMap[$sessionKey] = $sessionEntry
+                    } catch {
+                        $State.sessionMap.TryAdd($sessionKey, $sessionEntry) | Out-Null
+                    }
                 }
 
-                $remoteClient = New-Object System.Net.Sockets.TcpClient
-                $remoteClient.NoDelay = $true
-                $remoteClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Linger, (New-Object System.Net.Sockets.LingerOption($true, 1)))
-                $remoteClient.ReceiveBufferSize = 524288
-                $remoteClient.SendBufferSize = 524288
-                $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($adapter.IP), 0)
-                $remoteClient.Client.Bind($localEP)
-                $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
-                if ($ifIndex -gt 0) {
-                    try {
-                        $remoteClient.Client.SetSocketOption(
-                            [System.Net.Sockets.SocketOptionLevel]::IP,
-                            [System.Net.Sockets.SocketOptionName]::(31), # IP_UNICAST_IF
-                            [uint32]$ifIndex
-                        )
-                    } catch {
-                        # Fail open: preserve connectivity if this option is unsupported by stack/driver.
-                    }
-                }
-                $remoteClient.SendTimeout = 15000; $remoteClient.ReceiveTimeout = 15000
-                $ar = $remoteClient.BeginConnect($rHost, $rPort, $null, $null)
-                if ($ar.AsyncWaitHandle.WaitOne(5000, $false) -and $remoteClient.Connected) {
-                    try { $remoteClient.EndConnect($ar) } catch {}
-                    $State.connectionCounts[$adapter.Name]++
-                    $State.successCounts[$adapter.Name]++
-                    break
-                }
-                try { $remoteClient.Close() } catch {}
-                try { $remoteClient.Dispose() } catch {}
-                $remoteClient = $null
+                $State.connectionCounts[$adapter.Name]++
+                $State.successCounts[$adapter.Name]++
+                break
             } catch {
                 try { $remoteClient.Close() } catch {}
                 try { $remoteClient.Dispose() } catch {}
@@ -1174,7 +1356,7 @@ if ($global:ProxyState.adapters.Count -lt 1) {
 Write-Host "  HTTP Proxy:      127.0.0.1:${Port}" -ForegroundColor Green
 Write-Host "  Mode:            $($global:ProxyState.currentMode)" -ForegroundColor Green
 Write-Host "  Thread pool:     $minThreads-$maxThreads (adaptive)" -ForegroundColor Green
-Write-Host "  Session affinity: $($global:ProxyState.sessionTTL)s TTL" -ForegroundColor Green
+Write-Host "  Soft host hints: $($global:ProxyState.sessionTTL)s TTL" -ForegroundColor Green
 Write-Host "  Health endpoint: /health (loopback only)" -ForegroundColor Green
 Write-Host "  Safety aware:    yes" -ForegroundColor Green
 Write-Host ""
@@ -1190,7 +1372,7 @@ Write-Host ""
 Write-Host "  Configure apps: proxy 127.0.0.1 port ${Port}" -ForegroundColor Yellow
 Write-Host ""
 
-Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (Session affinity + Safety)"
+Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (connection-level WRR + safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }

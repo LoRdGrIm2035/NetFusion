@@ -20,6 +20,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $projectDir = Split-Path $scriptDir -Parent
 $script:NetFusionVersion = '6.2'
 $configPath = Join-Path $projectDir "config\config.json"
+$networkStateScript = Join-Path $scriptDir "NetworkState.ps1"
 $engineConfig = if (Test-Path $configPath) {
     try { Get-Content $configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $null }
 } else {
@@ -32,6 +33,10 @@ $maxProxyRestarts = if ($engineConfig -and $engineConfig.safety -and $engineConf
     3
 }
 $proxyRestartCount = 0
+$script:NetworkRestoreInvoked = $false
+if (Test-Path $networkStateScript) {
+    . $networkStateScript
+}
 
 function Test-ProxyProcessHealth {
     param([System.Diagnostics.Process]$ProcessObject)
@@ -159,6 +164,52 @@ function Get-AvailableRecoveryIP {
     return $null
 }
 
+function Invoke-EngineNetworkRestore {
+    if ($script:NetworkRestoreInvoked) {
+        return
+    }
+
+    $script:NetworkRestoreInvoked = $true
+
+    try {
+        if (Get-Command Invoke-NetworkRestore -ErrorAction SilentlyContinue) {
+            [void](Invoke-NetworkRestore)
+            return
+        }
+    } catch {}
+
+    try {
+        & powershell.exe -ExecutionPolicy Bypass -NoProfile -File $networkStateScript -Action Restore -Quiet | Out-Null
+    } catch {}
+}
+
+function Ensure-EngineNetworkRoutes {
+    try {
+        if (Get-Command Ensure-NetFusionRoutes -ErrorAction SilentlyContinue) {
+            [void](Ensure-NetFusionRoutes)
+        }
+    } catch {
+        Write-Host "  [Engine] Route safety refresh failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+try {
+    Get-EventSubscriber -SourceIdentifier 'PowerShell.Exiting' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Action -and $_.Action.ToString() -match 'NetworkState\.ps1' } |
+        ForEach-Object {
+            Unregister-Event -SubscriptionId $_.SubscriptionId -Force -ErrorAction SilentlyContinue
+        }
+} catch {}
+$script:ExitRestoreEvent = $null
+try {
+    $script:ExitRestoreEvent = Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
+        try {
+            & powershell.exe -ExecutionPolicy Bypass -NoProfile -File "$using:networkStateScript" -Action Restore -Quiet | Out-Null
+        } catch {}
+    }
+} catch {}
+
+try {
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host " NetFusion Engine v$script:NetFusionVersion SOLID Starting..." -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
@@ -194,6 +245,7 @@ $portOpen = Wait-ProxyBind -Port $proxyPort -TimeoutSeconds 10
 
 if ($portOpen) {
     Write-Host "  [+] Proxy Core Verified Online (Port $proxyPort)." -ForegroundColor Green
+    Ensure-EngineNetworkRoutes
 } else {
     Write-Host "  [-] Proxy Core Failed to Bind after 10s. Aborting Engine." -ForegroundColor Red
     if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue }
@@ -216,7 +268,6 @@ Write-AtomicJson -Path $safetyFile -Data $initSafety -Depth 3
 Write-Host "  [+] Safety state initialized." -ForegroundColor Green
 
 $loopCount = 0
-$lastECMP = Get-Date
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host " Network Orchestration Loop Running..." -ForegroundColor Cyan
 Write-Host "==================================================" -ForegroundColor Cyan
@@ -277,24 +328,9 @@ function Repair-AdapterDHCP {
     }
 }
 
-# v6.1: ECMP Enforcement - keep both adapters' metrics equal
+# v6.2: route safety maintenance - keep secondary routes present without touching primary metric
 function Enforce-ECMP {
-    $targetMetric = 15
-    $wifiAdapters = Get-NetAdapter | Where-Object { 
-        $_.Status -eq 'Up' -and $_.Name -match 'Wi-Fi' 
-    }
-    
-    if ($wifiAdapters.Count -ge 2) {
-        foreach ($wa in $wifiAdapters) {
-            $currentMetric = (Get-NetIPInterface -InterfaceIndex $wa.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric
-            if ($currentMetric -ne $targetMetric) {
-                try {
-                    Set-NetIPInterface -InterfaceIndex $wa.ifIndex -AutomaticMetric Disabled -InterfaceMetric $targetMetric -ErrorAction SilentlyContinue
-                    Set-NetRoute -InterfaceIndex $wa.ifIndex -DestinationPrefix '0.0.0.0/0' -RouteMetric $targetMetric -ErrorAction SilentlyContinue
-                } catch {}
-            }
-        }
-    }
+    Ensure-EngineNetworkRoutes
 }
 
 while ($true) {
@@ -348,6 +384,7 @@ while ($true) {
         # 3. Route Controller Dynamic Update (Every ~10s)
         if ($loopCount % 5 -eq 0 -and $interfaces.Count -ge 2) {
             Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
+            Ensure-EngineNetworkRoutes
         }
         
         # 4. Learning Engine Analytics (Every ~60s)
@@ -391,4 +428,19 @@ while ($true) {
     
     $loopCount++
     Start-Sleep -Seconds 2
+}
+} finally {
+    try {
+        if ($proxyProc -and -not $proxyProc.HasExited) {
+            Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    try {
+        if ($script:ExitRestoreEvent) {
+            Unregister-Event -SubscriptionId $script:ExitRestoreEvent.SubscriptionId -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    try {
+        Invoke-EngineNetworkRestore
+    } catch {}
 }

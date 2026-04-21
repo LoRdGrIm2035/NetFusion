@@ -17,6 +17,7 @@ if errorlevel 1 (
     exit /b
 )
 cd /d "%~dp0"
+set "NF_STATE=%~dp0core\NetworkState.ps1"
 echo  [OK] Running as Administrator
 echo.
 
@@ -44,17 +45,16 @@ echo        Done
 :: =========================================================
 :: STEP 3: Restore Default Networking
 :: =========================================================
-echo  [3/6] Restoring default routing...
-powershell -ExecutionPolicy Bypass -Command "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel' } | ForEach-Object { Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue }"
+echo  [3/6] Restoring original network state...
+powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action Restore
 powershell -ExecutionPolicy Bypass -File "%~dp0core\Cleanup-OnCrash.ps1"
 echo        Done
 
 :: =========================================================
 :: STEP 4: System Proxy Cleanup
 :: =========================================================
-echo  [4/6] Removing SYSTEM intercept...
-powershell -ExecutionPolicy Bypass -Command "$inetKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; Set-ItemProperty $inetKey 'ProxyEnable' 0 -Type DWord -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyServer' -Force -ErrorAction SilentlyContinue; Remove-ItemProperty $inetKey 'ProxyOverride' -Force -ErrorAction SilentlyContinue; Write-Host '       System proxy cleared' -ForegroundColor Green"
-powershell -ExecutionPolicy Bypass -Command "$k = 'HKCU:\Software\DownloadManager'; if (Test-Path $k) { Set-ItemProperty $k 'nProxyMode' 1 -Type DWord -Force; Set-ItemProperty $k 'UseHttpProxy' 0 -Type DWord -Force; Set-ItemProperty $k 'nHttpPrChbSt' 0 -Type DWord -Force; Set-ItemProperty $k 'UseHttpsProxy' 0 -Type DWord -Force; Set-ItemProperty $k 'nHttpsPrChbSt' 0 -Type DWord -Force; Write-Host '       IDM restored to direct' -ForegroundColor Green } else { Write-Host '       IDM not installed' -ForegroundColor DarkGray }"
+echo  [4/6] Proxy and IDM state restored via saved snapshot...
+echo        Done
 
 :: =========================================================
 :: STEP 5: Clean state files

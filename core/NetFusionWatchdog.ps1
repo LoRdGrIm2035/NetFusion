@@ -11,26 +11,18 @@ param()
 
 $proxyPort = 8080
 $failCount = 0
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+$networkStateScript = Join-Path $scriptDir 'NetworkState.ps1'
 
 Write-Host "  [Watchdog] Active. Guarding proxy on port $proxyPort..." -ForegroundColor Cyan
 
 function Clear-Proxy {
-    Write-Host "  [Watchdog] Critical Failure Detected! Clearing proxy..." -ForegroundColor Red
+    Write-Host "  [Watchdog] Critical Failure Detected! Restoring saved network state..." -ForegroundColor Red
     try {
-        $inetKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        Set-ItemProperty -Path $inetKey -Name 'ProxyEnable' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $inetKey -Name 'ProxyServer' -Force -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $inetKey -Name 'ProxyOverride' -Force -ErrorAction SilentlyContinue
-        
-        $idmKey = 'HKCU:\Software\DownloadManager'
-        if (Test-Path $idmKey) {
-            Set-ItemProperty -Path $idmKey -Name 'nProxyMode' -Value 1 -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $idmKey -Name 'UseHttpProxy' -Value 0 -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $idmKey -Name 'UseHttpsProxy' -Value 0 -ErrorAction SilentlyContinue
-        }
-        Write-Host "  [Watchdog] Direct internet restored successfully." -ForegroundColor Green
+        & powershell.exe -ExecutionPolicy Bypass -NoProfile -File $networkStateScript -Action Restore -Quiet | Out-Null
+        Write-Host "  [Watchdog] Saved network state restored." -ForegroundColor Green
     } catch {
-        Write-Host "  [Watchdog] Failed to clear proxy! $_" -ForegroundColor Red
+        Write-Host "  [Watchdog] Failed to restore network state! $_" -ForegroundColor Red
     }
 }
 

@@ -28,6 +28,7 @@ $HealthFile = Join-Path $projectDir "config\health.json"
 $EventsFile = Join-Path $projectDir "logs\events.json"
 $SafetyFile = Join-Path $projectDir "config\safety-state.json"
 . (Join-Path $projectDir "core\RouteAdapter.ps1")
+. (Join-Path $projectDir "core\NetworkState.ps1")
 
 # Ensure logs dir
 $logsDir = Join-Path $projectDir "logs"
@@ -179,56 +180,66 @@ function Get-AdapterHealthScore {
 }
 
 function Set-DynamicMetrics {
-    <# v4.0: Set metrics based on adapter type and real-time health. Lower metric = higher priority. #>
+    <# v6.2 safety: keep the primary adapter untouched and only maintain secondary metrics/routes. #>
     param([array]$Interfaces, [int]$BaseMetric)
 
-    foreach ($iface in $Interfaces) {
-        $idx = $iface.InterfaceIndex
-        $name = $iface.Name
-        $type = if ($iface.Type) { $iface.Type } else { 'Unknown' }
+    if (-not $Interfaces -or $Interfaces.Count -lt 2) {
+        return
+    }
 
-        $health = Get-AdapterHealthScore -Name $name
-        $metric = $BaseMetric
-
-        # Type-based adjustment: Ethernet gets lower metric (higher priority)
-        if ($ethernetPriority -and $type -eq 'Ethernet') {
-            $metric = [math]::Max(5, $BaseMetric - 15)
-        } elseif ($type -eq 'USB-WiFi') {
-            $metric = $BaseMetric + 5  # Slight penalty for USB overhead
-        }
-
-        # Health-based adjustment: degrading adapters get higher metric
-        if ($health.IsDegrading) {
-            $metric += 20
-            Write-Host "    [!] $name is degrading -- metric increased to $metric" -ForegroundColor Yellow
-        } elseif ($health.Score -lt 50) {
-            $metric += 10
-        }
-
-        $script:adapterMetrics[$name] = $metric
-
-        $liveIdx = $null
+    $state = Read-NetworkState
+    if ($state) {
         try {
-            # Always fetch the extreme live OS index in case the caching is desynced
-            $liveAdapter = Get-NetworkAdapters | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-            if (-not $liveAdapter) {
-                Write-Host "    - $name -> waiting for adapter to initialize..." -ForegroundColor DarkGray
-                continue
+            [void](Ensure-NetFusionRoutes)
+            foreach ($iface in $Interfaces) {
+                $metricInfo = Get-NetIPInterface -InterfaceIndex $iface.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+                if ($metricInfo) {
+                    $script:adapterMetrics[$iface.Name] = [int]$metricInfo.InterfaceMetric
+                }
             }
-            $liveIdx = $liveAdapter.ifIndex
-
-            # Verify IPv4 is bound to the interface before touching metrics
-            $ipif = Get-NetIPInterface -InterfaceIndex $liveIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue
-            if (-not $ipif) {
-                Write-Host "    - $name (index $liveIdx) -> waiting for IPv4 to bind..." -ForegroundColor DarkGray
-                continue
-            }
-
-            Set-InterfaceMetric -InterfaceIndex $liveIdx -Metric $metric
-            Write-Host "    * $name (index $liveIdx) -> metric $metric [$type HP:$($health.Score)]" -ForegroundColor Green
+            Write-Host "    * Route safety refresh complete (primary metric preserved)" -ForegroundColor Green
+            return
         } catch {
-            $idxLabel = if ($null -ne $liveIdx) { $liveIdx } else { '(unknown)' }
-            Write-Host "    x $name (index $idxLabel) -> $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    x Route safety refresh failed -> $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    $liveMetrics = @()
+    foreach ($iface in $Interfaces) {
+        $ipif = Get-NetIPInterface -InterfaceIndex $iface.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($ipif) {
+            $liveMetrics += [pscustomobject]@{
+                Name = $iface.Name
+                InterfaceIndex = [int]$iface.InterfaceIndex
+                InterfaceMetric = [int]$ipif.InterfaceMetric
+            }
+        }
+    }
+
+    if ($liveMetrics.Count -lt 2) {
+        return
+    }
+
+    $primary = $liveMetrics | Sort-Object InterfaceMetric, InterfaceIndex | Select-Object -First 1
+    $primaryMetric = [int]$primary.InterfaceMetric
+    $secondaryRank = 0
+
+    foreach ($iface in ($liveMetrics | Sort-Object @{ Expression = { if ($_.InterfaceIndex -eq $primary.InterfaceIndex) { 0 } else { 1 } } }, InterfaceMetric, InterfaceIndex)) {
+        if ($iface.InterfaceIndex -eq $primary.InterfaceIndex) {
+            $script:adapterMetrics[$iface.Name] = $primaryMetric
+            Write-Host "    * $($iface.Name) (index $($iface.InterfaceIndex)) -> primary metric preserved at $primaryMetric" -ForegroundColor Green
+            continue
+        }
+
+        $secondaryRank++
+        $desiredMetric = [Math]::Max([int]$iface.InterfaceMetric, $primaryMetric + ($secondaryRank * 5))
+        $script:adapterMetrics[$iface.Name] = $desiredMetric
+
+        try {
+            Set-InterfaceMetric -InterfaceIndex $iface.InterfaceIndex -Metric $desiredMetric
+            Write-Host "    * $($iface.Name) (index $($iface.InterfaceIndex)) -> secondary metric $desiredMetric" -ForegroundColor Green
+        } catch {
+            Write-Host "    x $($iface.Name) (index $($iface.InterfaceIndex)) -> $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
@@ -601,4 +612,3 @@ switch ($Action) {
         Invoke-WatchMode
     }
 }
-
