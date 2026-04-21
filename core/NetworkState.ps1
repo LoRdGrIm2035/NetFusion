@@ -141,6 +141,24 @@ function Resolve-PrimaryInterfaceIndex {
         }
     }
 
+    $metricCandidates = @()
+    foreach ($metric in @($State.originalMetrics)) {
+        $metricCandidates += [pscustomobject]@{
+            InterfaceIndex = [int]$metric.InterfaceIndex
+            InterfaceMetric = [int]$metric.InterfaceMetric
+        }
+    }
+
+    if ($Interfaces.Count -gt 0) {
+        $liveIndexes = @($Interfaces | ForEach-Object { [int]$_.InterfaceIndex })
+        $metricCandidates = @($metricCandidates | Where-Object { $_.InterfaceIndex -in $liveIndexes })
+    }
+
+    $primaryByMetric = $metricCandidates | Sort-Object InterfaceMetric, InterfaceIndex | Select-Object -First 1
+    if ($primaryByMetric) {
+        return [int]$primaryByMetric.InterfaceIndex
+    }
+
     $metricLookup = Get-MetricLookup -Metrics $State.originalMetrics
     $candidates = @()
     foreach ($route in @($State.originalRoutes)) {
@@ -296,6 +314,51 @@ function Test-RouteExists {
     return $null -ne $route
 }
 
+function Get-RouteRecords {
+    param(
+        [string]$DestinationPrefix,
+        [int]$InterfaceIndex,
+        [string]$NextHop
+    )
+
+    @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -ErrorAction SilentlyContinue |
+        Where-Object { [string]$_.NextHop -eq [string]$NextHop })
+}
+
+function Get-MinRouteMetric {
+    param(
+        [object[]]$Routes,
+        [int]$InterfaceIndex,
+        [int]$FallbackMetric = 15
+    )
+
+    $matches = @($Routes | Where-Object { [int]$_.InterfaceIndex -eq $InterfaceIndex })
+    if ($matches.Count -gt 0) {
+        return [int](($matches | Measure-Object -Property RouteMetric -Minimum).Minimum)
+    }
+
+    return $FallbackMetric
+}
+
+function Ensure-RouteMetric {
+    param(
+        [string]$DestinationPrefix,
+        [int]$InterfaceIndex,
+        [string]$NextHop,
+        [int]$DesiredMetric
+    )
+
+    foreach ($route in @(Get-RouteRecords -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop)) {
+        try {
+            if ([int]$route.RouteMetric -ne [int]$DesiredMetric) {
+                Set-NetRoute -AddressFamily IPv4 -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric $DesiredMetric -Confirm:$false -ErrorAction Stop | Out-Null
+            }
+        } catch {
+            Write-NetworkStateMessage ("Failed to update route metric for interface {0} via {1}: {2}" -f $InterfaceIndex, $NextHop, $_.Exception.Message) 'Yellow'
+        }
+    }
+}
+
 function Normalize-RouteRecord {
     param([object]$Route)
     return @{
@@ -328,7 +391,7 @@ function Ensure-NetFusionRoutes {
     $primaryMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $primaryInterfaceIndex -FallbackMetric (
         ($interfaces | Where-Object { $_.InterfaceIndex -eq $primaryInterfaceIndex } | Select-Object -First 1).InterfaceMetric
     )
-    $routeMetric = 5
+    $primaryRouteMetric = Get-MinRouteMetric -Routes $state.originalRoutes -InterfaceIndex $primaryInterfaceIndex -FallbackMetric 15
     $secondaryRank = 0
 
     foreach ($iface in ($interfaces | Sort-Object @{ Expression = { if ($_.InterfaceIndex -eq $primaryInterfaceIndex) { 0 } else { 1 } } }, @{ Expression = { -1 * $_.LinkSpeedMbps } }, InterfaceIndex)) {
@@ -340,6 +403,7 @@ function Ensure-NetFusionRoutes {
         $secondaryRank++
         $originalMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $iface.InterfaceIndex -FallbackMetric $iface.InterfaceMetric
         $desiredMetric = [Math]::Max($originalMetric, $primaryMetric + ($secondaryRank * 5))
+        $desiredRouteMetric = [Math]::Max(15, $primaryRouteMetric + ($secondaryRank * 5))
 
         try {
             Set-NetIPInterface -InterfaceIndex $iface.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -ErrorAction SilentlyContinue
@@ -349,8 +413,12 @@ function Ensure-NetFusionRoutes {
             Write-NetworkStateMessage "Failed to set metric for $($iface.Name): $($_.Exception.Message)" 'Yellow'
         }
 
+        foreach ($liveRoute in @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -ErrorAction SilentlyContinue)) {
+            Ensure-RouteMetric -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop ([string]$liveRoute.NextHop) -DesiredMetric $desiredRouteMetric
+        }
+
         if (-not (Test-RouteExists -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $iface.Gateway)) {
-            New-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $iface.Gateway -RouteMetric $routeMetric -Confirm:$false -ErrorAction Stop | Out-Null
+            New-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $iface.Gateway -RouteMetric $desiredRouteMetric -Confirm:$false -ErrorAction Stop | Out-Null
             if (-not (Test-RouteExists -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $iface.Gateway)) {
                 throw "Default route verification failed for $($iface.Name)"
             }
@@ -360,7 +428,7 @@ function Ensure-NetFusionRoutes {
                 InterfaceAlias = $iface.Name
                 DestinationPrefix = '0.0.0.0/0'
                 NextHop = $iface.Gateway
-                RouteMetric = $routeMetric
+                RouteMetric = $desiredRouteMetric
                 PolicyStore = 'ActiveStore'
             }
 
@@ -493,6 +561,8 @@ function Restore-OriginalRoutes {
         try {
             if (-not (Test-RouteExists -DestinationPrefix $route.DestinationPrefix -InterfaceIndex ([int]$route.InterfaceIndex) -NextHop ([string]$route.NextHop))) {
                 New-NetRoute -AddressFamily IPv4 -DestinationPrefix $route.DestinationPrefix -InterfaceIndex ([int]$route.InterfaceIndex) -NextHop ([string]$route.NextHop) -RouteMetric ([int]$route.RouteMetric) -PolicyStore ([string]$route.PolicyStore) -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+            } else {
+                Ensure-RouteMetric -DestinationPrefix ([string]$route.DestinationPrefix) -InterfaceIndex ([int]$route.InterfaceIndex) -NextHop ([string]$route.NextHop) -DesiredMetric ([int]$route.RouteMetric)
             }
         } catch {}
     }

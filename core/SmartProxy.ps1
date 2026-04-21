@@ -632,6 +632,106 @@ function Update-AdaptersAndWeights {
     $s.rrSchedule = New-WeightedRoundRobinSchedule -Weights ([double[]]$weights)
 }
 
+function Get-AdapterObservedMbps {
+    param(
+        [object]$State,
+        [object]$Adapter
+    )
+
+    $h = $State.adapterHealth[$Adapter.Name]
+    if (-not $h) {
+        return 0.0
+    }
+
+    $signals = @()
+    foreach ($propertyName in @('EstimatedDownMbps', 'EstimatedUpMbps', 'DownloadMbps', 'UploadMbps')) {
+        if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
+            $value = [double]$h[$propertyName]
+            if ($value -gt 0) {
+                $signals += $value
+            }
+        }
+    }
+
+    if ($signals.Count -gt 0) {
+        return [double](($signals | Measure-Object -Maximum).Maximum)
+    }
+
+    return 0.0
+}
+
+function Get-AdapterSelectionOrder {
+    param(
+        [object]$State,
+        [object[]]$Adapters,
+        [double[]]$Weights,
+        [int]$PreferredIndex = 0
+    )
+
+    if (-not $Adapters -or $Adapters.Count -eq 0) {
+        return @()
+    }
+
+    $weightValues = @()
+    $totalWeight = 0.0
+    for ($i = 0; $i -lt $Adapters.Count; $i++) {
+        $weight = if ($i -lt $Weights.Count) { [double]$Weights[$i] } else { 1.0 }
+        $weight = [math]::Max(1.0, $weight)
+        $weightValues += $weight
+        $totalWeight += $weight
+    }
+
+    $totalActive = 0
+    foreach ($adapter in $Adapters) {
+        if ($State.activePerAdapter.ContainsKey($adapter.Name)) {
+            $totalActive += [int]$State.activePerAdapter[$adapter.Name]
+        }
+    }
+
+    if ($PreferredIndex -lt 0 -or $PreferredIndex -ge $Adapters.Count) {
+        $PreferredIndex = 0
+    }
+
+    $ranked = @()
+    for ($i = 0; $i -lt $Adapters.Count; $i++) {
+        $adapter = $Adapters[$i]
+        $weight = [double]$weightValues[$i]
+        $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
+        $activeCount = if ($State.activePerAdapter.ContainsKey($adapter.Name)) { [int]$State.activePerAdapter[$adapter.Name] } else { 0 }
+        $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
+
+        $h = $State.adapterHealth[$adapter.Name]
+        $linkSpeedMbps = if ($null -ne $adapter.Speed -and [double]$adapter.Speed -gt 0) {
+            [double]$adapter.Speed
+        } elseif ($h -and $h.ContainsKey('LinkSpeedMbps') -and [double]$h.LinkSpeedMbps -gt 0) {
+            [double]$h.LinkSpeedMbps
+        } else {
+            100.0
+        }
+        $observedMbps = Get-AdapterObservedMbps -State $State -Adapter $adapter
+        $utilization = [math]::Min(1.50, ($observedMbps / [math]::Max(50.0, $linkSpeedMbps)))
+
+        $successCount = if ($State.successCounts.ContainsKey($adapter.Name)) { [int]$State.successCounts[$adapter.Name] } else { 0 }
+        $failCount = if ($State.failCounts.ContainsKey($adapter.Name)) { [int]$State.failCounts[$adapter.Name] } else { 0 }
+        $attempts = $successCount + $failCount
+        $failRate = if ($attempts -gt 0) { [double]$failCount / [double]$attempts } else { 0.0 }
+
+        # Keep weighted round-robin as the base policy, but prefer adapters that are below their target live share.
+        $rrBoost = if ($i -eq $PreferredIndex) { 0.02 } else { 0.0 }
+        $deficit = $targetShare - $currentShare
+        $score = ($deficit * 2.0) + ((1.0 - $utilization) * 0.15) - ($failRate * 0.40) + $rrBoost
+
+        $ranked += [pscustomobject]@{
+            Adapter = $adapter
+            Score = [math]::Round($score, 6)
+            Weight = $weight
+            Preferred = ($i -eq $PreferredIndex)
+        }
+    }
+
+    @($ranked | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Weight }; Descending = $true }, @{ Expression = { $_.Preferred }; Descending = $true })
+}
+
 function Update-ProxyStats {
     $s = $global:ProxyState
     $aStats = @()
@@ -904,6 +1004,105 @@ $HandlerScript = {
         }
     }
 
+    function Get-LocalAdapterObservedMbps {
+        param(
+            [object]$ProxyState,
+            [object]$Adapter
+        )
+
+        $h = $ProxyState.adapterHealth[$Adapter.Name]
+        if (-not $h) {
+            return 0.0
+        }
+
+        $signals = @()
+        foreach ($propertyName in @('EstimatedDownMbps', 'EstimatedUpMbps', 'DownloadMbps', 'UploadMbps')) {
+            if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
+                $value = [double]$h[$propertyName]
+                if ($value -gt 0) {
+                    $signals += $value
+                }
+            }
+        }
+
+        if ($signals.Count -gt 0) {
+            return [double](($signals | Measure-Object -Maximum).Maximum)
+        }
+
+        return 0.0
+    }
+
+    function Get-LocalAdapterSelectionOrder {
+        param(
+            [object]$ProxyState,
+            [object[]]$Adapters,
+            [double[]]$Weights,
+            [int]$PreferredIndex = 0
+        )
+
+        if (-not $Adapters -or $Adapters.Count -eq 0) {
+            return @()
+        }
+
+        $weightValues = @()
+        $totalWeight = 0.0
+        for ($i = 0; $i -lt $Adapters.Count; $i++) {
+            $weight = if ($i -lt $Weights.Count) { [double]$Weights[$i] } else { 1.0 }
+            $weight = [math]::Max(1.0, $weight)
+            $weightValues += $weight
+            $totalWeight += $weight
+        }
+
+        $totalActive = 0
+        foreach ($adapter in $Adapters) {
+            if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) {
+                $totalActive += [int]$ProxyState.activePerAdapter[$adapter.Name]
+            }
+        }
+
+        if ($PreferredIndex -lt 0 -or $PreferredIndex -ge $Adapters.Count) {
+            $PreferredIndex = 0
+        }
+
+        $ranked = @()
+        for ($i = 0; $i -lt $Adapters.Count; $i++) {
+            $adapter = $Adapters[$i]
+            $weight = [double]$weightValues[$i]
+            $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
+            $activeCount = if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) { [int]$ProxyState.activePerAdapter[$adapter.Name] } else { 0 }
+            $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
+
+            $h = $ProxyState.adapterHealth[$adapter.Name]
+            $linkSpeedMbps = if ($null -ne $adapter.Speed -and [double]$adapter.Speed -gt 0) {
+                [double]$adapter.Speed
+            } elseif ($h -and $h.ContainsKey('LinkSpeedMbps') -and [double]$h.LinkSpeedMbps -gt 0) {
+                [double]$h.LinkSpeedMbps
+            } else {
+                100.0
+            }
+            $observedMbps = Get-LocalAdapterObservedMbps -ProxyState $ProxyState -Adapter $adapter
+            $utilization = [math]::Min(1.50, ($observedMbps / [math]::Max(50.0, $linkSpeedMbps)))
+
+            $successCount = if ($ProxyState.successCounts.ContainsKey($adapter.Name)) { [int]$ProxyState.successCounts[$adapter.Name] } else { 0 }
+            $failCount = if ($ProxyState.failCounts.ContainsKey($adapter.Name)) { [int]$ProxyState.failCounts[$adapter.Name] } else { 0 }
+            $attempts = $successCount + $failCount
+            $failRate = if ($attempts -gt 0) { [double]$failCount / [double]$attempts } else { 0.0 }
+
+            $rrBoost = if ($i -eq $PreferredIndex) { 0.02 } else { 0.0 }
+            $deficit = $targetShare - $currentShare
+            $score = ($deficit * 2.0) + ((1.0 - $utilization) * 0.15) - ($failRate * 0.40) + $rrBoost
+
+            $ranked += [pscustomobject]@{
+                Adapter = $adapter
+                Score = [math]::Round($score, 6)
+                Weight = $weight
+                Preferred = ($i -eq $PreferredIndex)
+            }
+        }
+
+        @($ranked | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Weight }; Descending = $true }, @{ Expression = { $_.Preferred }; Descending = $true })
+    }
+
     $connAdapter = $null  # track which adapter this connection uses
     $hostKey = $null
     $sessionKey = $null
@@ -1137,8 +1336,18 @@ $HandlerScript = {
                 $preferredIndex = 0
             }
 
-            $adapter = $avail[$preferredIndex]
-            $selectionReason = 'weighted-round-robin(per-connection)'
+            $selectionPlan = Get-LocalAdapterSelectionOrder -ProxyState $State -Adapters $avail -Weights ([double[]]$aw) -PreferredIndex $preferredIndex
+            if ($selectionPlan.Count -gt 0) {
+                $adapter = $selectionPlan[0].Adapter
+                $selectionReason = if ($selectionPlan[0].Preferred) {
+                    'weighted-round-robin(per-connection)'
+                } else {
+                    'weighted-round-robin(load-corrected)'
+                }
+            } else {
+                $adapter = $avail[$preferredIndex]
+                $selectionReason = 'weighted-round-robin(per-connection)'
+            }
 
             if ($aw.Count -gt 1) {
                 $maxWeight = [double](($aw | Measure-Object -Maximum).Maximum)
@@ -1172,18 +1381,23 @@ $HandlerScript = {
 
         # ===== Connect to remote via chosen adapter (with failover) =====
         $remoteClient = $null
-        $candidateAdapters = @($adapter)
-        $fallbackAdapters = @(
-            for ($fi = 0; $fi -lt $avail.Count; $fi++) {
-                if ($avail[$fi].Name -eq $adapter.Name) { continue }
-                [pscustomobject]@{
-                    Adapter = $avail[$fi]
-                    Weight = [double]$aw[$fi]
+        $candidateAdapters = @()
+        if ($selectionPlan -and $selectionPlan.Count -gt 0) {
+            $candidateAdapters = @($selectionPlan | Select-Object -ExpandProperty Adapter)
+        } else {
+            $candidateAdapters = @($adapter)
+            $fallbackAdapters = @(
+                for ($fi = 0; $fi -lt $avail.Count; $fi++) {
+                    if ($avail[$fi].Name -eq $adapter.Name) { continue }
+                    [pscustomobject]@{
+                        Adapter = $avail[$fi]
+                        Weight = [double]$aw[$fi]
+                    }
                 }
+            )
+            if ($fallbackAdapters.Count -gt 0) {
+                $candidateAdapters += @($fallbackAdapters | Sort-Object Weight -Descending | Select-Object -ExpandProperty Adapter)
             }
-        )
-        if ($fallbackAdapters.Count -gt 0) {
-            $candidateAdapters += @($fallbackAdapters | Sort-Object Weight -Descending | Select-Object -ExpandProperty Adapter)
         }
 
         $maxRetries = [math]::Min($candidateAdapters.Count, 3)
