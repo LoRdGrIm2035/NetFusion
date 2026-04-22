@@ -402,7 +402,7 @@ function Ensure-NetFusionRoutes {
 
         $secondaryRank++
         $originalMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $iface.InterfaceIndex -FallbackMetric $iface.InterfaceMetric
-        # NetFusion-FIX: 9 - Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
+        # NetFusion-FIX-9: Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
         if ($originalMetric -ge 9000) {
             $originalMetric = $primaryMetric + ($secondaryRank * 5)
         }

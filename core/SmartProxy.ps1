@@ -35,8 +35,8 @@ $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
 if (-not ('NetFusion.StreamCopier' -as [type])) {
-    # NetFusion-FIX: 1 - Raise relay socket buffers to 1 MB and harden bound outbound sockets for high-BDP links.
-    # NetFusion-FIX: 2 - Keep relay copy buffers at 256 KB to cut syscall churn in the hot path.
+    # NetFusion-FIX-1: Raise relay socket buffers to 1 MB and harden bound outbound sockets for high-BDP links.
+    # NetFusion-FIX-2: Keep relay copy buffers at 256 KB to cut syscall churn in the hot path.
     Add-Type -TypeDefinition @"
 using System;
 using System.IO;
@@ -47,6 +47,36 @@ using System.Threading.Tasks;
 
 namespace NetFusion
 {
+    public sealed class AtomicCounter
+    {
+        private long _value;
+
+        public long Add(long delta)
+        {
+            return Interlocked.Add(ref _value, delta);
+        }
+
+        public long Increment()
+        {
+            return Interlocked.Increment(ref _value);
+        }
+
+        public long Decrement()
+        {
+            return Interlocked.Decrement(ref _value);
+        }
+
+        public long Read()
+        {
+            return Interlocked.Read(ref _value);
+        }
+
+        public long Set(long value)
+        {
+            return Interlocked.Exchange(ref _value, value);
+        }
+    }
+
     public static class StreamCopier
     {
         private const int BufferSize = 262144;
@@ -272,6 +302,32 @@ namespace NetFusion
 "@ -Language CSharp
 }
 
+# NetFusion-FIX-5: Use Interlocked-backed counters instead of plain integers for shared relay statistics.
+function Get-OrCreate-AtomicCounter {
+    param(
+        [hashtable]$Map,
+        [string]$Key
+    )
+
+    $counter = $Map[$Key]
+    if ($null -eq $counter) {
+        $counter = [NetFusion.AtomicCounter]::new()
+        $Map[$Key] = $counter
+    }
+
+    return $counter
+}
+
+function Get-AtomicCounterValue {
+    param([object]$Counter)
+
+    if ($null -eq $Counter) {
+        return [int64]0
+    }
+
+    return [int64]$Counter.Read()
+}
+
 # ===== Thread-safe state =====
 $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
@@ -280,9 +336,9 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     connectionCounts = [hashtable]::Synchronized(@{})
     successCounts    = [hashtable]::Synchronized(@{})
     failCounts       = [hashtable]::Synchronized(@{})
-    totalConnections = 0
-    totalFails       = 0
-    activeConnections = 0        # v5.1: live active connection count
+    totalConnections = [NetFusion.AtomicCounter]::new()
+    totalFails       = [NetFusion.AtomicCounter]::new()
+    activeConnections = [NetFusion.AtomicCounter]::new()        # v5.1: live active connection count
     activePerAdapter  = [hashtable]::Synchronized(@{})      # v5.1: per-adapter active counts
     activePerHost     = [hashtable]::Synchronized(@{})      # v5.1: per-host active counts for dynamic bulk detection
     currentMode      = 'maxspeed'
@@ -588,7 +644,7 @@ function Update-AdaptersAndWeights {
             $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
             if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
-            # NetFusion-FIX: 7 - Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
+            # NetFusion-FIX-7: Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
             if ($cfg.proxy -and $null -ne $cfg.proxy.sessionAffinityTTL) {
                 $ttl = [int]$cfg.proxy.sessionAffinityTTL
                 if ($ttl -gt 0) {
@@ -604,7 +660,7 @@ function Update-AdaptersAndWeights {
         } catch {}
     }
 
-    # NetFusion-FIX: 6 - Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
+    # NetFusion-FIX-6: Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
@@ -635,11 +691,10 @@ function Update-AdaptersAndWeights {
         $w = [math]::Max(1.0, [math]::Round($linkSpeedMbps * $healthFactor, 2))
 
         $weights += $w
-        if (-not $s.connectionCounts.ContainsKey($a.Name)) {
-            $s.connectionCounts[$a.Name] = 0
-            $s.successCounts[$a.Name] = 0
-            $s.failCounts[$a.Name] = 0
-        }
+        [void](Get-OrCreate-AtomicCounter -Map $s.connectionCounts -Key $a.Name)
+        [void](Get-OrCreate-AtomicCounter -Map $s.successCounts -Key $a.Name)
+        [void](Get-OrCreate-AtomicCounter -Map $s.failCounts -Key $a.Name)
+        [void](Get-OrCreate-AtomicCounter -Map $s.activePerAdapter -Key $a.Name)
     }
     $s.weights = $weights
     $s.rrSchedule = New-WeightedRoundRobinSchedule -Weights ([double[]]$weights)
@@ -697,7 +752,7 @@ function Get-AdapterSelectionOrder {
     $totalActive = 0
     foreach ($adapter in $Adapters) {
         if ($State.activePerAdapter.ContainsKey($adapter.Name)) {
-            $totalActive += [int]$State.activePerAdapter[$adapter.Name]
+            $totalActive += [int](Get-AtomicCounterValue -Counter $State.activePerAdapter[$adapter.Name])
         }
     }
 
@@ -710,7 +765,7 @@ function Get-AdapterSelectionOrder {
         $adapter = $Adapters[$i]
         $weight = [double]$weightValues[$i]
         $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
-        $activeCount = if ($State.activePerAdapter.ContainsKey($adapter.Name)) { [int]$State.activePerAdapter[$adapter.Name] } else { 0 }
+        $activeCount = if ($State.activePerAdapter.ContainsKey($adapter.Name)) { [int](Get-AtomicCounterValue -Counter $State.activePerAdapter[$adapter.Name]) } else { 0 }
         $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
 
         $h = $State.adapterHealth[$adapter.Name]
@@ -724,8 +779,8 @@ function Get-AdapterSelectionOrder {
         $observedMbps = Get-AdapterObservedMbps -State $State -Adapter $adapter
         $utilization = [math]::Min(1.50, ($observedMbps / [math]::Max(50.0, $linkSpeedMbps)))
 
-        $successCount = if ($State.successCounts.ContainsKey($adapter.Name)) { [int]$State.successCounts[$adapter.Name] } else { 0 }
-        $failCount = if ($State.failCounts.ContainsKey($adapter.Name)) { [int]$State.failCounts[$adapter.Name] } else { 0 }
+        $successCount = if ($State.successCounts.ContainsKey($adapter.Name)) { [int](Get-AtomicCounterValue -Counter $State.successCounts[$adapter.Name]) } else { 0 }
+        $failCount = if ($State.failCounts.ContainsKey($adapter.Name)) { [int](Get-AtomicCounterValue -Counter $State.failCounts[$adapter.Name]) } else { 0 }
         $attempts = $successCount + $failCount
         $failRate = if ($attempts -gt 0) { [double]$failCount / [double]$attempts } else { 0.0 }
 
@@ -752,9 +807,9 @@ function Update-ProxyStats {
         $h = $s.adapterHealth[$a.Name]
         $aStats += @{
             name = $a.Name; type = $a.Type; ip = $a.IP
-            connections = $s.connectionCounts[$a.Name]
-            successes = $s.successCounts[$a.Name]
-            failures = $s.failCounts[$a.Name]
+            connections = [int](Get-AtomicCounterValue -Counter $s.connectionCounts[$a.Name])
+            successes = [int](Get-AtomicCounterValue -Counter $s.successCounts[$a.Name])
+            failures = [int](Get-AtomicCounterValue -Counter $s.failCounts[$a.Name])
             health = if ($h) { $h.Score } else { 0 }
             latency = if ($h) { $h.LatencyEWMA } else { 999 }
             jitter = if ($h) { $h.Jitter } else { 0 }
@@ -764,7 +819,7 @@ function Update-ProxyStats {
     # Build per-adapter active counts
     $activePerAdapterSnap = @{}
     foreach ($a in $s.adapters) {
-        $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { $s.activePerAdapter[$a.Name] } else { 0 }
+        $activePerAdapterSnap[$a.Name] = if ($s.activePerAdapter.ContainsKey($a.Name)) { [int](Get-AtomicCounterValue -Counter $s.activePerAdapter[$a.Name]) } else { 0 }
     }
     $sessionStats = @{
         activeSessionCount = $s.sessionMap.Count
@@ -794,8 +849,8 @@ function Update-ProxyStats {
     }
     $statsSnapshot = @{
         running = $true; port = $s.port; mode = $s.currentMode
-        totalConnections = $s.totalConnections; totalFailures = $s.totalFails
-        activeConnections = $s.activeConnections
+        totalConnections = [int](Get-AtomicCounterValue -Counter $s.totalConnections); totalFailures = [int](Get-AtomicCounterValue -Counter $s.totalFails)
+        activeConnections = [int](Get-AtomicCounterValue -Counter $s.activeConnections)
         activePerAdapter = $activePerAdapterSnap
         adapterCount = $s.adapters.Count; adapters = $aStats
         connectionTypes = $s.connectionTypes
@@ -916,6 +971,31 @@ function Clear-ExpiredUploadHostHints {
 # ===== Connection Handler ScriptBlock (runs in separate runspace) =====
 $HandlerScript = {
     param($ClientSocket, $State)
+
+    function Get-OrCreate-LocalAtomicCounter {
+        param(
+            [hashtable]$Map,
+            [string]$Key
+        )
+
+        $counter = $Map[$Key]
+        if ($null -eq $counter) {
+            $counter = [NetFusion.AtomicCounter]::new()
+            $Map[$Key] = $counter
+        }
+
+        return $counter
+    }
+
+    function Get-LocalAtomicCounterValue {
+        param([object]$Counter)
+
+        if ($null -eq $Counter) {
+            return [int64]0
+        }
+
+        return [int64]$Counter.Read()
+    }
 
     function Read-HttpLine {
         param([System.IO.Stream]$Stream)
@@ -1069,7 +1149,7 @@ $HandlerScript = {
         $totalActive = 0
         foreach ($adapter in $Adapters) {
             if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) {
-                $totalActive += [int]$ProxyState.activePerAdapter[$adapter.Name]
+                $totalActive += [int](Get-LocalAtomicCounterValue -Counter $ProxyState.activePerAdapter[$adapter.Name])
             }
         }
 
@@ -1082,7 +1162,7 @@ $HandlerScript = {
             $adapter = $Adapters[$i]
             $weight = [double]$weightValues[$i]
             $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
-            $activeCount = if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) { [int]$ProxyState.activePerAdapter[$adapter.Name] } else { 0 }
+            $activeCount = if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) { [int](Get-LocalAtomicCounterValue -Counter $ProxyState.activePerAdapter[$adapter.Name]) } else { 0 }
             $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
 
             $h = $ProxyState.adapterHealth[$adapter.Name]
@@ -1096,8 +1176,8 @@ $HandlerScript = {
             $observedMbps = Get-LocalAdapterObservedMbps -ProxyState $ProxyState -Adapter $adapter
             $utilization = [math]::Min(1.50, ($observedMbps / [math]::Max(50.0, $linkSpeedMbps)))
 
-            $successCount = if ($ProxyState.successCounts.ContainsKey($adapter.Name)) { [int]$ProxyState.successCounts[$adapter.Name] } else { 0 }
-            $failCount = if ($ProxyState.failCounts.ContainsKey($adapter.Name)) { [int]$ProxyState.failCounts[$adapter.Name] } else { 0 }
+            $successCount = if ($ProxyState.successCounts.ContainsKey($adapter.Name)) { [int](Get-LocalAtomicCounterValue -Counter $ProxyState.successCounts[$adapter.Name]) } else { 0 }
+            $failCount = if ($ProxyState.failCounts.ContainsKey($adapter.Name)) { [int](Get-LocalAtomicCounterValue -Counter $ProxyState.failCounts[$adapter.Name]) } else { 0 }
             $attempts = $successCount + $failCount
             $failRate = if ($attempts -gt 0) { [double]$failCount / [double]$attempts } else { 0.0 }
 
@@ -1292,9 +1372,8 @@ $HandlerScript = {
 
         # v5.1: Track host concurrency for dynamic download manager detection
         $hostKey = $targetHost
-        if (-not $State.activePerHost.ContainsKey($hostKey)) { $State.activePerHost[$hostKey] = 0 }
-        $State.activePerHost[$hostKey]++
-        $activeHostCount = $State.activePerHost[$hostKey]
+        $hostCounter = Get-OrCreate-LocalAtomicCounter -Map $State.activePerHost -Key $hostKey
+        $activeHostCount = [int]$hostCounter.Increment()
 
         $portClasses = $State.portClasses
         $gamingPorts = if ($portClasses -and $portClasses.gaming) { @($portClasses.gaming) } else { @() }
@@ -1329,8 +1408,8 @@ $HandlerScript = {
             $aw += $State.weights[$i]
         }
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
-        $State.totalConnections++
-        $State.activeConnections++
+        $null = $State.totalConnections.Increment()
+        $null = $State.activeConnections.Increment()
         $sessionKey = if ($targetHost) { "{0}:{1}" -f $targetHost, $rPort } else { $null }
 
         $adapter = $avail[0]
@@ -1368,7 +1447,7 @@ $HandlerScript = {
                 $weightsNearlyEqual = ([math]::Abs($maxWeight - $minWeight) -le [math]::Max(5.0, ($maxWeight * 0.05)))
             }
 
-            # NetFusion-FIX: 7 - Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
+            # NetFusion-FIX-7: Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
             if ($weightsNearlyEqual -and $sessionKey -and $connType -ne 'bulk') {
                 $hintEntry = $null
                 if ($State.sessionMap.TryGetValue($sessionKey, [ref]$hintEntry) -and $hintEntry -and $hintEntry.adapter) {
@@ -1423,15 +1502,15 @@ $HandlerScript = {
 
             try {
                 if (-not $adapter.IP -or $adapter.IP -match '^169\.254\.') {
-                    $State.failCounts[$adapter.Name]++
-                    $State.totalFails++
+                    $null = (Get-OrCreate-LocalAtomicCounter -Map $State.failCounts -Key $adapter.Name).Increment()
+                    $null = $State.totalFails.Increment()
                     continue
                 }
 
-                # NetFusion-FIX: 4 - Bind outbound sockets to the chosen adapter's local IPv4 before connect so Windows uses that WAN path.
+                # NetFusion-FIX-4: Bind outbound sockets to the chosen adapter's local IPv4 before connect so Windows uses that WAN path.
                 $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
                 $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, 5000, $ifIndex)
-                # NetFusion-FIX: 1 - Keep both tunnel endpoints at 1 MB buffers with eager sends and short linger teardown.
+                # NetFusion-FIX-1: Keep both tunnel endpoints at 1 MB buffers with eager sends and short linger teardown.
                 $remoteClient.NoDelay = $true
                 $remoteClient.ReceiveBufferSize = 1048576
                 $remoteClient.SendBufferSize = 1048576
@@ -1439,8 +1518,7 @@ $HandlerScript = {
                 $remoteClient.SendTimeout = 15000
                 $remoteClient.ReceiveTimeout = 15000
 
-                if (-not $State.activePerAdapter.ContainsKey($adapter.Name)) { $State.activePerAdapter[$adapter.Name] = 0 }
-                $State.activePerAdapter[$adapter.Name] = [int]$State.activePerAdapter[$adapter.Name] + 1
+                $null = (Get-OrCreate-LocalAtomicCounter -Map $State.activePerAdapter -Key $adapter.Name).Increment()
                 $connAdapter = $adapter.Name
 
                 if ($sessionKey) {
@@ -1455,15 +1533,16 @@ $HandlerScript = {
                     }
                 }
 
-                $State.connectionCounts[$adapter.Name]++
-                $State.successCounts[$adapter.Name]++
+                $null = (Get-OrCreate-LocalAtomicCounter -Map $State.connectionCounts -Key $adapter.Name).Increment()
+                $null = (Get-OrCreate-LocalAtomicCounter -Map $State.successCounts -Key $adapter.Name).Increment()
                 break
             } catch {
                 try { $remoteClient.Close() } catch {}
                 try { $remoteClient.Dispose() } catch {}
                 $remoteClient = $null
             }
-            $State.failCounts[$adapter.Name]++; $State.totalFails++
+            $null = (Get-OrCreate-LocalAtomicCounter -Map $State.failCounts -Key $adapter.Name).Increment()
+            $null = $State.totalFails.Increment()
         }
 
         if (-not $remoteClient) {
@@ -1484,7 +1563,7 @@ $HandlerScript = {
             $clientStream.WriteTimeout = [System.Threading.Timeout]::Infinite
             $remoteStream.ReadTimeout = [System.Threading.Timeout]::Infinite
             $remoteStream.WriteTimeout = [System.Threading.Timeout]::Infinite
-            # NetFusion-FIX: 3 - Keep HTTPS tunnels fully bidirectional so ACK and payload paths are not serialized.
+            # NetFusion-FIX-3: Keep HTTPS tunnels fully bidirectional so ACK and payload paths are not serialized.
             [NetFusion.StreamCopier]::CopyStreamBidirectional(
                 $clientStream,
                 $remoteStream,
@@ -1538,13 +1617,15 @@ $HandlerScript = {
         }
 
     } catch {} finally {
-        # v5.1: Decrement active connection counters
-        if ($State.activeConnections -gt 0) { $State.activeConnections-- }
+        # NetFusion-FIX-5: Use atomic decrement paths for shared connection counters during cleanup.
+        if ($State.activeConnections.Read() -gt 0) { $null = $State.activeConnections.Decrement() }
         if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
-            $State.activePerAdapter[$connAdapter] = [math]::Max(0, $State.activePerAdapter[$connAdapter] - 1)
+            $adapterCounter = $State.activePerAdapter[$connAdapter]
+            if ($adapterCounter -and $adapterCounter.Read() -gt 0) { $null = $adapterCounter.Decrement() }
         }
         if ($hostKey -and $State.activePerHost.ContainsKey($hostKey)) {
-            $State.activePerHost[$hostKey] = [math]::Max(0, $State.activePerHost[$hostKey] - 1)
+            $hostCounter = $State.activePerHost[$hostKey]
+            if ($hostCounter -and $hostCounter.Read() -gt 0) { $null = $hostCounter.Decrement() }
         }
         try { if ($remoteStream) { $remoteStream.Dispose() } } catch {}
         try { if ($clientStream) { $clientStream.Dispose() } } catch {}
@@ -1610,7 +1691,7 @@ Write-Host ""
 Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (connection-level WRR + safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
-# NetFusion-FIX: 1 - Increase the listener socket buffers so accepted proxy sockets inherit a large receive window.
+# NetFusion-FIX-1: Increase the listener socket buffers so accepted proxy sockets inherit a large receive window.
 $listener.Server.ReceiveBufferSize = 1048576
 $listener.Server.SendBufferSize = 1048576
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
@@ -1710,7 +1791,7 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
-        # NetFusion-FIX: 8 - Disable Nagle on proxy sockets so ACK/control packets are not delayed in the relay.
+        # NetFusion-FIX-8: Disable Nagle on proxy sockets so ACK/control packets are not delayed in the relay.
         $client.NoDelay = $true
         $client.ReceiveBufferSize = 1048576
         $client.SendBufferSize = 1048576
@@ -1727,14 +1808,14 @@ try {
         if (($nowTicks - $lastLogTicks) -gt $logIntervalTicks) {
             $s = $global:ProxyState
             $connParts = @()
-            foreach ($a in $s.adapters) { $connParts += "$($a.Name):$($s.connectionCounts[$a.Name])" }
+            foreach ($a in $s.adapters) { $connParts += "$($a.Name):$(Get-AtomicCounterValue -Counter $s.connectionCounts[$a.Name])" }
             $typeStr = @()
             foreach ($k in @('bulk','interactive','streaming','gaming')) {
                 if ($s.connectionTypes.ContainsKey($k)) { $typeStr += "$k=$($s.connectionTypes[$k])" }
             }
             $safeFlag = if ($s.safeMode) { ' [SAFE]' } else { '' }
             $ts = [System.DateTimeOffset]::Now.ToString('HH:mm:ss')
-            Write-Host "  [$ts] conns=$($s.totalConnections) | $($connParts -join ' | ') | threads=$($jobs.Count) | sessions=$($s.sessionMap.Count)$safeFlag | $($typeStr -join ' ')" -ForegroundColor DarkGray
+            Write-Host "  [$ts] conns=$(Get-AtomicCounterValue -Counter $s.totalConnections) | $($connParts -join ' | ') | threads=$($jobs.Count) | sessions=$($s.sessionMap.Count)$safeFlag | $($typeStr -join ' ')" -ForegroundColor DarkGray
             $lastLogTicks = $nowTicks
         }
     }

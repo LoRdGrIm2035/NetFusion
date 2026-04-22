@@ -41,7 +41,7 @@ $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFro
 $pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
 $pingTarget2 = '1.1.1.1'
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
-# NetFusion-FIX: 11 - Slow the primary health cadence down to a 10s TCP probe and reserve full latency/jitter sampling for 60s intervals.
+# NetFusion-FIX-11: Slow the primary health cadence down to a 10s TCP probe and reserve full latency/jitter sampling for 60s intervals.
 $script:healthPrimaryIntervalSeconds = if ($config -and $config.healthCheck -and $config.healthCheck.primaryIntervalSeconds) { [Math]::Max(10, [int]$config.healthCheck.primaryIntervalSeconds) } else { 10 }
 $script:healthFullMeasurementIntervalSeconds = if ($config -and $config.healthCheck -and $config.healthCheck.fullMeasurementIntervalSeconds) { [Math]::Max(30, [int]$config.healthCheck.fullMeasurementIntervalSeconds) } else { 60 }
 $script:tcpProbeTarget = if ($config -and $config.healthCheck -and $config.healthCheck.tcpTarget) { [string]$config.healthCheck.tcpTarget } else { '1.1.1.1' }
@@ -239,8 +239,8 @@ function Test-InternetLatency {
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $tcp.NoDelay = $true
-        $tcp.ReceiveBufferSize = 524288
-        $tcp.SendBufferSize = 524288
+        $tcp.ReceiveBufferSize = 1048576
+        $tcp.SendBufferSize = 1048576
         $asyncResult = $tcp.BeginConnect($Target, 53, $null, $null)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
@@ -550,7 +550,7 @@ function Measure-InterfaceHealth {
         $packetLoss = 5.0
     }
 
-    # NetFusion-FIX: 6 - Score adapters with bandwidth as the primary factor, then latency, jitter, and loss.
+    # NetFusion-FIX-6: Score adapters with bandwidth as the primary factor, then latency, jitter, and loss.
     $hasIP = [bool]$ip
     $linkSpeedMbps = if ($null -ne $Interface.LinkSpeedMbps) { [double]$Interface.LinkSpeedMbps } else { 0.0 }
     if ($linkSpeedMbps -le 0.0 -and $previousHealth -and $previousHealth.LinkSpeedMbps) {

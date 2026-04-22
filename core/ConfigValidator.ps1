@@ -107,6 +107,7 @@ function Check-Enum($obj, $prop, $allowed, $default) {
 # Validate Core
 Check-Number $config 'proxyPort' 1024 65535 8080
 Check-Number $config 'dashboardPort' 1024 65535 9090
+Check-Number $config 'monitorInterval' 1000 60000 10000
 Check-Enum $config 'mode' $validModes 'maxspeed'
 Check-Bool $config 'dashboardAllowLAN' $false
 Check-Bool $config 'blockQUICOnSecondaryAdapters' $true
@@ -121,9 +122,17 @@ if ($config.proxyPort -eq $config.dashboardPort) {
 if ($config.proxy) {
     Check-Number $config.proxy 'minThreads' 4 128 64
     Check-Number $config.proxy 'maxThreads' 8 256 256
-    Check-Number $config.proxy 'bufferSize' 8192 1048576 65536
+    Check-Number $config.proxy 'bufferSize' 8192 1048576 262144
     Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
-    Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 300
+    Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 60
+}
+
+if ($config.healthCheck) {
+    Check-Number $config.healthCheck 'timeout' 250 10000 1500
+    Check-Number $config.healthCheck 'failThreshold' 1 20 3
+    Check-Number $config.healthCheck 'primaryIntervalSeconds' 10 120 10
+    Check-Number $config.healthCheck 'fullMeasurementIntervalSeconds' 30 600 60
+    Check-Number $config.healthCheck 'tcpPort' 1 65535 80
 }
 
 # Validate circuit breaker

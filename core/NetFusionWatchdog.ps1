@@ -38,8 +38,8 @@ while ($true) {
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $tcp.NoDelay = $true
-        $tcp.ReceiveBufferSize = 524288
-        $tcp.SendBufferSize = 524288
+        $tcp.ReceiveBufferSize = 1048576
+        $tcp.SendBufferSize = 1048576
         $ar = $tcp.BeginConnect('127.0.0.1', $proxyPort, $null, $null)
         if ($ar.AsyncWaitHandle.WaitOne(500, $false)) {
             $isListening = $true

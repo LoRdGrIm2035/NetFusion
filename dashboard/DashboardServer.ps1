@@ -301,7 +301,7 @@ function Test-IsMutationAuthorized {
 }
 
 function Get-ClientInterfaces {
-    # NetFusion-FIX: 10 - Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
+    # NetFusion-FIX-10: Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
     $data = Get-CachedJsonFile -Path (Join-Path $configDir "interfaces.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $interfaces = @()
     if ($data -and $data.interfaces) {
@@ -619,6 +619,8 @@ $listener = $null
 try {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
     $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+    $listener.Server.ReceiveBufferSize = 1048576
+    $listener.Server.SendBufferSize = 1048576
     $listener.Start()
 
     $global:DashToken = Ensure-DashboardToken
@@ -641,8 +643,8 @@ try {
 
         $client = $listener.AcceptTcpClient()
         $client.NoDelay = $true
-        $client.ReceiveBufferSize = 524288
-        $client.SendBufferSize = 524288
+        $client.ReceiveBufferSize = 1048576
+        $client.SendBufferSize = 1048576
         $stream = $client.GetStream()
         $stream.ReadTimeout = 5000
 
