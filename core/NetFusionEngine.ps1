@@ -135,36 +135,6 @@ function Wait-ProxyBind {
     return $false
 }
 
-function Get-AvailableRecoveryIP {
-    param(
-        [string]$Subnet,
-        [int]$StartOctet = 147
-    )
-
-    $usedIPs = @()
-    try {
-        $usedIPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -like "$Subnet.*" } |
-            Select-Object -ExpandProperty IPAddress)
-    } catch {}
-
-    for ($octet = [math]::Max(2, $StartOctet); $octet -lt 254; $octet++) {
-        $candidate = "$Subnet.$octet"
-        if ($candidate -in $usedIPs) { continue }
-
-        $inUse = $false
-        try {
-            $inUse = Test-Connection -ComputerName $candidate -Count 1 -Quiet -ErrorAction SilentlyContinue
-        } catch {}
-
-        if (-not $inUse) {
-            return $candidate
-        }
-    }
-
-    return $null
-}
-
 function Invoke-EngineNetworkRestore {
     if ($script:NetworkRestoreInvoked) {
         return
@@ -293,36 +263,29 @@ function Repair-AdapterDHCP {
             if (-not $alreadyKnown) {
                 Write-Host "  [REPAIR] $($adapter.Name) has APIPA ($ip) or no route - attempting fix..." -ForegroundColor Yellow
                 
-                # Try to find gateway from a working adapter on same subnet
-                $workingGW = ($Interfaces | Where-Object { $_.Gateway } | Select-Object -First 1).Gateway
-                if ($workingGW) {
-                    try {
-                        # Remove APIPA address
-                        Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
-                            Where-Object { $_.IPAddress -match '^169\.254\.' } | 
-                            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-                        
-                        # Determine a safe static IP (use .147 for second adapter, .148 for third, etc.)
-                        $sortedIndexes = @($allAdapters | Select-Object -ExpandProperty ifIndex | Sort-Object)
-                        $adapterPosition = [Array]::IndexOf($sortedIndexes, $adapter.ifIndex)
-                        $lastOctet = if ($adapterPosition -ge 0) { 147 + $adapterPosition } else { 149 }
-                        
-                        # Apply static IP with same gateway as working adapter
-                        $gwParts = $workingGW -split '\.'
-                        $subnet = "$($gwParts[0]).$($gwParts[1]).$($gwParts[2])"
-                        $availableIP = Get-AvailableRecoveryIP -Subnet $subnet -StartOctet $lastOctet
-                        if (-not $availableIP) {
-                            Write-Host "  [REPAIR] No available recovery IP found in $subnet.0/24 for $($adapter.Name)" -ForegroundColor Red
-                            continue
-                        }
-                        
-                        New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $availableIP -PrefixLength 24 -DefaultGateway $workingGW -ErrorAction SilentlyContinue | Out-Null
-                        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @("8.8.8.8","1.1.1.1") -ErrorAction SilentlyContinue
-                        
-                        Write-Host "  [REPAIR] Applied static IP $availableIP to $($adapter.Name)" -ForegroundColor Green
-                    } catch {
-                        Write-Host "  [REPAIR] Failed: $_" -ForegroundColor Red
+                try {
+                    # NetFusion-FIX-19: Never force static IPv4 during recovery. Static fallback can persist after exit and degrade Wi-Fi.
+                    foreach ($manualIp in @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' })) {
+                        try {
+                            Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $manualIp.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                        } catch {}
                     }
+
+                    Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
+                    Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+                    ipconfig /renew "$($adapter.Name)" | Out-Null
+
+                    Start-Sleep -Seconds 2
+                    $updatedIp = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                        Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } |
+                        Select-Object -First 1).IPAddress
+                    if ($updatedIp) {
+                        Write-Host "  [REPAIR] DHCP recovery succeeded for $($adapter.Name): $updatedIp" -ForegroundColor Green
+                    } else {
+                        Write-Host "  [REPAIR] DHCP recovery attempted for $($adapter.Name), but no valid IPv4 yet." -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-Host "  [REPAIR] Failed: $_" -ForegroundColor Red
                 }
             }
         }

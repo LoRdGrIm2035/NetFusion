@@ -15,7 +15,7 @@ echo  [1/5] Killing all NetFusion services...
 taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
-powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'DualWifi' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match '(NetFusion|SmartProxy|DashboardServer|NetFusionEngine|NetFusionWatchdog)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
 timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----

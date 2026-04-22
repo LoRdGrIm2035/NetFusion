@@ -126,6 +126,13 @@ function Get-OriginalDnsSettings {
     )
 }
 
+function Get-OriginalDhcpSettings {
+    return @(
+        Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Select-Object InterfaceIndex, InterfaceAlias, Dhcp
+    )
+}
+
 function Get-MetricLookup {
     param([object]$Metrics)
 
@@ -625,6 +632,36 @@ function Restore-OriginalDnsSettings {
     }
 }
 
+function Restore-OriginalDhcpSettings {
+    param([object]$State)
+
+    foreach ($dhcpEntry in @($State.originalDhcpSettings)) {
+        try {
+            $idx = [int]$dhcpEntry.InterfaceIndex
+            $dhcpEnabled = [string]$dhcpEntry.Dhcp -match 'Enabled|True'
+            if (-not $dhcpEnabled) {
+                continue
+            }
+
+            # NetFusion-FIX-19: If a previous session forced a static IPv4 during repair, revert DHCP-enabled interfaces back to DHCP.
+            foreach ($manualIp in @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' })) {
+                try {
+                    Remove-NetIPAddress -InterfaceIndex $idx -IPAddress $manualIp.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
+            Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
+            Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
+
+            if ($dhcpEntry.InterfaceAlias) {
+                try { ipconfig /renew "$($dhcpEntry.InterfaceAlias)" | Out-Null } catch {}
+            }
+        } catch {
+            Write-NetworkStateMessage ("Failed to restore DHCP mode on interface {0}: {1}" -f $dhcpEntry.InterfaceIndex, $_.Exception.Message) 'Yellow'
+        }
+    }
+}
+
 function Remove-AddedRoutes {
     param([object]$State)
 
@@ -679,6 +716,7 @@ function Invoke-NetworkRestore {
 
     try { Restore-ProxySettings -State $state } catch {}
     try { Restore-IdmSettings -State $state } catch {}
+    try { if ($state) { Restore-OriginalDhcpSettings -State $state } } catch {}
     try { if ($state) { Restore-OriginalRoutes -State $state } } catch {}
     try { if ($state) { Remove-AddedRoutes -State $state } } catch {}
     try { if ($state) { Restore-OriginalMetrics -State $state } } catch {}
@@ -707,6 +745,7 @@ function Save-OriginalNetworkState {
         originalRoutes = @(Get-OriginalRoutes)
         originalMetrics = @(Get-OriginalMetrics)
         originalDnsSettings = @(Get-OriginalDnsSettings)
+        originalDhcpSettings = @(Get-OriginalDhcpSettings)
         originalProxySettings = Get-OriginalProxySettings
         originalIdmSettings = Get-OriginalIdmSettings
         addedRoutes = @()
