@@ -74,6 +74,8 @@ This project is designed for real aggregate throughput on workloads that already
 | Local proxy | `127.0.0.1:8080` |
 | Dashboard | `http://localhost:9090` |
 | Privileges | Administrator required for route, firewall, proxy, and interface metric changes |
+| Wi-Fi capability model | Wi-Fi 1 (802.11b) through Wi-Fi 7 (802.11be), plus latest generation detection |
+| Ethernet capability model | Ethernet v1 (10MbE) through latest generation detection (up to 800GbE mapping) |
 | Best workloads | IDM, `aria2`, torrent clients, multi-request downloaders, parallel API fetchers |
 | Runtime config | [`config/config.default.json`](./config/config.default.json) |
 

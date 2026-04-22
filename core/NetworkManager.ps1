@@ -47,7 +47,13 @@ function Write-AtomicJson {
 
 function Get-AdapterCapabilityScore {
     <# Score an adapter based on its inherent capabilities (0-100). #>
-    param([string]$Type, [double]$LinkSpeedMbps, [string]$Status, [int]$WiFiGen = 0)
+    param(
+        [string]$Type,
+        [double]$LinkSpeedMbps,
+        [string]$Status,
+        [double]$WiFiGen = 0,
+        [int]$EthernetGen = 0
+    )
 
     if ($Status -ne 'Up') { return 0 }
     $score = 30  # Base score for being active
@@ -68,14 +74,34 @@ function Get-AdapterCapabilityScore {
     if ($LinkSpeedMbps -ge 1000) { $score += 10 }
     elseif ($LinkSpeedMbps -ge 300) { $score += 5 }
 
-    # Wi-Fi generation bonus (newer = better radios, MU-MIMO, OFDMA)
+    # Wi-Fi generation bonus (Wi-Fi 1 -> latest)
     switch ($WiFiGen) {
-        8 { $score += 18 }  # Wi-Fi 8 (802.11bn, future)
-        7 { $score += 15 }  # Wi-Fi 7 (802.11be, MLO, 320MHz, 4096-QAM)
-        { $_ -eq 6.1 } { $score += 12 }  # Wi-Fi 6E (6GHz band)
-        6 { $score += 10 }  # Wi-Fi 6 (802.11ax, OFDMA, MU-MIMO)
-        5 { $score += 5 }   # Wi-Fi 5 (802.11ac, 5GHz)
-        4 { $score += 2 }   # Wi-Fi 4 (802.11n)
+        { $_ -ge 8 } { $score += 18 }  # Wi-Fi latest (802.11bn+)
+        7 { $score += 15 }              # Wi-Fi 7 (802.11be)
+        { $_ -eq 6.1 } { $score += 12 } # Wi-Fi 6E (6GHz)
+        6 { $score += 10 }              # Wi-Fi 6 (802.11ax)
+        5 { $score += 7 }               # Wi-Fi 5 (802.11ac)
+        4 { $score += 5 }               # Wi-Fi 4 (802.11n)
+        3 { $score += 3 }               # Wi-Fi 3 (802.11g)
+        2 { $score += 2 }               # Wi-Fi 2 (802.11a)
+        1 { $score += 1 }               # Wi-Fi 1 (802.11b)
+    }
+
+    # Ethernet generation bonus (Ethernet v1 -> latest)
+    switch ($EthernetGen) {
+        { $_ -ge 13 } { $score += 18 } # 800GbE+
+        12 { $score += 16 }             # 400GbE
+        11 { $score += 15 }             # 200GbE
+        10 { $score += 14 }             # 100GbE
+        9 { $score += 13 }              # 50GbE
+        8 { $score += 12 }              # 40GbE
+        7 { $score += 11 }              # 25GbE
+        6 { $score += 10 }              # 10GbE
+        5 { $score += 8 }               # 5GbE
+        4 { $score += 6 }               # 2.5GbE
+        3 { $score += 4 }               # 1GbE
+        2 { $score += 2 }               # 100MbE
+        1 { $score += 1 }               # 10MbE
     }
 
     return [math]::Min(100, $score)
@@ -89,6 +115,21 @@ function Get-AdapterFingerprint {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $hash = $sha.ComputeHash($bytes)
     return [BitConverter]::ToString($hash[0..7]).Replace('-', '').ToLower()
+}
+
+function Get-LinkSpeedMbps {
+    param([string]$LinkSpeed)
+
+    if ($LinkSpeed -match '([\d.]+)\s*(Gbps|Mbps|Kbps)') {
+        $val = [double]$Matches[1]
+        switch ($Matches[2]) {
+            'Gbps' { return ($val * 1000) }
+            'Mbps' { return $val }
+            'Kbps' { return ($val / 1000) }
+        }
+    }
+
+    return 0
 }
 
 function Get-AllNetworkInterfaces {
@@ -116,14 +157,18 @@ function Get-AllNetworkInterfaces {
             $type = 'Ethernet'
         }
 
+        $linkSpeedMbps = Get-LinkSpeedMbps -LinkSpeed ([string]$adapter.LinkSpeed)
+
         # Detect Wi-Fi generation from adapter description
-        # Supports: Wi-Fi 4 (802.11n), 5 (802.11ac), 6 (802.11ax), 6E (6GHz), 7 (802.11be), 8+ (802.11bn+)
+        # Supports: Wi-Fi 1 (802.11b) through Wi-Fi 7 (802.11be) and latest (802.11bn+)
         $wifiGen = 0
         $wifiGenLabel = ''
+        $ethernetGen = 0
+        $ethernetGenLabel = ''
         $desc = $adapter.InterfaceDescription
         if ($type -match 'WiFi') {
             if ($desc -match '802\.11bn|Wi-?Fi\s*8') {
-                $wifiGen = 8; $wifiGenLabel = 'Wi-Fi 8 (802.11bn)'
+                $wifiGen = 8; $wifiGenLabel = 'Wi-Fi Latest (802.11bn+)'
             } elseif ($desc -match '802\.11be|Wi-?Fi\s*7|BE200|BE202|KILLER.*BE|QCA6698|QCN9274|MT7925|RTL8922') {
                 $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (802.11be)'
             } elseif ($desc -match '6\s*GHz|Wi-?Fi\s*6E|AX2[01]1|AX411|AX1690|KILLER.*AX.*6E') {
@@ -134,19 +179,45 @@ function Get-AllNetworkInterfaces {
                 $wifiGen = 5; $wifiGenLabel = 'Wi-Fi 5 (802.11ac)'
             } elseif ($desc -match '802\.11n|Wi-?Fi\s*4|Wireless-N|RTL8188|RT3572|AR9271|AR9462') {
                 $wifiGen = 4; $wifiGenLabel = 'Wi-Fi 4 (802.11n)'
+            } elseif ($desc -match '802\.11g|Wi-?Fi\s*3|Wireless-G') {
+                $wifiGen = 3; $wifiGenLabel = 'Wi-Fi 3 (802.11g)'
+            } elseif ($desc -match '802\.11a|Wi-?Fi\s*2|Wireless-A') {
+                $wifiGen = 2; $wifiGenLabel = 'Wi-Fi 2 (802.11a)'
+            } elseif ($desc -match '802\.11b|Wi-?Fi\s*1|Wireless-B') {
+                $wifiGen = 1; $wifiGenLabel = 'Wi-Fi 1 (802.11b)'
             } elseif ($desc -match '802\.11[abg]\b') {
-                $wifiGen = 3; $wifiGenLabel = 'Legacy (802.11a/b/g)'
+                $wifiGen = 3; $wifiGenLabel = 'Wi-Fi 3 (802.11g, legacy fallback)'
             } else {
                 # Fallback: guess from link speed if description doesn't match
-                if ($adapter.LinkSpeed -match '[\d.]+') {
-                    $rawSpeed = 0
-                    if ($adapter.LinkSpeed -match '([\d.]+)\s*Gbps') { $rawSpeed = [double]$Matches[1] * 1000 }
-                    elseif ($adapter.LinkSpeed -match '([\d.]+)\s*Mbps') { $rawSpeed = [double]$Matches[1] }
-                    if ($rawSpeed -ge 5000) { $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (speed-detected)' }
-                    elseif ($rawSpeed -ge 2400) { $wifiGen = 6; $wifiGenLabel = 'Wi-Fi 6 (speed-detected)' }
-                    elseif ($rawSpeed -ge 866) { $wifiGen = 5; $wifiGenLabel = 'Wi-Fi 5 (speed-detected)' }
-                    elseif ($rawSpeed -ge 72) { $wifiGen = 4; $wifiGenLabel = 'Wi-Fi 4 (speed-detected)' }
-                }
+                if ($linkSpeedMbps -ge 10000) { $wifiGen = 8; $wifiGenLabel = 'Wi-Fi Latest (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 5000) { $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 2400) { $wifiGen = 6; $wifiGenLabel = 'Wi-Fi 6 (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 866) { $wifiGen = 5; $wifiGenLabel = 'Wi-Fi 5 (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 72) { $wifiGen = 4; $wifiGenLabel = 'Wi-Fi 4 (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 54) { $wifiGen = 3; $wifiGenLabel = 'Wi-Fi 3 (speed-detected)' }
+                elseif ($linkSpeedMbps -ge 11) { $wifiGen = 2; $wifiGenLabel = 'Wi-Fi 2 (speed-detected)' }
+                elseif ($linkSpeedMbps -gt 0) { $wifiGen = 1; $wifiGenLabel = 'Wi-Fi 1 (speed-detected)' }
+            }
+        } elseif ($type -eq 'Ethernet') {
+            # Ethernet version mapping from v1 (10MbE) through latest mainstream speeds.
+            if ($linkSpeedMbps -ge 800000) { $ethernetGen = 13; $ethernetGenLabel = 'Ethernet v13 (800GbE)' }
+            elseif ($linkSpeedMbps -ge 400000) { $ethernetGen = 12; $ethernetGenLabel = 'Ethernet v12 (400GbE)' }
+            elseif ($linkSpeedMbps -ge 200000) { $ethernetGen = 11; $ethernetGenLabel = 'Ethernet v11 (200GbE)' }
+            elseif ($linkSpeedMbps -ge 100000) { $ethernetGen = 10; $ethernetGenLabel = 'Ethernet v10 (100GbE)' }
+            elseif ($linkSpeedMbps -ge 50000) { $ethernetGen = 9; $ethernetGenLabel = 'Ethernet v9 (50GbE)' }
+            elseif ($linkSpeedMbps -ge 40000) { $ethernetGen = 8; $ethernetGenLabel = 'Ethernet v8 (40GbE)' }
+            elseif ($linkSpeedMbps -ge 25000) { $ethernetGen = 7; $ethernetGenLabel = 'Ethernet v7 (25GbE)' }
+            elseif ($linkSpeedMbps -ge 10000) { $ethernetGen = 6; $ethernetGenLabel = 'Ethernet v6 (10GbE)' }
+            elseif ($linkSpeedMbps -ge 5000) { $ethernetGen = 5; $ethernetGenLabel = 'Ethernet v5 (5GbE)' }
+            elseif ($linkSpeedMbps -ge 2500) { $ethernetGen = 4; $ethernetGenLabel = 'Ethernet v4 (2.5GbE)' }
+            elseif ($linkSpeedMbps -ge 1000) { $ethernetGen = 3; $ethernetGenLabel = 'Ethernet v3 (1GbE)' }
+            elseif ($linkSpeedMbps -ge 100) { $ethernetGen = 2; $ethernetGenLabel = 'Ethernet v2 (100MbE)' }
+            elseif ($linkSpeedMbps -gt 0) { $ethernetGen = 1; $ethernetGenLabel = 'Ethernet v1 (10MbE)' }
+
+            if (-not $ethernetGenLabel -and $desc -match 'Fast Ethernet|10/100') {
+                $ethernetGen = 2; $ethernetGenLabel = 'Ethernet v2 (100MbE)'
+            } elseif (-not $ethernetGenLabel -and $desc -match 'Gigabit|GbE|1000') {
+                $ethernetGen = 3; $ethernetGenLabel = 'Ethernet v3 (1GbE)'
             }
         }
 
@@ -193,19 +264,8 @@ function Get-AllNetworkInterfaces {
         # Get adapter statistics
         $stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
 
-        # Parse link speed to Mbps
-        $linkSpeedMbps = 0
-        if ($adapter.LinkSpeed -match '([\d.]+)\s*(Gbps|Mbps|Kbps)') {
-            $val = [double]$Matches[1]
-            switch ($Matches[2]) {
-                'Gbps' { $linkSpeedMbps = $val * 1000 }
-                'Mbps' { $linkSpeedMbps = $val }
-                'Kbps' { $linkSpeedMbps = $val / 1000 }
-            }
-        }
-
-        # v5.2: Capability score with Wi-Fi generation awareness
-        $capScore = Get-AdapterCapabilityScore -Type $type -LinkSpeedMbps $linkSpeedMbps -Status ([string]$adapter.Status) -WiFiGen ([int]$wifiGen)
+        # v5.3: Capability score with Wi-Fi and Ethernet generation awareness
+        $capScore = Get-AdapterCapabilityScore -Type $type -LinkSpeedMbps $linkSpeedMbps -Status ([string]$adapter.Status) -WiFiGen ([double]$wifiGen) -EthernetGen ([int]$ethernetGen)
         $fingerprint = Get-AdapterFingerprint -MacAddress $adapter.MacAddress -Description $adapter.InterfaceDescription
 
         $results += @{
@@ -229,6 +289,8 @@ function Get-AllNetworkInterfaces {
             Fingerprint     = $fingerprint
             WiFiGeneration  = $wifiGen
             WiFiGenerationLabel = $wifiGenLabel
+            EthernetGeneration = $ethernetGen
+            EthernetGenerationLabel = $ethernetGenLabel
         }
     }
 
