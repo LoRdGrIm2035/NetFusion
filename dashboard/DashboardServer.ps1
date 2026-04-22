@@ -301,7 +301,7 @@ function Test-IsMutationAuthorized {
 }
 
 function Get-ClientInterfaces {
-    # NetFusion-FIX-10: Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
+    # NetFusion-FIX-16: Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
     $data = Get-CachedJsonFile -Path (Join-Path $configDir "interfaces.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $interfaces = @()
     if ($data -and $data.interfaces) {

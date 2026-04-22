@@ -150,6 +150,7 @@ function Get-AllNetworkInterfaces {
             }
         }
 
+        # NetFusion-FIX-11: Capture link speed, IPv4, gateway, and DNS metadata during adapter discovery so routing and source-bound sockets use the selected WAN.
         # Get IP address
         $ipInfo = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
         $ipAddr = if ($ipInfo) { $ipInfo.IPAddress } else { $null }
@@ -238,7 +239,7 @@ function Update-NetworkState {
     param([switch]$ForceRefresh)
 
     try {
-        # NetFusion-FIX-12: Cache adapter discovery instead of re-querying NetAdapter/NetRoute every few seconds.
+        # NetFusion-FIX-18: Cache adapter discovery instead of re-querying NetAdapter/NetRoute every few seconds.
         $now = Get-Date
         if (-not $ForceRefresh -and $script:CachedInterfaces.Count -gt 0 -and $script:LastInterfaceRefresh -and (($now - $script:LastInterfaceRefresh).TotalSeconds -lt $script:AdapterCacheTtlSeconds)) {
             return @($script:CachedInterfaces)

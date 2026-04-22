@@ -11,8 +11,22 @@ if (Test-Path $rulesFile) {
         $data = Get-Content $rulesFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ($data -and $data.rules) {
             foreach ($r in $data.rules) {
-                Remove-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
-                Write-Host "  [Cleanup] Removed orphaned rule: $r" -ForegroundColor DarkGray
+                $matchingRules = @(Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue)
+                if ($matchingRules.Count -gt 0) {
+                    # NetFusion-FIX-15: Remove crash-left firewall rules by concrete rule IDs and verify they are actually gone.
+                    foreach ($rule in $matchingRules) {
+                        try {
+                            Remove-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                }
+
+                $remainingRules = @(Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue)
+                if ($remainingRules.Count -eq 0) {
+                    Write-Host "  [Cleanup] Removed orphaned rule: $r" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  [Cleanup] Unable to fully remove orphaned rule: $r" -ForegroundColor Yellow
+                }
             }
         }
         Remove-Item $rulesFile -Force -ErrorAction SilentlyContinue
