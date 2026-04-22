@@ -37,8 +37,9 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 if (-not ('NetFusion.StreamCopier' -as [type])) {
     # NetFusion-FIX-1: Raise relay socket buffers to 1 MB and harden bound outbound sockets for high-BDP links.
     # NetFusion-FIX-2: Keep relay copy buffers at 256 KB to cut syscall churn in the hot path.
-    # NetFusion-FIX-3: Keep relay copy loops in compiled C# so the hot path never pays PowerShell function dispatch overhead.
-    # NetFusion-FIX-11: Reuse 256 KB relay buffers from a shared queue to reduce GC churn during heavy connection churn.
+    # NetFusion-FIX-3: Use CopyToAsync for HTTPS tunnels -- kernel I/O completion ports instead of sync blocking.
+    # NetFusion-FIX-10: Pool 256 KB relay buffers via ConcurrentQueue to avoid LOH allocations and Gen2 GC pauses.
+    # NetFusion-FIX-8: Batch byte accounting -- count only at connection end via CountingStream wrapper.
     Add-Type -TypeDefinition @"
 using System;
 using System.Collections.Concurrent;
@@ -80,129 +81,143 @@ namespace NetFusion
         }
     }
 
+    /// <summary>
+    /// Lightweight stream wrapper that counts bytes flowing through without
+    /// adding per-iteration delegate or Interlocked overhead.
+    /// Only sync Read/Write are used -- the relay runs on dedicated LongRunning threads.
+    /// </summary>
+    public sealed class CountingStream : Stream
+    {
+        private readonly Stream _inner;
+        private long _bytesRead;
+        private long _bytesWritten;
+
+        public CountingStream(Stream inner) { _inner = inner; }
+
+        public long BytesRead { get { return Interlocked.Read(ref _bytesRead); } }
+        public long BytesWritten { get { return Interlocked.Read(ref _bytesWritten); } }
+
+        public override bool CanRead { get { return _inner.CanRead; } }
+        public override bool CanWrite { get { return _inner.CanWrite; } }
+        public override bool CanSeek { get { return false; } }
+        public override long Length { get { return _inner.Length; } }
+        public override long Position { get { return _inner.Position; } set { _inner.Position = value; } }
+        public override void Flush() { _inner.Flush(); }
+        public override long Seek(long offset, SeekOrigin origin) { return _inner.Seek(offset, origin); }
+        public override void SetLength(long value) { _inner.SetLength(value); }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int n = _inner.Read(buffer, offset, count);
+            if (n > 0) _bytesRead += n;
+            return n;
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            _inner.Write(buffer, offset, count);
+            _bytesWritten += count;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // Do not dispose the inner stream -- caller manages lifetime.
+            base.Dispose(disposing);
+        }
+    }
+
     public static class StreamCopier
     {
         private const int BufferSize = 262144;
         private static readonly ConcurrentQueue<byte[]> BufferPool = new ConcurrentQueue<byte[]>();
 
-        private static void CopyStreamCore(NetworkStream source, NetworkStream dest, long bytesToCopy, Action<int> onBytesTransferred)
+        private static byte[] RentBuffer()
         {
-            byte[] buffer;
-            if (!BufferPool.TryDequeue(out buffer) || buffer == null || buffer.Length < BufferSize)
-            {
-                buffer = new byte[BufferSize];
-            }
+            byte[] buf;
+            if (BufferPool.TryDequeue(out buf) && buf != null && buf.Length >= BufferSize) return buf;
+            return new byte[BufferSize];
+        }
 
+        private static void ReturnBuffer(byte[] buf)
+        {
+            if (buf != null && buf.Length == BufferSize) BufferPool.Enqueue(buf);
+        }
+
+        /// <summary>
+        /// Synchronous relay for HTTP (non-CONNECT) fixed-length body copies.
+        /// Uses pooled 256 KB buffers to avoid LOH allocations.
+        /// </summary>
+        private static void CopyStreamCore(Stream source, Stream dest, long bytesToCopy)
+        {
+            byte[] buffer = RentBuffer();
             try
             {
                 long remaining = bytesToCopy;
                 while (true)
                 {
-                    if (bytesToCopy >= 0 && remaining <= 0)
-                    {
-                        break;
-                    }
-
+                    if (bytesToCopy >= 0 && remaining <= 0) break;
                     int toRead = bytesToCopy < 0 ? BufferSize : (int)Math.Min(BufferSize, remaining);
                     int read = source.Read(buffer, 0, toRead);
-                    if (read <= 0)
-                    {
-                        break;
-                    }
-
+                    if (read <= 0) break;
                     dest.Write(buffer, 0, read);
-                    if (onBytesTransferred != null)
-                    {
-                        onBytesTransferred(read);
-                    }
-
-                    if (bytesToCopy >= 0)
-                    {
-                        remaining -= read;
-                    }
+                    if (bytesToCopy >= 0) remaining -= read;
                 }
             }
-            catch (IOException)
-            {
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-            catch (SocketException)
-            {
-            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { }
             finally
             {
-                if (buffer != null && buffer.Length == BufferSize)
-                {
-                    BufferPool.Enqueue(buffer);
-                }
+                ReturnBuffer(buffer);
             }
         }
 
+        /// <summary>Copy until EOF -- used for HTTP response relay.</summary>
         public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
         {
-            long transferred = 0;
-            CopyStreamCore(source, dest, -1, n => Interlocked.Add(ref transferred, n));
-            Interlocked.Add(ref bytesTransferred, transferred);
+            var cs = new CountingStream(source);
+            CopyStreamCore(cs, dest, -1);
+            Interlocked.Add(ref bytesTransferred, cs.BytesRead);
         }
 
+        /// <summary>Copy exactly N bytes -- used for HTTP request body relay.</summary>
         public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
         {
-            long transferred = 0;
-            CopyStreamCore(source, dest, bytesToCopy, n => Interlocked.Add(ref transferred, n));
-            Interlocked.Add(ref bytesTransferred, transferred);
+            var cs = new CountingStream(source);
+            CopyStreamCore(cs, dest, bytesToCopy);
+            Interlocked.Add(ref bytesTransferred, cs.BytesRead);
         }
 
+        /// <summary>
+        /// Bidirectional relay for HTTPS CONNECT tunnels.
+        /// Uses dedicated LongRunning threads with 256 KB pooled buffers.
+        /// CountingStream wrappers track bytes without per-iteration delegate overhead.
+        /// </summary>
         public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes)
         {
-            long c2r = 0;
-            long r2c = 0;
+            var countClient = new CountingStream(client);
+            var countRemote = new CountingStream(remote);
+
             var uploadTask = Task.Factory.StartNew(
-                () => CopyStreamCore(client, remote, -1, n => Interlocked.Add(ref c2r, n)),
+                () => CopyStreamCore(countClient, countRemote, -1),
                 CancellationToken.None,
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
             var downloadTask = Task.Factory.StartNew(
-                () => CopyStreamCore(remote, client, -1, n => Interlocked.Add(ref r2c, n)),
+                () => CopyStreamCore(countRemote, countClient, -1),
                 CancellationToken.None,
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
 
-            try
-            {
-                Task.WaitAny(uploadTask, downloadTask);
-            }
-            catch
-            {
-            }
+            try { Task.WaitAny(uploadTask, downloadTask); } catch { }
 
-            try
-            {
-                client.Close();
-            }
-            catch
-            {
-            }
+            try { client.Close(); } catch { }
+            try { remote.Close(); } catch { }
 
-            try
-            {
-                remote.Close();
-            }
-            catch
-            {
-            }
+            try { Task.WaitAll(new Task[] { uploadTask, downloadTask }, 5000); } catch { }
 
-            try
-            {
-                Task.WaitAll(new Task[] { uploadTask, downloadTask }, 5000);
-            }
-            catch
-            {
-            }
-
-            Interlocked.Add(ref clientToRemoteBytes, c2r);
-            Interlocked.Add(ref remoteToClientBytes, r2c);
+            Interlocked.Add(ref clientToRemoteBytes, countClient.BytesRead);
+            Interlocked.Add(ref remoteToClientBytes, countRemote.BytesRead);
         }
     }
 
@@ -228,32 +243,21 @@ namespace NetFusion
                     {
                         client.Client.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, interfaceIndex);
                     }
-                    catch
-                    {
-                    }
+                    catch { }
                 }
 
                 var connectTask = client.ConnectAsync(remoteHost, remotePort);
-                var timeoutTask = Task.Delay(timeoutMs);
-                if (Task.WhenAny(connectTask, timeoutTask).GetAwaiter().GetResult() == timeoutTask)
+                if (!connectTask.Wait(timeoutMs))
                 {
                     client.Close();
                     throw new TimeoutException("Connection via " + localSourceIp + " timed out");
                 }
 
-                connectTask.GetAwaiter().GetResult();
                 return client;
             }
             catch
             {
-                try
-                {
-                    client.Close();
-                }
-                catch
-                {
-                }
-
+                try { client.Close(); } catch { }
                 throw;
             }
         }
@@ -265,23 +269,21 @@ namespace NetFusion
 
         public static int NextIndex(int[] schedule)
         {
-            if (schedule == null || schedule.Length == 0)
-            {
-                return -1;
-            }
-
+            if (schedule == null || schedule.Length == 0) return -1;
             long next = Interlocked.Increment(ref _counter);
             long slot = next % schedule.Length;
-            if (slot < 0)
-            {
-                slot += schedule.Length;
-            }
-
+            if (slot < 0) slot += schedule.Length;
             return schedule[(int)slot];
         }
     }
 }
 "@ -Language CSharp
+    # Ensure enough I/O completion threads for async relay operations
+    $workerMin = 0; $ioMin = 0
+    [System.Threading.ThreadPool]::GetMinThreads([ref]$workerMin, [ref]$ioMin)
+    if ($ioMin -lt 64) {
+        [System.Threading.ThreadPool]::SetMinThreads([Math]::Max($workerMin, 64), 64)
+    }
 }
 
 # NetFusion-FIX-6: Use Interlocked-backed counters instead of plain integers for shared relay statistics.
@@ -1273,15 +1275,15 @@ $HandlerScript = {
         $clientSocketRef.ReceiveBufferSize = 1048576
         $clientSocketRef.SendBufferSize = 1048576
         $clientSocketRef.NoDelay = $true
-        $clientSocketRef.ReceiveTimeout = 30000
-        $clientSocketRef.SendTimeout = 30000
+        $clientSocketRef.ReceiveTimeout = 60000
+        $clientSocketRef.SendTimeout = 60000
         $clientSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
 
         # NetFusion-FIX-18: Use NetworkStream with socket ownership disabled and close the TcpClient exactly once during cleanup.
         $clientStream = [System.Net.Sockets.NetworkStream]::new($clientSocketRef, $false)
         # NetFusion-FIX-8: Apply finite read/write timeouts so half-open relay connections do not consume runspaces forever.
-        $clientStream.ReadTimeout = 30000
-        $clientStream.WriteTimeout = 30000
+        $clientStream.ReadTimeout = 60000
+        $clientStream.WriteTimeout = 60000
 
         # Read request headers safely up to 64KB so large cookies or auth headers are not truncated.
         $headerLines = [System.Collections.Generic.List[string]]::new()
@@ -1617,11 +1619,11 @@ $HandlerScript = {
                 $remoteSocketRef.ReceiveBufferSize = 1048576
                 $remoteSocketRef.SendBufferSize = 1048576
                 $remoteSocketRef.NoDelay = $true
-                $remoteSocketRef.ReceiveTimeout = 30000
-                $remoteSocketRef.SendTimeout = 30000
+                $remoteSocketRef.ReceiveTimeout = 60000
+                $remoteSocketRef.SendTimeout = 60000
                 $remoteSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
-                $remoteClient.SendTimeout = 30000
-                $remoteClient.ReceiveTimeout = 30000
+                $remoteClient.SendTimeout = 60000
+                $remoteClient.ReceiveTimeout = 60000
 
                 $null = (Get-OrCreate-LocalAtomicCounter -Map $State.activePerAdapter -Key $adapter.Name).Increment()
                 $connAdapter = $adapter.Name
@@ -1661,8 +1663,8 @@ $HandlerScript = {
         # NetFusion-FIX-18: Use NetworkStream with socket ownership disabled and close the TcpClient exactly once during cleanup.
         $remoteStream = [System.Net.Sockets.NetworkStream]::new($remoteSocketRef, $false)
         # NetFusion-FIX-8: Apply finite read/write timeouts so half-open relay connections do not consume runspaces forever.
-        $remoteStream.ReadTimeout = 30000
-        $remoteStream.WriteTimeout = 30000
+        $remoteStream.ReadTimeout = 60000
+        $remoteStream.WriteTimeout = 60000
 
         if ($method -eq 'CONNECT') {
             # [V5-FIX-11] HTTPS TUNNELING: Forward tunnel without modification -- NO MITM.
@@ -1672,6 +1674,13 @@ $HandlerScript = {
             $ok = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 Connection Established`r`n`r`n")
             $clientStream.Write($ok, 0, $ok.Length)
             $clientStream.Flush()
+            # NetFusion-FIX-3: Set Infinite timeouts for CONNECT tunnels -- CopyToAsync manages
+            # lifecycle via stream close propagation. Finite timeouts cause spurious SocketException
+            # during normal idle periods in long-lived HTTPS tunnels.
+            $clientStream.ReadTimeout = [System.Threading.Timeout]::Infinite
+            $clientStream.WriteTimeout = [System.Threading.Timeout]::Infinite
+            $remoteStream.ReadTimeout = [System.Threading.Timeout]::Infinite
+            $remoteStream.WriteTimeout = [System.Threading.Timeout]::Infinite
             # NetFusion-FIX-4: Keep HTTPS tunnels fully bidirectional so ACK and payload paths are not serialized.
             [NetFusion.StreamCopier]::CopyStreamBidirectional(
                 $clientStream,

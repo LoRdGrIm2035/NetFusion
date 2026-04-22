@@ -232,7 +232,7 @@ function Set-DynamicMetrics {
         }
 
         $secondaryRank++
-        $desiredMetric = [Math]::Max([int]$iface.InterfaceMetric, $primaryMetric + ($secondaryRank * 5))
+        $desiredMetric = [Math]::Max([int]$iface.InterfaceMetric, $primaryMetric + ($secondaryRank * 50))
         $script:adapterMetrics[$iface.Name] = $desiredMetric
 
         try {

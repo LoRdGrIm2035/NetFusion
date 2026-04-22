@@ -435,10 +435,10 @@ function Ensure-NetFusionRoutes {
         $originalMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $iface.InterfaceIndex -FallbackMetric $iface.InterfaceMetric
         # NetFusion-FIX-15: Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
         if ($originalMetric -ge 9000) {
-            $originalMetric = $primaryMetric + ($secondaryRank * 5)
+            $originalMetric = $primaryMetric + ($secondaryRank * 50)
         }
-        $desiredMetric = [Math]::Min(50, [Math]::Max($originalMetric, $primaryMetric + ($secondaryRank * 5)))
-        $desiredRouteMetric = [Math]::Min(50, [Math]::Max(15, $primaryRouteMetric + ($secondaryRank * 5)))
+        $desiredMetric = [Math]::Max($originalMetric, $primaryMetric + ($secondaryRank * 50))
+        $desiredRouteMetric = [Math]::Max(15, $primaryRouteMetric + ($secondaryRank * 50))
 
         try {
             Set-NetIPInterface -InterfaceIndex $iface.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -ErrorAction SilentlyContinue
