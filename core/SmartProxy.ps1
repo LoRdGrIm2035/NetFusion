@@ -651,6 +651,7 @@ function Update-AdaptersAndWeights {
 
                 $health[$_.Name] = @{
                     Score       = $_.HealthScore
+                    Status      = if ($_.Status) { [string]$_.Status } else { 'offline' }
                     Latency     = $_.InternetLatency
                     LatencyEWMA = if ($_.InternetLatencyEWMA) { $_.InternetLatencyEWMA } else { $_.InternetLatency }
                     Jitter      = if ($_.Jitter) { $_.Jitter } else { 0 }
@@ -679,14 +680,14 @@ function Update-AdaptersAndWeights {
             $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
             if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
-            # NetFusion-FIX-14: Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
+            # NetFusion-FIX-7: Keep soft affinity short-lived so new bulk flows rebalance quickly across both WAN adapters.
             if ($cfg.proxy -and $null -ne $cfg.proxy.sessionAffinityTTL) {
                 $ttl = [int]$cfg.proxy.sessionAffinityTTL
                 if ($ttl -gt 0) {
-                    $s.sessionTTL = [Math]::Min(60, [Math]::Max(30, $ttl))
+                    $s.sessionTTL = [Math]::Min(30, [Math]::Max(15, $ttl))
                 }
             } else {
-                $s.sessionTTL = 60
+                $s.sessionTTL = 30
             }
             $refresh = $cfg.intelligence.weightRefreshInterval
             if ($null -ne $refresh -and [double]$refresh -gt 0) {
@@ -695,35 +696,43 @@ function Update-AdaptersAndWeights {
         } catch {}
     }
 
-    # NetFusion-FIX-13: Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
+    # NetFusion-FIX-7: Immediately expire sticky affinity entries for adapters that just went offline so new flows re-spread.
+    $unhealthyAdapters = @(
+        foreach ($entry in $health.GetEnumerator()) {
+            $status = if ($entry.Value.ContainsKey('Status')) { [string]$entry.Value.Status } else { '' }
+            $score = if ($entry.Value.ContainsKey('Score') -and $null -ne $entry.Value.Score) { [double]$entry.Value.Score } else { 0.0 }
+            if ($status -eq 'offline' -or $score -le 0.0) {
+                $entry.Key
+            }
+        }
+    )
+    if ($unhealthyAdapters.Count -gt 0) {
+        [void](Clear-SessionAffinityForAdapters -State $s -AdapterNames $unhealthyAdapters)
+    }
+
+    # NetFusion-FIX-5: Weight adapters by measured throughput first, then apply only a minor latency nudge.
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
-        $linkSpeedMbps = if ($null -ne $a.Speed -and [double]$a.Speed -gt 0) { [double]$a.Speed } else { 0.0 }
-        if ($h) {
-            if ($null -ne $h.LinkSpeedMbps -and [double]$h.LinkSpeedMbps -gt $linkSpeedMbps) {
-                $linkSpeedMbps = [double]$h.LinkSpeedMbps
+        $observedMbps = Get-AdapterObservedMbps -State $s -Adapter $a
+        if ($observedMbps -le 0.0) {
+            if ($a.Type -match 'USB') {
+                $observedMbps = 300.0
+            } elseif ($a.Type -match 'WiFi|Ethernet') {
+                $observedMbps = 500.0
+            } else {
+                $observedMbps = 100.0
             }
         }
-        if ($linkSpeedMbps -le 0.0) {
-            $linkSpeedMbps = 100.0
-        }
 
-        $healthFactor = 0.85
+        $latencyAdjustment = 1.0
         if ($h) {
-            $latency = if ($null -ne $h.LatencyEWMA) { [double]$h.LatencyEWMA } elseif ($null -ne $h.Latency) { [double]$h.Latency } else { 999.0 }
-            $jitter = if ($null -ne $h.Jitter) { [double]$h.Jitter } else { 0.0 }
-            $packetLossPct = if ($h.ContainsKey('PacketLoss') -and $null -ne $h.PacketLoss) { [double]$h.PacketLoss } else { 0.0 }
-
-            $bwFactor = [math]::Min($linkSpeedMbps / 500.0, 1.0)
-            $latencyFactor = [math]::Max(0.0, 1.0 - ($latency / 200.0))
-            $jitterFactor = [math]::Max(0.0, 1.0 - ($jitter / 100.0))
-            $lossFactor = [math]::Max(0.0, 1.0 - ($packetLossPct / 10.0))
-            $rawScore = ($bwFactor * 50.0) + ($latencyFactor * 20.0) + ($jitterFactor * 10.0) + ($lossFactor * 20.0)
-            $healthFactor = [math]::Max(0.25, [math]::Min(1.0, ($rawScore / 100.0)))
+            $latency = if ($null -ne $h.LatencyEWMA) { [double]$h.LatencyEWMA } elseif ($null -ne $h.Latency) { [double]$h.Latency } else { 0.0 }
+            $latencyPenalty = [math]::Min(0.10, [math]::Max(0.0, ($latency / 1000.0)))
+            $latencyAdjustment = 1.0 - $latencyPenalty
         }
 
-        $w = [math]::Max(1.0, [math]::Round($linkSpeedMbps * $healthFactor, 2))
+        $w = [math]::Max(1.0, [math]::Round(($observedMbps * $latencyAdjustment), 2))
 
         $weights += $w
         [void](Get-OrCreate-AtomicCounter -Map $s.connectionCounts -Key $a.Name)
@@ -746,21 +755,27 @@ function Get-AdapterObservedMbps {
         return 0.0
     }
 
-    $signals = @()
-    foreach ($propertyName in @('EstimatedDownMbps', 'EstimatedUpMbps', 'DownloadMbps', 'UploadMbps')) {
+    $bestDown = 0.0
+    foreach ($propertyName in @('EstimatedDownMbps', 'DownloadMbps')) {
         if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
             $value = [double]$h[$propertyName]
-            if ($value -gt 0) {
-                $signals += $value
+            if ($value -gt $bestDown) {
+                $bestDown = $value
             }
         }
     }
 
-    if ($signals.Count -gt 0) {
-        return [double](($signals | Measure-Object -Maximum).Maximum)
+    $bestUp = 0.0
+    foreach ($propertyName in @('EstimatedUpMbps', 'UploadMbps')) {
+        if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
+            $value = [double]$h[$propertyName]
+            if ($value -gt $bestUp) {
+                $bestUp = $value
+            }
+        }
     }
 
-    return 0.0
+    return [double]($bestDown + $bestUp)
 }
 
 function Get-AdapterSelectionOrder {
@@ -1143,21 +1158,27 @@ $HandlerScript = {
             return 0.0
         }
 
-        $signals = @()
-        foreach ($propertyName in @('EstimatedDownMbps', 'EstimatedUpMbps', 'DownloadMbps', 'UploadMbps')) {
+        $bestDown = 0.0
+        foreach ($propertyName in @('EstimatedDownMbps', 'DownloadMbps')) {
             if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
                 $value = [double]$h[$propertyName]
-                if ($value -gt 0) {
-                    $signals += $value
+                if ($value -gt $bestDown) {
+                    $bestDown = $value
                 }
             }
         }
 
-        if ($signals.Count -gt 0) {
-            return [double](($signals | Measure-Object -Maximum).Maximum)
+        $bestUp = 0.0
+        foreach ($propertyName in @('EstimatedUpMbps', 'UploadMbps')) {
+            if ($h.ContainsKey($propertyName) -and $null -ne $h[$propertyName]) {
+                $value = [double]$h[$propertyName]
+                if ($value -gt $bestUp) {
+                    $bestUp = $value
+                }
+            }
         }
 
-        return 0.0
+        return [double]($bestDown + $bestUp)
     }
 
     function Get-LocalAdapterSelectionOrder {
@@ -1456,7 +1477,15 @@ $HandlerScript = {
         # ===== Adapter Selection =====
         $avail = @(); $aw = @()
         for ($i = 0; $i -lt $State.adapters.Count; $i++) {
-            $avail += $State.adapters[$i]
+            $candidateAdapter = $State.adapters[$i]
+            $healthEntry = if ($State.adapterHealth.ContainsKey($candidateAdapter.Name)) { $State.adapterHealth[$candidateAdapter.Name] } else { $null }
+            $candidateStatus = if ($healthEntry -and $healthEntry.ContainsKey('Status')) { [string]$healthEntry.Status } else { '' }
+            $candidateScore = if ($healthEntry -and $healthEntry.ContainsKey('Score') -and $null -ne $healthEntry.Score) { [double]$healthEntry.Score } else { 1.0 }
+            if ($candidateStatus -eq 'offline' -or $candidateScore -le 0.0) {
+                continue
+            }
+
+            $avail += $candidateAdapter
             $aw += $State.weights[$i]
         }
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
@@ -1475,21 +1504,13 @@ $HandlerScript = {
         } elseif ($avail.Count -eq 1) {
             $selectionReason = 'only-adapter'
         } else {
-            # NetFusion-FIX-14: Prefer adapters for new connections using an atomic per-connection weighted round-robin counter.
+            # NetFusion-FIX-5: Prefer adapters for new connections using measured-throughput weights, not latency-heavy health scores.
             $adapterScores = @()
             for ($scoreIndex = 0; $scoreIndex -lt $avail.Count; $scoreIndex++) {
-                $healthEntry = if ($State.adapterHealth.ContainsKey($avail[$scoreIndex].Name)) { $State.adapterHealth[$avail[$scoreIndex].Name] } else { $null }
-                $rawScore = if ($healthEntry -and $null -ne $healthEntry.Score) {
-                    [double]$healthEntry.Score
-                } elseif ($scoreIndex -lt $aw.Count) {
-                    [double]$aw[$scoreIndex]
-                } else {
-                    1.0
-                }
-
+                $selectionWeight = if ($scoreIndex -lt $aw.Count) { [double]$aw[$scoreIndex] } else { 1.0 }
                 $adapterScores += [pscustomobject]@{
                     Index = $scoreIndex
-                    Score = [Math]::Max(1, [int][Math]::Round($rawScore))
+                    Score = [Math]::Max(1, [int][Math]::Round($selectionWeight))
                 }
             }
 
@@ -1526,12 +1547,14 @@ $HandlerScript = {
                 $weightsNearlyEqual = ([math]::Abs($maxWeight - $minWeight) -le [math]::Max(5.0, ($maxWeight * 0.05)))
             }
 
-            # NetFusion-FIX-14: Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
+            # NetFusion-FIX-7: Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
             if ($weightsNearlyEqual -and $sessionKey -and $connType -ne 'bulk') {
                 $hintEntry = $null
                 if ($State.sessionMap.TryGetValue($sessionKey, [ref]$hintEntry) -and $hintEntry -and $hintEntry.adapter) {
                     $hintedAdapter = $avail | Where-Object { $_.Name -eq [string]$hintEntry.adapter } | Select-Object -First 1
                     if ($hintedAdapter) {
+                        $hintEntry.time = [System.DateTimeOffset]::UtcNow.Ticks
+                        try { $State.sessionMap[$sessionKey] = $hintEntry } catch {}
                         $adapter = $hintedAdapter
                         $selectionReason = 'soft-host-hint(equal-weights)'
                         $affinityMode = 'soft'
@@ -1787,7 +1810,8 @@ $lastLogTicks = $lastRefreshTicks
 $lastCleanupTicks = $lastRefreshTicks
 $lastSessionCleanTicks = $lastRefreshTicks
 $cleanupIntervalTicks = [System.TimeSpan]::FromMilliseconds(500).Ticks
-$sessionCleanIntervalTicks = [System.TimeSpan]::FromSeconds(60).Ticks
+# NetFusion-FIX-7: Sweep session affinity more frequently than the 30s inactivity TTL so stale pinning does not linger.
+$sessionCleanIntervalTicks = [System.TimeSpan]::FromSeconds(15).Ticks
 $logIntervalTicks = [System.TimeSpan]::FromSeconds(1).Ticks
 $staleJobTicks = [System.TimeSpan]::FromSeconds(180).Ticks
 $lowThreadHoldTicks = [System.TimeSpan]::FromSeconds(120).Ticks
@@ -1939,5 +1963,40 @@ try {
     try { Write-AtomicJson -Path $global:ProxyState.statsFile -Data @{ running = $false } -Depth 3 } catch {}
     Write-ProxyEvent "Proxy stopped"
     Write-Host "`n  Proxy stopped." -ForegroundColor Yellow
+}
+
+function Clear-SessionAffinityForAdapters {
+    param(
+        [object]$State,
+        [string[]]$AdapterNames
+    )
+
+    if (-not $State -or -not $AdapterNames -or $AdapterNames.Count -eq 0) {
+        return 0
+    }
+
+    $targetAdapters = @($AdapterNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($targetAdapters.Count -eq 0) {
+        return 0
+    }
+
+    $removedCount = 0
+    foreach ($key in @($State.sessionMap.Keys)) {
+        $entry = $State.sessionMap[$key]
+        if (-not $entry -or -not $entry.adapter) {
+            continue
+        }
+
+        if ([string]$entry.adapter -in $targetAdapters) {
+            try {
+                $removedEntry = $null
+                if ($State.sessionMap.TryRemove($key, [ref]$removedEntry)) {
+                    $removedCount++
+                }
+            } catch {}
+        }
+    }
+
+    return $removedCount
 }
 

@@ -552,7 +552,7 @@ function Measure-InterfaceHealth {
         $packetLoss = 5.0
     }
 
-    # NetFusion-FIX-13: Score adapters with bandwidth as the primary factor, then latency, jitter, and loss.
+    # NetFusion-FIX-6: Score adapters with bandwidth as the primary factor while suppressing normal Wi-Fi jitter noise.
     $hasIP = [bool]$ip
     $linkSpeedMbps = if ($null -ne $Interface.LinkSpeedMbps) { [double]$Interface.LinkSpeedMbps } else { 0.0 }
     if ($linkSpeedMbps -le 0.0 -and $previousHealth -and $previousHealth.LinkSpeedMbps) {
@@ -565,9 +565,11 @@ function Measure-InterfaceHealth {
     if ($hasIP) {
         $bwFactor = [math]::Min($linkSpeedMbps / 500.0, 1.0)
         $latencyFactor = [math]::Max(0.0, 1.0 - ($inetLatencySmoothed / 200.0))
-        $jitterFactor = [math]::Max(0.0, 1.0 - ($jitter / 100.0))
         $lossFactor = [math]::Max(0.0, 1.0 - ($packetLoss / 10.0))
-        $rawScore = ($bwFactor * 50.0) + ($latencyFactor * 20.0) + ($jitterFactor * 10.0) + ($lossFactor * 20.0)
+        $baseScore = ($bwFactor * 50.0) + ($latencyFactor * 20.0) + ($lossFactor * 20.0)
+        $jitterPenaltyRatio = [math]::Min(0.15, [math]::Max(0.0, (($jitter - 10.0) / 100.0) * 0.15))
+        $jitterPenalty = [math]::Min(($baseScore * 0.15), ($baseScore * $jitterPenaltyRatio))
+        $rawScore = $baseScore + 10.0 - $jitterPenalty
 
         $previousScore = if ($previousHealth -and $null -ne $previousHealth.HealthScore) { [double]$previousHealth.HealthScore } else { $rawScore }
         $score = [math]::Round([math]::Max(0.0, [math]::Min(100.0, (($previousScore * 0.7) + ($rawScore * 0.3)))), 1)
