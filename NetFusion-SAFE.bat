@@ -12,15 +12,10 @@ set "NF_STATE=%~dp0core\NetworkState.ps1"
 
 :: ---- Kill ALL NetFusion processes ----
 echo  [1/5] Killing all NetFusion services...
-taskkill /FI "WINDOWTITLE eq NF-NetworkManager*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-InterfaceMonitor*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-RouteController*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-SmartProxy*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Engine*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NF-Watchdog*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NF-Dashboard*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-LearningEngine*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-SafetyController*" /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq NF-WatchdogSupervisor*" /F >nul 2>&1
-powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'NetFusion' -and $_.CommandLine -match '(SmartProxy|NetworkManager|InterfaceMonitor|DashboardServer|RouteController|LearningEngine|SafetyController|WatchdogSupervisor)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+powershell -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | ForEach-Object { if ($_.CommandLine -and $_.CommandLine -match 'DualWifi' -and $_.CommandLine -match '(NetFusionEngine|NetFusionWatchdog|DashboardServer)') { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
 timeout /t 1 /nobreak >nul
 
 :: ---- Release ports ----
@@ -34,7 +29,7 @@ powershell -ExecutionPolicy Bypass -NoProfile -File "%NF_STATE%" -Action Restore
 
 :: ---- Set safe mode flag ----
 echo  [4/5] Setting safe mode flag...
-powershell -ExecutionPolicy Bypass -Command "$f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='5.0'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8"
+powershell -ExecutionPolicy Bypass -Command "$f = '%~dp0config\safety-state.json'; @{safeMode=$true; circuitBreakerOpen=$true; proxyHealthy=$false; version='6.2'; lastEvent='Emergency safe mode activated'} | ConvertTo-Json -Compress | Set-Content $f -Force -Encoding UTF8"
 
 :: ---- Done ----
 echo  [5/5] Verifying internet connectivity...
