@@ -38,7 +38,7 @@ if (-not ('NetFusion.StreamCopier' -as [type])) {
     # NetFusion-FIX-1: Raise relay socket buffers to 1 MB and harden bound outbound sockets for high-BDP links.
     # NetFusion-FIX-2: Keep relay copy buffers at 256 KB to cut syscall churn in the hot path.
     # NetFusion-FIX-3: Keep relay copy loops in compiled C# so the hot path never pays PowerShell function dispatch overhead.
-    # NetFusion-FIX-12: Reuse 256 KB relay buffers from a shared queue to reduce GC churn during heavy connection churn.
+    # NetFusion-FIX-11: Reuse 256 KB relay buffers from a shared queue to reduce GC churn during heavy connection churn.
     Add-Type -TypeDefinition @"
 using System;
 using System.Collections.Concurrent;
@@ -85,17 +85,18 @@ namespace NetFusion
         private const int BufferSize = 262144;
         private static readonly ConcurrentQueue<byte[]> BufferPool = new ConcurrentQueue<byte[]>();
 
-        private static async Task CopyStreamCoreAsync(NetworkStream source, NetworkStream dest, long bytesToCopy, Action<int> onBytesTransferred, CancellationToken ct)
+        private static void CopyStreamCore(NetworkStream source, NetworkStream dest, long bytesToCopy, Action<int> onBytesTransferred)
         {
             byte[] buffer;
             if (!BufferPool.TryDequeue(out buffer) || buffer == null || buffer.Length < BufferSize)
             {
                 buffer = new byte[BufferSize];
             }
+
             try
             {
                 long remaining = bytesToCopy;
-                while (!ct.IsCancellationRequested)
+                while (true)
                 {
                     if (bytesToCopy >= 0 && remaining <= 0)
                     {
@@ -103,13 +104,13 @@ namespace NetFusion
                     }
 
                     int toRead = bytesToCopy < 0 ? BufferSize : (int)Math.Min(BufferSize, remaining);
-                    int read = await source.ReadAsync(buffer, 0, toRead, ct).ConfigureAwait(false);
+                    int read = source.Read(buffer, 0, toRead);
                     if (read <= 0)
                     {
                         break;
                     }
 
-                    await dest.WriteAsync(buffer, 0, read, ct).ConfigureAwait(false);
+                    dest.Write(buffer, 0, read);
                     if (onBytesTransferred != null)
                     {
                         onBytesTransferred(read);
@@ -120,6 +121,15 @@ namespace NetFusion
                         remaining -= read;
                     }
                 }
+            }
+            catch (IOException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (SocketException)
+            {
             }
             finally
             {
@@ -132,102 +142,67 @@ namespace NetFusion
 
         public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
         {
-            using (var cts = new CancellationTokenSource())
-            {
-                long transferred = 0;
-                try
-                {
-                    CopyStreamCoreAsync(source, dest, -1, n => Interlocked.Add(ref transferred, n), cts.Token).GetAwaiter().GetResult();
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch (IOException)
-                {
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-
-                Interlocked.Add(ref bytesTransferred, transferred);
-            }
+            long transferred = 0;
+            CopyStreamCore(source, dest, -1, n => Interlocked.Add(ref transferred, n));
+            Interlocked.Add(ref bytesTransferred, transferred);
         }
 
         public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
         {
-            using (var cts = new CancellationTokenSource())
-            {
-                long transferred = 0;
-                try
-                {
-                    CopyStreamCoreAsync(source, dest, bytesToCopy, n => Interlocked.Add(ref transferred, n), cts.Token).GetAwaiter().GetResult();
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch (IOException)
-                {
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-
-                Interlocked.Add(ref bytesTransferred, transferred);
-            }
+            long transferred = 0;
+            CopyStreamCore(source, dest, bytesToCopy, n => Interlocked.Add(ref transferred, n));
+            Interlocked.Add(ref bytesTransferred, transferred);
         }
 
         public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes)
         {
-            using (var cts = new CancellationTokenSource())
+            long c2r = 0;
+            long r2c = 0;
+            var uploadTask = Task.Factory.StartNew(
+                () => CopyStreamCore(client, remote, -1, n => Interlocked.Add(ref c2r, n)),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+            var downloadTask = Task.Factory.StartNew(
+                () => CopyStreamCore(remote, client, -1, n => Interlocked.Add(ref r2c, n)),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+
+            try
             {
-                long c2r = 0;
-                long r2c = 0;
-                var uploadTask = CopyStreamCoreAsync(client, remote, -1, n => Interlocked.Add(ref c2r, n), cts.Token);
-                var downloadTask = CopyStreamCoreAsync(remote, client, -1, n => Interlocked.Add(ref r2c, n), cts.Token);
-
-                try
-                {
-                    Task.WhenAny(uploadTask, downloadTask).GetAwaiter().GetResult();
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    cts.Cancel();
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    client.Close();
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    remote.Close();
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    Task.WhenAll(uploadTask, downloadTask).Wait(1000);
-                }
-                catch
-                {
-                }
-
-                Interlocked.Add(ref clientToRemoteBytes, c2r);
-                Interlocked.Add(ref remoteToClientBytes, r2c);
+                Task.WaitAny(uploadTask, downloadTask);
             }
+            catch
+            {
+            }
+
+            try
+            {
+                client.Close();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                remote.Close();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Task.WaitAll(new Task[] { uploadTask, downloadTask }, 5000);
+            }
+            catch
+            {
+            }
+
+            Interlocked.Add(ref clientToRemoteBytes, c2r);
+            Interlocked.Add(ref remoteToClientBytes, r2c);
         }
     }
 
@@ -340,6 +315,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     adapters         = @()
     weights          = @()
     rrSchedule       = @()
+    rrCounter        = [NetFusion.AtomicCounter]::new()
     connectionCounts = [hashtable]::Synchronized(@{})
     successCounts    = [hashtable]::Synchronized(@{})
     failCounts       = [hashtable]::Synchronized(@{})
@@ -390,6 +366,8 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     }
 })
 $script:ProxyLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
+$script:ActivePowershells = [System.Collections.Concurrent.ConcurrentQueue[System.Management.Automation.PowerShell]]::new()
+$script:IsRunning = $true
 
 function Write-AtomicJson {
     param(
@@ -507,7 +485,7 @@ function Get-ProxyAdapters {
     $data = Read-JsonFile -Path $ifFile -DefaultValue $null
     if ($data -and $data.interfaces) {
         foreach ($iface in $data.interfaces) {
-            # NetFusion-FIX-11: Carry adapter IP, gateway, DNS, and link-speed metadata into the proxy so source-bound connects use the selected WAN.
+            # NetFusion-FIX-12: Carry adapter IP, gateway, DNS, and link-speed metadata into the proxy so source-bound connects use the selected WAN.
             $adapterIp = if ($iface.PSObject.Properties['IpAddress'] -and $iface.IpAddress) { $iface.IpAddress } else { $iface.IPAddress }
             $adapterDns = if ($iface.PSObject.Properties['DnsServers'] -and $iface.DnsServers) {
                 [string]$iface.DnsServers
@@ -701,7 +679,7 @@ function Update-AdaptersAndWeights {
             $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
             if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
-            # NetFusion-FIX-10: Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
+            # NetFusion-FIX-14: Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
             if ($cfg.proxy -and $null -ne $cfg.proxy.sessionAffinityTTL) {
                 $ttl = [int]$cfg.proxy.sessionAffinityTTL
                 if ($ttl -gt 0) {
@@ -717,7 +695,7 @@ function Update-AdaptersAndWeights {
         } catch {}
     }
 
-    # NetFusion-FIX-9: Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
+    # NetFusion-FIX-13: Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
@@ -1257,17 +1235,32 @@ $HandlerScript = {
     $hostKey = $null
     $sessionKey = $null
     $remoteClient = $null
+    $clientSocketRef = $null
+    $remoteSocketRef = $null
     $clientStream = $null
     $remoteStream = $null
     $clientToRemoteBytes = [long]0
     $remoteToClientBytes = [long]0
     $uri = $null
+    $selectionPlan = @()
     try {
         # v5.0: Safe mode check -- if active, act as simple pass-through on default adapter
         $isSafeMode = $State.safeMode
 
-        $clientStream = $ClientSocket.GetStream()
-        $clientStream.ReadTimeout = 10000
+        # NetFusion-FIX-1: Cache the accepted client socket wrapper once so socket property changes reliably apply to the underlying socket.
+        $clientSocketRef = $ClientSocket.Client
+        $clientSocketRef.ReceiveBufferSize = 1048576
+        $clientSocketRef.SendBufferSize = 1048576
+        $clientSocketRef.NoDelay = $true
+        $clientSocketRef.ReceiveTimeout = 30000
+        $clientSocketRef.SendTimeout = 30000
+        $clientSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+
+        # NetFusion-FIX-18: Use NetworkStream with socket ownership disabled and close the TcpClient exactly once during cleanup.
+        $clientStream = [System.Net.Sockets.NetworkStream]::new($clientSocketRef, $false)
+        # NetFusion-FIX-8: Apply finite read/write timeouts so half-open relay connections do not consume runspaces forever.
+        $clientStream.ReadTimeout = 30000
+        $clientStream.WriteTimeout = 30000
 
         # Read request headers safely up to 64KB so large cookies or auth headers are not truncated.
         $headerLines = [System.Collections.Generic.List[string]]::new()
@@ -1302,7 +1295,7 @@ $HandlerScript = {
 
         # ===== v5.0: Health check endpoint for SafetyController =====
         if ($method -eq 'GET' -and $parts.Count -ge 2 -and $parts[1] -eq '/health') {
-            $remoteEndPoint = $ClientSocket.Client.RemoteEndPoint -as [System.Net.IPEndPoint]
+            $remoteEndPoint = $clientSocketRef.RemoteEndPoint -as [System.Net.IPEndPoint]
             $isLocalRequester = $remoteEndPoint -and (
                 $remoteEndPoint.Address.Equals([System.Net.IPAddress]::Loopback) -or
                 $remoteEndPoint.Address.Equals([System.Net.IPAddress]::IPv6Loopback)
@@ -1312,7 +1305,7 @@ $HandlerScript = {
             } else {
                 [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 403 Forbidden`r`nContent-Type: text/plain`r`nContent-Length: 9`r`nConnection: close`r`n`r`nForbidden")
             }
-            # NetFusion-FIX-8: Flush tiny proxy control responses immediately so clients do not stall waiting on buffered handshake bytes.
+            # NetFusion-FIX-7: Flush tiny proxy control responses immediately so clients do not stall waiting on buffered handshake bytes.
             $clientStream.Write($resp, 0, $resp.Length)
             $clientStream.Flush()
             $ClientSocket.Close()
@@ -1482,9 +1475,36 @@ $HandlerScript = {
         } elseif ($avail.Count -eq 1) {
             $selectionReason = 'only-adapter'
         } else {
-            $preferredIndex = [NetFusion.WeightedRoundRobin]::NextIndex([int[]]$State.rrSchedule)
-            if ($preferredIndex -lt 0 -or $preferredIndex -ge $avail.Count) {
-                $preferredIndex = 0
+            # NetFusion-FIX-14: Prefer adapters for new connections using an atomic per-connection weighted round-robin counter.
+            $adapterScores = @()
+            for ($scoreIndex = 0; $scoreIndex -lt $avail.Count; $scoreIndex++) {
+                $healthEntry = if ($State.adapterHealth.ContainsKey($avail[$scoreIndex].Name)) { $State.adapterHealth[$avail[$scoreIndex].Name] } else { $null }
+                $rawScore = if ($healthEntry -and $null -ne $healthEntry.Score) {
+                    [double]$healthEntry.Score
+                } elseif ($scoreIndex -lt $aw.Count) {
+                    [double]$aw[$scoreIndex]
+                } else {
+                    1.0
+                }
+
+                $adapterScores += [pscustomobject]@{
+                    Index = $scoreIndex
+                    Score = [Math]::Max(1, [int][Math]::Round($rawScore))
+                }
+            }
+
+            $totalScore = [int](($adapterScores | Measure-Object -Property Score -Sum).Sum)
+            if ($totalScore -le 0) { $totalScore = [Math]::Max(1, $avail.Count) }
+            $tick = [int]$State.rrCounter.Increment()
+            $target = $tick % [Math]::Max(1, $totalScore)
+            $preferredIndex = 0
+            $cumulativeScore = 0
+            foreach ($scoreEntry in @($adapterScores | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Index }; Descending = $false })) {
+                $cumulativeScore += [int]$scoreEntry.Score
+                if ($target -lt $cumulativeScore) {
+                    $preferredIndex = [int]$scoreEntry.Index
+                    break
+                }
             }
 
             $selectionPlan = Get-LocalAdapterSelectionOrder -ProxyState $State -Adapters $avail -Weights ([double[]]$aw) -PreferredIndex $preferredIndex
@@ -1506,7 +1526,7 @@ $HandlerScript = {
                 $weightsNearlyEqual = ([math]::Abs($maxWeight - $minWeight) -le [math]::Max(5.0, ($maxWeight * 0.05)))
             }
 
-            # NetFusion-FIX-10: Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
+            # NetFusion-FIX-14: Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
             if ($weightsNearlyEqual -and $sessionKey -and $connType -ne 'bulk') {
                 $hintEntry = $null
                 if ($State.sessionMap.TryGetValue($sessionKey, [ref]$hintEntry) -and $hintEntry -and $hintEntry.adapter) {
@@ -1569,13 +1589,16 @@ $HandlerScript = {
                 # NetFusion-FIX-5: Bind outbound sockets to the chosen adapter's local IPv4 before connect so Windows uses that WAN path.
                 $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
                 $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, 5000, $ifIndex)
-                # NetFusion-FIX-1: Keep both tunnel endpoints at 1 MB buffers with eager sends and short linger teardown.
-                $remoteClient.NoDelay = $true
-                $remoteClient.ReceiveBufferSize = 1048576
-                $remoteClient.SendBufferSize = 1048576
-                $remoteClient.Client.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
-                $remoteClient.SendTimeout = 15000
-                $remoteClient.ReceiveTimeout = 15000
+                # NetFusion-FIX-1: Cache the outbound socket wrapper once so socket property changes reliably apply after source-IP binding.
+                $remoteSocketRef = $remoteClient.Client
+                $remoteSocketRef.ReceiveBufferSize = 1048576
+                $remoteSocketRef.SendBufferSize = 1048576
+                $remoteSocketRef.NoDelay = $true
+                $remoteSocketRef.ReceiveTimeout = 30000
+                $remoteSocketRef.SendTimeout = 30000
+                $remoteSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+                $remoteClient.SendTimeout = 30000
+                $remoteClient.ReceiveTimeout = 30000
 
                 $null = (Get-OrCreate-LocalAtomicCounter -Map $State.activePerAdapter -Key $adapter.Name).Increment()
                 $connAdapter = $adapter.Name
@@ -1612,7 +1635,11 @@ $HandlerScript = {
             return
         }
 
-        $remoteStream = $remoteClient.GetStream()
+        # NetFusion-FIX-18: Use NetworkStream with socket ownership disabled and close the TcpClient exactly once during cleanup.
+        $remoteStream = [System.Net.Sockets.NetworkStream]::new($remoteSocketRef, $false)
+        # NetFusion-FIX-8: Apply finite read/write timeouts so half-open relay connections do not consume runspaces forever.
+        $remoteStream.ReadTimeout = 30000
+        $remoteStream.WriteTimeout = 30000
 
         if ($method -eq 'CONNECT') {
             # [V5-FIX-11] HTTPS TUNNELING: Forward tunnel without modification -- NO MITM.
@@ -1622,10 +1649,6 @@ $HandlerScript = {
             $ok = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 Connection Established`r`n`r`n")
             $clientStream.Write($ok, 0, $ok.Length)
             $clientStream.Flush()
-            $clientStream.ReadTimeout = [System.Threading.Timeout]::Infinite
-            $clientStream.WriteTimeout = [System.Threading.Timeout]::Infinite
-            $remoteStream.ReadTimeout = [System.Threading.Timeout]::Infinite
-            $remoteStream.WriteTimeout = [System.Threading.Timeout]::Infinite
             # NetFusion-FIX-4: Keep HTTPS tunnels fully bidirectional so ACK and payload paths are not serialized.
             [NetFusion.StreamCopier]::CopyStreamBidirectional(
                 $clientStream,
@@ -1634,7 +1657,6 @@ $HandlerScript = {
                 [ref]$remoteToClientBytes
             )
         } else {
-            $remoteStream.ReadTimeout = 15000
             $reqPath = $uri.PathAndQuery; if (-not $reqPath) { $reqPath = '/' }
             $req = "$method $reqPath HTTP/1.1`r`n"
             $hasHost = $false; $contentLength = 0; $isChunked = $false
@@ -1690,8 +1712,6 @@ $HandlerScript = {
             $hostCounter = $State.activePerHost[$hostKey]
             if ($hostCounter -and $hostCounter.Read() -gt 0) { $null = $hostCounter.Decrement() }
         }
-        try { if ($remoteStream) { $remoteStream.Dispose() } } catch {}
-        try { if ($clientStream) { $clientStream.Dispose() } } catch {}
         try { if ($remoteClient) { $remoteClient.Close() } } catch {}
         try { if ($remoteClient) { $remoteClient.Dispose() } } catch {}
         try { if ($ClientSocket) { $ClientSocket.Close() } } catch {}
@@ -1713,7 +1733,7 @@ $maxThreads = [math]::Max(50, [math]::Max($minThreads, $maxThreads))
 $currentMaxThreads = [math]::Max(50, [math]::Min($maxThreads, [math]::Max($minThreads, 96)))
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
 
-# NetFusion-FIX-13: Keep the accept loop non-blocking by dispatching each client into a large adaptive runspace pool.
+# NetFusion-FIX-17: Keep the accept loop backed by a large adaptive runspace pool so burst traffic does not queue behind a small worker cap.
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
 $rsPool.Open()
 $jobs = [System.Collections.Generic.List[object]]::new()
@@ -1755,9 +1775,10 @@ Write-Host ""
 Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (connection-level WRR + safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
-# NetFusion-FIX-1: Increase the listener socket buffers so accepted proxy sockets inherit a large receive window.
-$listener.Server.ReceiveBufferSize = 1048576
-$listener.Server.SendBufferSize = 1048576
+# NetFusion-FIX-1: Cache the listener socket wrapper once so buffer settings reliably apply before the accept loop starts.
+$listenerSocket = $listener.Server
+$listenerSocket.ReceiveBufferSize = 1048576
+$listenerSocket.SendBufferSize = 1048576
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
 
 Update-ProxyStats
@@ -1773,7 +1794,7 @@ $lowThreadHoldTicks = [System.TimeSpan]::FromSeconds(120).Ticks
 $lowThreadTicks = $null
 
 try {
-    while ($true) {
+    while ($script:IsRunning) {
         $nowTicks = [System.DateTimeOffset]::UtcNow.Ticks
 
         # Refresh adapter data and weights every 5 seconds
@@ -1808,7 +1829,7 @@ try {
             
             # [V5-FIX-8] Dynamic Thread Pool Scaling Policy
             $activeThreads = $activeCount
-            $queueDepth = if ($listener.Pending()) { 1 } else { 0 } # Conservative estimate to avoid oversensitive scale-ups
+            $queueDepth = if ($listenerSocket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { 1 } else { 0 } # Conservative estimate to avoid oversensitive scale-ups
             
             if ($queueDepth -gt 0 -and $activeThreads -ge ($currentMaxThreads - 8) -and $currentMaxThreads -lt $maxThreads) {
                 $targetThreads = [math]::Max($currentMaxThreads + 16, $activeThreads + 16)
@@ -1849,24 +1870,42 @@ try {
             $lastSessionCleanTicks = $nowTicks
         }
 
-        if (-not $listener.Pending()) {
-            Start-Sleep -Milliseconds 5  # 5ms poll (was 15ms) -- 3x faster new connection acceptance
+        # NetFusion-FIX-9: Use an interruptible poll-based accept loop so shutdown can break out of accept waits without hanging the process.
+        $acceptReady = $false
+        try {
+            $acceptReady = $listenerSocket.Poll(1000000, [System.Net.Sockets.SelectMode]::SelectRead)
+        } catch {
+            if (-not $script:IsRunning) { break }
+        }
+
+        if (-not $acceptReady) {
             continue
         }
 
-        $client = $listener.AcceptTcpClient()
-        # NetFusion-FIX-7: Disable Nagle on proxy sockets so ACK/control packets are not delayed in the relay.
-        $client.NoDelay = $true
-        $client.ReceiveBufferSize = 1048576
-        $client.SendBufferSize = 1048576
-        $client.Client.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+        try {
+            $client = $listener.AcceptTcpClient()
+        } catch {
+            if (-not $script:IsRunning) { break }
+            continue
+        }
 
-        # NetFusion-FIX-13: Dispatch each accepted connection asynchronously; never block the accept loop on relay work.
+        # NetFusion-FIX-1: Cache the accepted socket wrapper once so socket property changes reliably apply before dispatch.
+        $clientSocket = $client.Client
+        $clientSocket.ReceiveBufferSize = 1048576
+        $clientSocket.SendBufferSize = 1048576
+        # NetFusion-FIX-7: Disable Nagle on proxy sockets so ACK/control packets are not delayed in the relay.
+        $clientSocket.NoDelay = $true
+        $clientSocket.ReceiveTimeout = 30000
+        $clientSocket.SendTimeout = 30000
+        $clientSocket.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+
+        # NetFusion-FIX-17: Dispatch each accepted connection asynchronously into the existing runspace pool; never block the accept loop on relay work.
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $rsPool
         $ps.AddScript($HandlerScript).AddArgument($client).AddArgument($global:ProxyState) | Out-Null
         $handle = $ps.BeginInvoke()
         $jobs.Add(@{ PS = $ps; Handle = $handle; StartTicks = $nowTicks })
+        $script:ActivePowershells.Enqueue($ps)
 
         # Log connection activity
         if (($nowTicks - $lastLogTicks) -gt $logIntervalTicks) {
@@ -1884,8 +1923,19 @@ try {
         }
     }
 } finally {
-    $listener.Stop()
+    $script:IsRunning = $false
+    try { $listener.Stop() } catch {}
+    try { $listenerSocket.Close() } catch {}
+    foreach ($job in @($jobs)) {
+        try { $job.PS.Dispose() } catch {}
+    }
+    $psInstance = $null
+    while ($script:ActivePowershells.TryDequeue([ref]$psInstance)) {
+        try { if ($psInstance) { $psInstance.Dispose() } } catch {}
+        $psInstance = $null
+    }
     $rsPool.Close()
+    try { $rsPool.Dispose() } catch {}
     try { Write-AtomicJson -Path $global:ProxyState.statsFile -Data @{ running = $false } -Depth 3 } catch {}
     Write-ProxyEvent "Proxy stopped"
     Write-Host "`n  Proxy stopped." -ForegroundColor Yellow

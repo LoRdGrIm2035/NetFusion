@@ -358,7 +358,7 @@ function Test-DNSResolution {
     try {
         $dnsConfig = Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue
         if (-not $dnsConfig -or -not $dnsConfig.ServerAddresses -or @($dnsConfig.ServerAddresses).Count -eq 0) {
-            # NetFusion-FIX-15: Fall back to neutral public resolvers when an adapter lacks usable DNS so WAN-specific lookups stay consistent.
+            # NetFusion-FIX-16: Fall back to neutral public resolvers when an adapter lacks usable DNS so WAN-specific lookups stay consistent.
             Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @('1.1.1.1', '8.8.8.8') -ErrorAction SilentlyContinue
         }
 
@@ -369,7 +369,7 @@ function Test-DNSResolution {
         Write-Host "  [DNS] $name DNS resolution failed -- adding fallback DNS" -ForegroundColor Yellow
         Write-RouteEvent "DNS failsafe: adding 8.8.8.8 + 1.1.1.1 to $name"
         try {
-            # NetFusion-FIX-15: Fall back to neutral public resolvers when an adapter has broken DNS so CDN lookups stop depending on the wrong WAN.
+            # NetFusion-FIX-16: Fall back to neutral public resolvers when an adapter has broken DNS so CDN lookups stop depending on the wrong WAN.
             Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @('1.1.1.1', '8.8.8.8') -ErrorAction SilentlyContinue
         } catch {}
         $script:dnsVerified[$name] = @{ verified = $false; time = Get-Date }

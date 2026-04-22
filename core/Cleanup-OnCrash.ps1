@@ -13,7 +13,7 @@ if (Test-Path $rulesFile) {
             foreach ($r in $data.rules) {
                 $matchingRules = @(Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue)
                 if ($matchingRules.Count -gt 0) {
-                    # NetFusion-FIX-15: Remove crash-left firewall rules by concrete rule IDs and verify they are actually gone.
+                    # Remove crash-left firewall rules by concrete rule IDs and verify they are actually gone.
                     foreach ($rule in $matchingRules) {
                         try {
                             Remove-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue

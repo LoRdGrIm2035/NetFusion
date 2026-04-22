@@ -119,6 +119,13 @@ function Get-OriginalRoutes {
     )
 }
 
+function Get-OriginalDnsSettings {
+    return @(
+        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Select-Object InterfaceIndex, InterfaceAlias, ServerAddresses
+    )
+}
+
 function Get-MetricLookup {
     param([object]$Metrics)
 
@@ -295,10 +302,34 @@ function Get-LiveInterfaces {
             InterfaceMetric = if ($metricInfo) { [int]$metricInfo.InterfaceMetric } else { 9999 }
             AutomaticMetric = if ($metricInfo) { [string]$metricInfo.AutomaticMetric } else { 'Unknown' }
             LinkSpeedMbps = $linkSpeedMbps
+            DnsServers = @((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).ServerAddresses)
         }
     }
 
     return $interfaces
+}
+
+function Set-NeutralDnsServers {
+    param([object[]]$Interfaces)
+
+    foreach ($iface in @($Interfaces)) {
+        if (-not $iface -or -not $iface.InterfaceIndex) {
+            continue
+        }
+
+        try {
+            $targetServers = @('1.1.1.1', '8.8.8.8')
+            $currentServers = @((Get-DnsClientServerAddress -InterfaceIndex ([int]$iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).ServerAddresses)
+            if (($currentServers.Count -eq $targetServers.Count) -and (@($currentServers) -join ',') -eq ($targetServers -join ',')) {
+                continue
+            }
+
+            # NetFusion-FIX-16: Normalize active adapter DNS to neutral public resolvers so both WANs receive consistent CDN answers.
+            Set-DnsClientServerAddress -InterfaceIndex ([int]$iface.InterfaceIndex) -ServerAddresses $targetServers -ErrorAction SilentlyContinue
+        } catch {
+            Write-NetworkStateMessage ("Failed to set neutral DNS on interface {0}: {1}" -f $iface.InterfaceIndex, $_.Exception.Message) 'Yellow'
+        }
+    }
 }
 
 function Test-RouteExists {
@@ -402,7 +433,7 @@ function Ensure-NetFusionRoutes {
 
         $secondaryRank++
         $originalMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $iface.InterfaceIndex -FallbackMetric $iface.InterfaceMetric
-        # NetFusion-FIX-14: Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
+        # NetFusion-FIX-15: Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
         if ($originalMetric -ge 9000) {
             $originalMetric = $primaryMetric + ($secondaryRank * 5)
         }
@@ -448,6 +479,7 @@ function Ensure-NetFusionRoutes {
         }
     }
 
+    Set-NeutralDnsServers -Interfaces $interfaces
     Save-NetworkState -State $state
     return $true
 }
@@ -576,6 +608,23 @@ function Restore-OriginalRoutes {
     }
 }
 
+function Restore-OriginalDnsSettings {
+    param([object]$State)
+
+    foreach ($dnsEntry in @($State.originalDnsSettings)) {
+        try {
+            $serverAddresses = @($dnsEntry.ServerAddresses)
+            if ($serverAddresses.Count -gt 0) {
+                Set-DnsClientServerAddress -InterfaceIndex ([int]$dnsEntry.InterfaceIndex) -ServerAddresses $serverAddresses -ErrorAction SilentlyContinue
+            } else {
+                Set-DnsClientServerAddress -InterfaceIndex ([int]$dnsEntry.InterfaceIndex) -ResetServerAddresses -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Write-NetworkStateMessage ("Failed to restore DNS on interface {0}: {1}" -f $dnsEntry.InterfaceIndex, $_.Exception.Message) 'Yellow'
+        }
+    }
+}
+
 function Remove-AddedRoutes {
     param([object]$State)
 
@@ -633,6 +682,7 @@ function Invoke-NetworkRestore {
     try { if ($state) { Restore-OriginalRoutes -State $state } } catch {}
     try { if ($state) { Remove-AddedRoutes -State $state } } catch {}
     try { if ($state) { Restore-OriginalMetrics -State $state } } catch {}
+    try { if ($state) { Restore-OriginalDnsSettings -State $state } } catch {}
     try { ipconfig /flushdns | Out-Null } catch {}
 
     if (Test-Path $script:StateFile) {
@@ -656,6 +706,7 @@ function Save-OriginalNetworkState {
         activeSession = $true
         originalRoutes = @(Get-OriginalRoutes)
         originalMetrics = @(Get-OriginalMetrics)
+        originalDnsSettings = @(Get-OriginalDnsSettings)
         originalProxySettings = Get-OriginalProxySettings
         originalIdmSettings = Get-OriginalIdmSettings
         addedRoutes = @()
@@ -664,7 +715,7 @@ function Save-OriginalNetworkState {
 
     $state.primaryInterfaceIndex = Resolve-PrimaryInterfaceIndex -State $state
     Save-NetworkState -State $state
-    Write-NetworkStateMessage 'Saved original routes, metrics, proxy, and IDM state.' 'Green'
+    Write-NetworkStateMessage 'Saved original routes, metrics, DNS, proxy, and IDM state.' 'Green'
     return $true
 }
 
