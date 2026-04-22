@@ -532,7 +532,7 @@ New-NetRoute -InterfaceAlias 'Wi-Fi 4' -AddressFamily IPv4 -DestinationPrefix '0
 
 ## Contributor
 
-**[Arman Khan](https://github.com/Arman-techiee)**
+**[Arman Khan](https://github.com/armancore)**
 
 ## License
 
