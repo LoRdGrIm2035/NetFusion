@@ -41,6 +41,12 @@ $config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFro
 $pingTarget = if ($config -and $config.healthCheck -and $config.healthCheck.pingTarget) { $config.healthCheck.pingTarget } else { '8.8.8.8' }
 $pingTarget2 = '1.1.1.1'
 $pingTimeout = if ($config -and $config.healthCheck -and $config.healthCheck.timeout) { $config.healthCheck.timeout } else { 1500 }
+# NetFusion-FIX: 11 - Slow the primary health cadence down to a 10s TCP probe and reserve full latency/jitter sampling for 60s intervals.
+$script:healthPrimaryIntervalSeconds = if ($config -and $config.healthCheck -and $config.healthCheck.primaryIntervalSeconds) { [Math]::Max(10, [int]$config.healthCheck.primaryIntervalSeconds) } else { 10 }
+$script:healthFullMeasurementIntervalSeconds = if ($config -and $config.healthCheck -and $config.healthCheck.fullMeasurementIntervalSeconds) { [Math]::Max(30, [int]$config.healthCheck.fullMeasurementIntervalSeconds) } else { 60 }
+$script:tcpProbeTarget = if ($config -and $config.healthCheck -and $config.healthCheck.tcpTarget) { [string]$config.healthCheck.tcpTarget } else { '1.1.1.1' }
+$script:tcpProbeTarget2 = if ($config -and $config.healthCheck -and $config.healthCheck.tcpTarget2) { [string]$config.healthCheck.tcpTarget2 } else { '1.0.0.1' }
+$script:tcpProbePort = if ($config -and $config.healthCheck -and $config.healthCheck.tcpPort) { [int]$config.healthCheck.tcpPort } else { 80 }
 
 # Intelligence config
 $script:defaultEwmaAlpha = 0.30
@@ -65,6 +71,10 @@ $script:healthTrend = @{}           # Rolling health scores for trend: @{ name =
 $script:successRates = @{}          # Success/fail tracking: @{ name = @{ success=N; fail=N; rate=0.0 } }
 $script:degradationWarnings = @{}   # Predictive warnings: @{ name = @{ warned=$bool; trend=$val; since=$time } }
 $script:stabilityScores = @{}       # Health variance tracking for stability: @{ name = [double] }
+$script:lastHealthOutput = $null
+$script:lastHealthRun = $null
+$script:lastFullHealthRun = $null
+$script:lastHealthByAdapter = @{}
 $script:InterfaceMonitorLogMutex = New-Object System.Threading.Mutex($false, "NetFusion-LogWrite")
 
 function Write-AtomicJson {
@@ -237,6 +247,42 @@ function Test-InternetLatency {
         $sw.Stop()
         $tcp.Close()
         if ($connected) { return [math]::Max(1, [int]$sw.ElapsedMilliseconds) }
+    } catch {}
+
+    return 999
+}
+
+function Test-BoundTcpLatency {
+    param(
+        [string]$SourceIP,
+        [string]$Target,
+        [int]$Port,
+        [int]$Timeout
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SourceIP) -or [string]::IsNullOrWhiteSpace($Target)) {
+        return 999
+    }
+
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new([System.Net.Sockets.AddressFamily]::InterNetwork)
+        $tcp.NoDelay = $true
+        $tcp.ReceiveBufferSize = 1048576
+        $tcp.SendBufferSize = 1048576
+        $tcp.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($SourceIP), 0))
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $asyncResult = $tcp.BeginConnect($Target, $Port, $null, $null)
+        $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
+        $sw.Stop()
+
+        if ($connected -and $tcp.Connected) {
+            try { $tcp.EndConnect($asyncResult) } catch {}
+            $tcp.Close()
+            return [math]::Max(1, [int]$sw.ElapsedMilliseconds)
+        }
+
+        $tcp.Close()
     } catch {}
 
     return 999
@@ -417,33 +463,61 @@ function Update-SuccessRate {
 # ===== Enhanced Health Measurement =====
 
 function Measure-InterfaceHealth {
-    param([hashtable]$Interface, [string]$Mode = 'default')
+    param(
+        [hashtable]$Interface,
+        [string]$Mode = 'default',
+        [switch]$PrimaryOnly
+    )
 
     $ip = $Interface.IPAddress
     $gateway = $Interface.Gateway
     $name = $Interface.Name
+    $previousHealth = if ($script:lastHealthByAdapter.ContainsKey($name)) { $script:lastHealthByAdapter[$name] } else { $null }
 
     # --- Gateway latency ---
-    $gwLatencyRaw = Test-GatewayLatency -Gateway $gateway
+    $gwLatencyMeasured = Test-GatewayLatency -Gateway $gateway
+    $gwLatencyRaw = $gwLatencyMeasured
+    if ($gwLatencyRaw -ge 999 -and $previousHealth -and $previousHealth.GatewayLatency) {
+        $gwLatencyRaw = [double]$previousHealth.GatewayLatency
+    }
     $gwLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $gwLatencyRaw -Type 'gateway' -Mode $Mode
 
-    # --- Internet latency (try primary then secondary target) ---
-    $inetLatencyRaw = 999
+    # --- Internet latency ---
+    $inetLatencyMeasured = 999
     if ($ip) {
-        $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget -Timeout $pingTimeout
-        if ($inetLatencyRaw -ge 999) {
-            $inetLatencyRaw = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
+        if ($PrimaryOnly) {
+            $inetLatencyMeasured = Test-BoundTcpLatency -SourceIP $ip -Target $script:tcpProbeTarget -Port $script:tcpProbePort -Timeout $pingTimeout
+            if ($inetLatencyMeasured -ge 999) {
+                $inetLatencyMeasured = Test-BoundTcpLatency -SourceIP $ip -Target $script:tcpProbeTarget2 -Port $script:tcpProbePort -Timeout $pingTimeout
+            }
+        } else {
+            $inetLatencyMeasured = Test-InternetLatency -SourceIP $ip -Target $pingTarget -Timeout $pingTimeout
+            if ($inetLatencyMeasured -ge 999) {
+                $inetLatencyMeasured = Test-InternetLatency -SourceIP $ip -Target $pingTarget2 -Timeout $pingTimeout
+            }
         }
+    }
+    $inetLatencyRaw = $inetLatencyMeasured
+    if ($inetLatencyRaw -ge 999 -and $previousHealth -and $previousHealth.InternetLatency) {
+        $inetLatencyRaw = [double]$previousHealth.InternetLatency
     }
     $inetLatencySmoothed = Update-EWMALatency -Name $name -RawLatency $inetLatencyRaw -Type 'internet' -Mode $Mode
 
     # --- Update latency history and measure jitter ---
-    Update-LatencyHistory -Name $name -RawLatency $inetLatencyRaw
-    $jitter = Measure-Jitter -Name $name
+    if (-not $PrimaryOnly) {
+        Update-LatencyHistory -Name $name -RawLatency $inetLatencyRaw
+        $jitter = Measure-Jitter -Name $name
+    } elseif ($script:jitterValues.ContainsKey($name)) {
+        $jitter = [double]$script:jitterValues[$name]
+    } elseif ($previousHealth -and $previousHealth.Jitter) {
+        $jitter = [double]$previousHealth.Jitter
+    } else {
+        $jitter = 0.0
+    }
 
     # --- Update success rate ---
-    $gwOk = $gwLatencyRaw -lt 999
-    $inetOk = $inetLatencyRaw -lt 999
+    $gwOk = $gwLatencyMeasured -lt 999
+    $inetOk = $inetLatencyMeasured -lt 999
     Update-SuccessRate -Name $name -GatewayOk $gwOk -InternetOk $inetOk
 
     # --- Bandwidth calculation (with counter wraparound protection) ---
@@ -460,7 +534,7 @@ function Measure-InterfaceHealth {
         if ($timeDelta -gt 0.5) {
             $rxDelta = $rxBytes - $prev.rx
             $txDelta = $txBytes - $prev.tx
-            if ($rxDelta -lt 0) { $rxDelta = $rxBytes }  # Counter wraparound
+            if ($rxDelta -lt 0) { $rxDelta = $rxBytes }
             if ($txDelta -lt 0) { $txDelta = $txBytes }
             $rxSpeed = [math]::Round($rxDelta * 8 / $timeDelta / 1000000, 2)
             $txSpeed = [math]::Round($txDelta * 8 / $timeDelta / 1000000, 2)
@@ -468,73 +542,42 @@ function Measure-InterfaceHealth {
     }
     $script:prevBytes[$name] = @{ rx = $rxBytes; tx = $txBytes; time = (Get-Date) }
 
-    # --- Packet loss estimation ---
-    $packetLoss = 0
-    if ($inetLatencyRaw -ge 999 -and $gwLatencyRaw -ge 999) { $packetLoss = 100 }
-    elseif ($inetLatencyRaw -ge 999) { $packetLoss = 50 }
+    # --- Packet loss estimation (0-10% scale for weighting) ---
+    $packetLoss = 0.0
+    if (-not $inetOk -and -not $gwOk) {
+        $packetLoss = 10.0
+    } elseif (-not $inetOk) {
+        $packetLoss = 5.0
+    }
 
-    # ===== Enhanced Health Score (0-100) -- 7-Factor Weighted =====
-    $score = 0
+    # NetFusion-FIX: 6 - Score adapters with bandwidth as the primary factor, then latency, jitter, and loss.
     $hasIP = [bool]$ip
+    $linkSpeedMbps = if ($null -ne $Interface.LinkSpeedMbps) { [double]$Interface.LinkSpeedMbps } else { 0.0 }
+    if ($linkSpeedMbps -le 0.0 -and $previousHealth -and $previousHealth.LinkSpeedMbps) {
+        $linkSpeedMbps = [double]$previousHealth.LinkSpeedMbps
+    }
+    if ($linkSpeedMbps -le 0.0) {
+        $linkSpeedMbps = 100.0
+    }
 
     if ($hasIP) {
-        # Factor 1: Gateway reachable (15 points)
-        if ($gwLatencySmoothed -lt 998) {
-            $score += 15
-            if ($gwLatencySmoothed -lt 5) { $score += 3 }      # Ultra-low gateway bonus
-            elseif ($gwLatencySmoothed -lt 20) { $score += 2 }
-            elseif ($gwLatencySmoothed -lt 50) { $score += 1 }
-        }
+        $bwFactor = [math]::Min($linkSpeedMbps / 500.0, 1.0)
+        $latencyFactor = [math]::Max(0.0, 1.0 - ($inetLatencySmoothed / 200.0))
+        $jitterFactor = [math]::Max(0.0, 1.0 - ($jitter / 100.0))
+        $lossFactor = [math]::Max(0.0, 1.0 - ($packetLoss / 10.0))
+        $rawScore = ($bwFactor * 50.0) + ($latencyFactor * 20.0) + ($jitterFactor * 10.0) + ($lossFactor * 20.0)
 
-        # Factor 2: Internet reachable (25 points)
-        if ($inetLatencySmoothed -lt 998) {
-            $score += 25
-            if ($inetLatencySmoothed -lt 15) { $score += 5 }   # Ultra-low latency
-            elseif ($inetLatencySmoothed -lt 30) { $score += 3 }
-            elseif ($inetLatencySmoothed -lt 60) { $score += 2 }
-            elseif ($inetLatencySmoothed -lt 100) { $score += 1 }
-        }
+        $previousScore = if ($previousHealth -and $null -ne $previousHealth.HealthScore) { [double]$previousHealth.HealthScore } else { $rawScore }
+        $score = [math]::Round([math]::Max(0.0, [math]::Min(100.0, (($previousScore * 0.7) + ($rawScore * 0.3)))), 1)
 
-        # Factor 3: Jitter score (10 points) -- low jitter = stable
-        if ($jitter -lt 3) { $score += 10 }
-        elseif ($jitter -lt 10) { $score += 7 }
-        elseif ($jitter -lt 25) { $score += 4 }
-        elseif ($jitter -lt 50) { $score += 2 }
-
-        # Factor 4: Success rate (15 points)
-        $sr = if ($script:successRates.ContainsKey($name)) { $script:successRates[$name].rate } else { 100.0 }
-        $score += [math]::Round(($sr / 100) * 15)
-
-        # Factor 5: Bandwidth activity (10 points)
-        if ($rxSpeed -gt 1.0 -or $txSpeed -gt 1.0) {
-            $score += 10
-        } elseif ($rxSpeed -gt 0.1 -or $txSpeed -gt 0.1) {
-            $score += 7
-            if ($score -lt 50) { $score = 50 }  # If data flowing, adapter is working
-        }
-
-        # Factor 6: Stability score (15 points)
-        $stability = Get-StabilityScore -Name $name
-        $score += [math]::Round(($stability / 100) * 15)
-
-        # Factor 7: Trend bonus/penalty (10 points)
         $trendSlope = Update-HealthTrend -Name $name -HealthScore $score
-        if ($trendSlope -gt 1) { $score += 5 }          # Improving trend
-        elseif ($trendSlope -gt 0) { $score += 3 }
-        elseif ($trendSlope -lt -2) { $score -= 5 }      # Declining trend
-        elseif ($trendSlope -lt -1) { $score -= 3 }
-
-        # Packet loss penalty
-        if ($packetLoss -gt 0) { $score -= [math]::Min(15, [int]($packetLoss / 5)) }
-
-        $score = [math]::Max(0, [math]::Min(100, [math]::Round($score)))
-
-        # --- Predictive degradation check ---
+        $stability = Get-StabilityScore -Name $name
         $isDegrading = Test-PredictiveDegradation -Name $name -Slope $trendSlope -CurrentHealth $score
     } else {
-        $trendSlope = 0
-        $jitter = 0
-        $stability = 0
+        $rawScore = 0.0
+        $score = 0.0
+        $trendSlope = 0.0
+        $stability = 0.0
         $isDegrading = $false
     }
 
@@ -551,29 +594,34 @@ function Measure-InterfaceHealth {
     }
     $script:prevStates[$name] = $status
 
-    return @{
-        Name              = $name
-        Type              = $Interface.Type
-        InterfaceIndex    = $Interface.InterfaceIndex
-        GatewayLatency    = $gwLatencyRaw
+    $result = @{
+        Name               = $name
+        Type               = $Interface.Type
+        InterfaceIndex     = $Interface.InterfaceIndex
+        GatewayLatency     = $gwLatencyRaw
         GatewayLatencyEWMA = [math]::Round($gwLatencySmoothed, 1)
-        InternetLatency   = $inetLatencyRaw
+        InternetLatency    = $inetLatencyRaw
         InternetLatencyEWMA = [math]::Round($inetLatencySmoothed, 1)
-        Jitter            = $jitter
-        DownloadMbps      = $rxSpeed
-        UploadMbps        = $txSpeed
-        PacketLoss        = $packetLoss
-        HealthScore       = $score
-        Status            = $status
-        SuccessRate       = if ($script:successRates.ContainsKey($name)) { $script:successRates[$name].rate } else { 100.0 }
-        StabilityScore    = if ($script:stabilityScores.ContainsKey($name)) { $script:stabilityScores[$name] } else { 80 }
-        HealthTrend       = $trendSlope
-        IsDegrading       = $isDegrading
-        LinkSpeedMbps     = $Interface.LinkSpeedMbps
-        IPAddress         = $ip
-        Gateway           = $gateway
-        SSID              = $Interface.SSID
+        Jitter             = $jitter
+        DownloadMbps       = $rxSpeed
+        UploadMbps         = $txSpeed
+        PacketLoss         = $packetLoss
+        RawHealthScore     = [math]::Round($rawScore, 1)
+        HealthScore        = $score
+        Status             = $status
+        SuccessRate        = if ($script:successRates.ContainsKey($name)) { $script:successRates[$name].rate } else { 100.0 }
+        StabilityScore     = if ($script:stabilityScores.ContainsKey($name)) { $script:stabilityScores[$name] } else { 80 }
+        HealthTrend        = $trendSlope
+        IsDegrading        = $isDegrading
+        LinkSpeedMbps      = $linkSpeedMbps
+        IPAddress          = $ip
+        Gateway            = $gateway
+        SSID               = $Interface.SSID
+        MeasurementMode    = if ($PrimaryOnly) { 'primary' } else { 'full' }
     }
+
+    $script:lastHealthByAdapter[$name] = $result
+    return $result
 }
 
 function Rotate-CSVLog {
@@ -591,6 +639,8 @@ function Rotate-CSVLog {
 Write-Host ""
 Write-Host "  [InterfaceMonitor v4.0] Intelligent health monitoring every ${Interval}s" -ForegroundColor Yellow
 Write-Host "  Ping targets: $pingTarget, $pingTarget2" -ForegroundColor DarkGray
+Write-Host "  Primary checks: every $($script:healthPrimaryIntervalSeconds)s via bound TCP $($script:tcpProbeTarget):$($script:tcpProbePort)" -ForegroundColor DarkGray
+Write-Host "  Full checks: every $($script:healthFullMeasurementIntervalSeconds)s via ping + jitter refresh" -ForegroundColor DarkGray
 Write-Host "  Multi-method: Gateway + Internet + DNS + Bandwidth" -ForegroundColor DarkGray
 Write-Host "  Intelligence: Dynamic EWMA + Jitter(w=$jitterWindowSize) + Trend(w=$healthTrendWindow) + Prediction(t=$degradationThreshold)" -ForegroundColor DarkGray
 Write-Host ""
@@ -602,6 +652,11 @@ if (-not (Test-Path $LogFile)) {
 
 function Update-HealthState {
     try {
+        $now = Get-Date
+        if ($script:lastHealthOutput -and $script:lastHealthRun -and (($now - $script:lastHealthRun).TotalSeconds -lt $script:healthPrimaryIntervalSeconds)) {
+            return $script:lastHealthOutput
+        }
+
         try {
             $liveCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
             $activeMode = if ($liveCfg -and $liveCfg.mode) { $liveCfg.mode } else { 'maxspeed' }
@@ -614,12 +669,13 @@ function Update-HealthState {
 
         $ifaceData = Get-Content $InterfacesFile -Raw | ConvertFrom-Json
         $healthResults = @()
+        $fullMeasurementDue = (-not $script:lastFullHealthRun) -or (($now - $script:lastFullHealthRun).TotalSeconds -ge $script:healthFullMeasurementIntervalSeconds)
 
         foreach ($iface in $ifaceData.interfaces) {
             $ifHash = @{}
             $iface.PSObject.Properties | ForEach-Object { $ifHash[$_.Name] = $_.Value }
 
-            $health = Measure-InterfaceHealth -Interface $ifHash -Mode $activeMode
+            $health = Measure-InterfaceHealth -Interface $ifHash -Mode $activeMode -PrimaryOnly:(-not $fullMeasurementDue)
             $healthResults += $health
 
             # Optional UI Console Output
@@ -635,10 +691,20 @@ function Update-HealthState {
             timestamp   = (Get-Date).ToString('o')
             version     = '4.0'
             uptime      = [math]::Round(((Get-Date) - $script:startTime).TotalMinutes, 1)
+            measurementMode = if ($fullMeasurementDue) { 'full' } else { 'primary' }
+            intervals   = @{
+                primarySeconds = $script:healthPrimaryIntervalSeconds
+                fullSeconds = $script:healthFullMeasurementIntervalSeconds
+            }
             adapters    = $healthResults
             degradation = $script:degradationWarnings
         }
         Write-AtomicJson -Path $HealthFile -Data $healthOutput -Depth 4
+        $script:lastHealthOutput = $healthOutput
+        $script:lastHealthRun = $now
+        if ($fullMeasurementDue) {
+            $script:lastFullHealthRun = $now
+        }
 
         # Rotate CSV and Events log every 50 loops
         $script:loopCount++

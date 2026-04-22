@@ -4,21 +4,26 @@
     "dashboardAllowLAN": false,
     "blockQUICOnSecondaryAdapters": true,
     "mode":  "maxspeed",
-    "monitorInterval":  2000,
+    "monitorInterval":  10000,
     "healthCheck":  {
                         "pingTarget":  "8.8.8.8",
                         "pingTarget2":  "1.1.1.1",
+                        "primaryIntervalSeconds":  10,
+                        "fullMeasurementIntervalSeconds":  60,
+                        "tcpTarget":  "1.1.1.1",
+                        "tcpTarget2":  "1.0.0.1",
+                        "tcpPort":  80,
                         "timeout":  1500,
                         "failThreshold":  3
                     },
     "proxy":  {
                   "connectTimeout":  5000,
                   "maxRetries":  3,
-                  "bufferSize":  65536,
+                  "bufferSize":  262144,
                   "minThreads":  64,
                   "maxThreads":  256,
                   "jobTimeoutSec":  120,
-                  "sessionAffinityTTL":  300,
+                  "sessionAffinityTTL":  60,
                   "healthEndpoint":  true
               },
     "routing":  {
@@ -156,4 +161,3 @@
                          ],
     "autoStart":  false
 }
-

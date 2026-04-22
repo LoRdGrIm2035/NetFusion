@@ -32,6 +32,8 @@ $validModes = @("maxspeed", "download", "gaming", "streaming", "balanced")
 $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
+$script:DashboardSnapshotCache = @{}
+$script:DashboardSnapshotTtlSeconds = 2
 
 function Write-AtomicJson {
     param(
@@ -76,6 +78,31 @@ function Read-JsonFile {
         }
         return $DefaultValue
     }
+}
+
+function Get-CachedJsonFile {
+    param(
+        [string]$Path,
+        [object]$DefaultValue = $null,
+        [int]$MaxAgeSeconds = 2
+    )
+
+    $cacheKey = [System.IO.Path]::GetFullPath($Path)
+    $entry = if ($script:DashboardSnapshotCache.ContainsKey($cacheKey)) { $script:DashboardSnapshotCache[$cacheKey] } else { $null }
+    $lastWriteTicks = if (Test-Path $Path) { [System.IO.File]::GetLastWriteTimeUtc($Path).Ticks } else { 0L }
+    $now = [System.DateTimeOffset]::UtcNow
+
+    if ($entry -and (($now - [System.DateTimeOffset]$entry.cachedAt).TotalSeconds -lt $MaxAgeSeconds) -and ([int64]$entry.lastWriteTicks -eq [int64]$lastWriteTicks)) {
+        return $entry.data
+    }
+
+    $data = Read-JsonFile -Path $Path -DefaultValue $DefaultValue
+    $script:DashboardSnapshotCache[$cacheKey] = @{
+        cachedAt = [System.DateTimeOffset]::UtcNow
+        lastWriteTicks = $lastWriteTicks
+        data = $data
+    }
+    return $data
 }
 
 function Normalize-DisplayText {
@@ -274,7 +301,8 @@ function Test-IsMutationAuthorized {
 }
 
 function Get-ClientInterfaces {
-    $data = Read-JsonFile (Join-Path $configDir "interfaces.json")
+    # NetFusion-FIX: 10 - Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
+    $data = Get-CachedJsonFile -Path (Join-Path $configDir "interfaces.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $interfaces = @()
     if ($data -and $data.interfaces) {
         foreach ($iface in @($data.interfaces)) {
@@ -291,7 +319,7 @@ function Get-ClientInterfaces {
 }
 
 function Get-ClientHealth {
-    $data = Read-JsonFile (Join-Path $configDir "health.json")
+    $data = Get-CachedJsonFile -Path (Join-Path $configDir "health.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $adapters = @()
     $degradation = @{}
     if ($data -and $data.adapters) {
@@ -326,7 +354,7 @@ function Get-ClientHealth {
 }
 
 function Get-ClientProxy {
-    $data = Read-JsonFile (Join-Path $configDir "proxy-stats.json")
+    $data = Get-CachedJsonFile -Path (Join-Path $configDir "proxy-stats.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $adapters = @()
     $activePerAdapter = @{}
     $connectionTypes = @{}
@@ -351,14 +379,14 @@ function Get-ClientProxy {
 }
 
 function Get-ClientConfig {
-    $cfg = Read-JsonFile (Join-Path $configDir "config.json")
+    $cfg = Get-CachedJsonFile -Path (Join-Path $configDir "config.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $mode = Get-ValidMode $cfg.mode
     if (-not $mode) { $mode = 'maxspeed' }
     return @{ mode = $mode; version = '6.2' }
 }
 
 function Get-ClientSafety {
-    $state = Read-JsonFile (Join-Path $configDir "safety-state.json")
+    $state = Get-CachedJsonFile -Path (Join-Path $configDir "safety-state.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     return @{ safeMode = if ($state) { [bool]$state.safeMode } else { $false }; circuitBreakerOpen = if ($state) { [bool]$state.circuitBreakerOpen } else { $false }; proxyHealthy = if ($state -and $null -ne $state.proxyHealthy) { [bool]$state.proxyHealthy } else { $true }; uptime = if ($state -and $null -ne $state.uptime) { [double]$state.uptime } else { 0 }; version = if ($state -and $state.version) { Normalize-DisplayText $state.version 16 } else { '6.2' }; lastEvent = if ($state -and $state.lastEvent) { Normalize-DisplayText $state.lastEvent 120 } else { '' } }
 }
 
@@ -367,7 +395,7 @@ function Get-UnifiedStats {
 }
 
 function Get-Events {
-    $data = Read-JsonFile (Join-Path $logsDir "events.json")
+    $data = Get-CachedJsonFile -Path (Join-Path $logsDir "events.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $events = @()
     if ($data -and $data.events) {
         foreach ($e in @($data.events)) {
@@ -378,7 +406,7 @@ function Get-Events {
 }
 
 function Get-Decisions {
-    $data = Read-JsonFile (Join-Path $configDir "decisions.json")
+    $data = Get-CachedJsonFile -Path (Join-Path $configDir "decisions.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $decisions = @()
     if ($data -and $data.decisions) {
         foreach ($d in @($data.decisions)) {
@@ -389,7 +417,7 @@ function Get-Decisions {
 }
 
 function Get-LearningData {
-    $data = Read-JsonFile (Join-Path $configDir "learning-data.json")
+    $data = Get-CachedJsonFile -Path (Join-Path $configDir "learning-data.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $profiles = [ordered]@{}
     $rawProfiles = @{}
 
@@ -399,7 +427,7 @@ function Get-LearningData {
         }
     }
 
-    $interfaceData = Read-JsonFile (Join-Path $configDir "interfaces.json")
+    $interfaceData = Get-CachedJsonFile -Path (Join-Path $configDir "interfaces.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     if ($interfaceData -and $interfaceData.interfaces -and $rawProfiles.Count -gt 0) {
         foreach ($iface in @($interfaceData.interfaces)) {
             $ifaceName = Normalize-DisplayText $iface.Name 64

@@ -402,8 +402,12 @@ function Ensure-NetFusionRoutes {
 
         $secondaryRank++
         $originalMetric = Get-OriginalMetricValue -State $state -InterfaceIndex $iface.InterfaceIndex -FallbackMetric $iface.InterfaceMetric
-        $desiredMetric = [Math]::Max($originalMetric, $primaryMetric + ($secondaryRank * 5))
-        $desiredRouteMetric = [Math]::Max(15, $primaryRouteMetric + ($secondaryRank * 5))
+        # NetFusion-FIX: 9 - Keep secondary routes usable by avoiding pathological high metrics while preserving clean restore data.
+        if ($originalMetric -ge 9000) {
+            $originalMetric = $primaryMetric + ($secondaryRank * 5)
+        }
+        $desiredMetric = [Math]::Min(50, [Math]::Max($originalMetric, $primaryMetric + ($secondaryRank * 5)))
+        $desiredRouteMetric = [Math]::Min(50, [Math]::Max(15, $primaryRouteMetric + ($secondaryRank * 5)))
 
         try {
             Set-NetIPInterface -InterfaceIndex $iface.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -ErrorAction SilentlyContinue
@@ -550,7 +554,9 @@ function Restore-OriginalMetrics {
                 Set-NetIPInterface -InterfaceIndex $metric.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -ErrorAction SilentlyContinue
                 Set-NetIPInterface -InterfaceIndex $metric.InterfaceIndex -AddressFamily IPv4 -InterfaceMetric ([int]$metric.InterfaceMetric) -ErrorAction SilentlyContinue
             }
-        } catch {}
+        } catch {
+            Write-NetworkStateMessage ("Failed to restore interface metric for index {0}: {1}" -f $metric.InterfaceIndex, $_.Exception.Message) 'Yellow'
+        }
     }
 }
 
@@ -564,7 +570,9 @@ function Restore-OriginalRoutes {
             } else {
                 Ensure-RouteMetric -DestinationPrefix ([string]$route.DestinationPrefix) -InterfaceIndex ([int]$route.InterfaceIndex) -NextHop ([string]$route.NextHop) -DesiredMetric ([int]$route.RouteMetric)
             }
-        } catch {}
+        } catch {
+            Write-NetworkStateMessage ("Failed to restore route {0} via {1} on interface {2}: {3}" -f $route.DestinationPrefix, $route.NextHop, $route.InterfaceIndex, $_.Exception.Message) 'Yellow'
+        }
     }
 }
 

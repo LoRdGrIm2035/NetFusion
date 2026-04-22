@@ -19,6 +19,9 @@ param(
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $OutputFile = Join-Path $projectDir "config\interfaces.json"
+$script:AdapterCacheTtlSeconds = 60
+$script:LastInterfaceRefresh = $null
+$script:CachedInterfaces = @()
 
 function Write-AtomicJson {
     param(
@@ -232,7 +235,15 @@ function Get-AllNetworkInterfaces {
 }
 
 function Update-NetworkState {
+    param([switch]$ForceRefresh)
+
     try {
+        # NetFusion-FIX: 12 - Cache adapter discovery instead of re-querying NetAdapter/NetRoute every few seconds.
+        $now = Get-Date
+        if (-not $ForceRefresh -and $script:CachedInterfaces.Count -gt 0 -and $script:LastInterfaceRefresh -and (($now - $script:LastInterfaceRefresh).TotalSeconds -lt $script:AdapterCacheTtlSeconds)) {
+            return @($script:CachedInterfaces)
+        }
+
         $interfaces = Get-AllNetworkInterfaces
         $data = @{
             timestamp  = (Get-Date).ToString('o')
@@ -241,6 +252,8 @@ function Update-NetworkState {
             interfaces = $interfaces
         }
         Write-AtomicJson -Path $OutputFile -Data $data -Depth 4
+        $script:CachedInterfaces = @($interfaces)
+        $script:LastInterfaceRefresh = $now
 
         # Optional UI debug
         # foreach ($iface in $interfaces) { ... }

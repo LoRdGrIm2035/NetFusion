@@ -35,6 +35,8 @@ $logsDir = Join-Path $projectDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
 if (-not ('NetFusion.StreamCopier' -as [type])) {
+    # NetFusion-FIX: 1 - Raise relay socket buffers to 1 MB and harden bound outbound sockets for high-BDP links.
+    # NetFusion-FIX: 2 - Keep relay copy buffers at 256 KB to cut syscall churn in the hot path.
     Add-Type -TypeDefinition @"
 using System;
 using System.IO;
@@ -194,14 +196,18 @@ namespace NetFusion
 
     public static class SocketConnector
     {
+        private const int SocketBufferSize = 1048576;
+        private const int SocketLingerSeconds = 2;
+
         public static TcpClient CreateBoundConnection(string localSourceIp, string remoteHost, int remotePort, int timeoutMs, int interfaceIndex)
         {
             var client = new TcpClient();
             try
             {
                 client.NoDelay = true;
-                client.ReceiveBufferSize = 524288;
-                client.SendBufferSize = 524288;
+                client.ReceiveBufferSize = SocketBufferSize;
+                client.SendBufferSize = SocketBufferSize;
+                client.Client.LingerState = new LingerOption(true, SocketLingerSeconds);
                 client.Client.Bind(new IPEndPoint(IPAddress.Parse(localSourceIp), 0));
 
                 if (interfaceIndex > 0)
@@ -311,7 +317,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     }
     # v6.2 Soft host hint cache (used only when weights are effectively equal)
     sessionMap     = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()    # { "host:port" -> @{ adapter=Name; time=Ticks } }
-    sessionTTL     = 120
+    sessionTTL     = 60
     # v5.0 Safety
     safeMode       = $false
     portClasses    = @{
@@ -557,6 +563,7 @@ function Update-AdaptersAndWeights {
                     Latency     = $_.InternetLatency
                     LatencyEWMA = if ($_.InternetLatencyEWMA) { $_.InternetLatencyEWMA } else { $_.InternetLatency }
                     Jitter      = if ($_.Jitter) { $_.Jitter } else { 0 }
+                    PacketLoss  = if ($null -ne $_.PacketLoss) { $_.PacketLoss } else { 0 }
                     SuccessRate = if ($_.SuccessRate) { $_.SuccessRate } else { 100 }
                     Stability   = if ($_.StabilityScore) { $_.StabilityScore } else { 80 }
                     Trend       = if ($_.HealthTrend) { $_.HealthTrend } else { 0 }
@@ -581,6 +588,15 @@ function Update-AdaptersAndWeights {
             $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
             if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
+            # NetFusion-FIX: 7 - Keep soft affinity short-lived so bulk transfers rebalance across adapters quickly.
+            if ($cfg.proxy -and $null -ne $cfg.proxy.sessionAffinityTTL) {
+                $ttl = [int]$cfg.proxy.sessionAffinityTTL
+                if ($ttl -gt 0) {
+                    $s.sessionTTL = [Math]::Min(60, [Math]::Max(30, $ttl))
+                }
+            } else {
+                $s.sessionTTL = 60
+            }
             $refresh = $cfg.intelligence.weightRefreshInterval
             if ($null -ne $refresh -and [double]$refresh -gt 0) {
                 $s.weightRefreshInterval = [double]$refresh
@@ -588,6 +604,7 @@ function Update-AdaptersAndWeights {
         } catch {}
     }
 
+    # NetFusion-FIX: 6 - Weight adapters by bandwidth-first health so slower-but-usable USB links still receive traffic.
     $weights = @()
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
@@ -601,25 +618,21 @@ function Update-AdaptersAndWeights {
             $linkSpeedMbps = 100.0
         }
 
-        $penalty = 0.0
+        $healthFactor = 0.85
         if ($h) {
             $latency = if ($null -ne $h.LatencyEWMA) { [double]$h.LatencyEWMA } elseif ($null -ne $h.Latency) { [double]$h.Latency } else { 999.0 }
             $jitter = if ($null -ne $h.Jitter) { [double]$h.Jitter } else { 0.0 }
+            $packetLossPct = if ($h.ContainsKey('PacketLoss') -and $null -ne $h.PacketLoss) { [double]$h.PacketLoss } else { 0.0 }
 
-            $latencyPenalty = 0.0
-            if ($latency -gt 40.0) {
-                $latencyPenalty = [math]::Min(0.20, (($latency - 40.0) / 200.0))
-            }
-
-            $jitterPenalty = 0.0
-            if ($jitter -gt 5.0) {
-                $jitterPenalty = [math]::Min(0.10, (($jitter - 5.0) / 100.0))
-            }
-
-            $penalty = [math]::Min(0.30, ($latencyPenalty + $jitterPenalty))
+            $bwFactor = [math]::Min($linkSpeedMbps / 500.0, 1.0)
+            $latencyFactor = [math]::Max(0.0, 1.0 - ($latency / 200.0))
+            $jitterFactor = [math]::Max(0.0, 1.0 - ($jitter / 100.0))
+            $lossFactor = [math]::Max(0.0, 1.0 - ($packetLossPct / 10.0))
+            $rawScore = ($bwFactor * 50.0) + ($latencyFactor * 20.0) + ($jitterFactor * 10.0) + ($lossFactor * 20.0)
+            $healthFactor = [math]::Max(0.25, [math]::Min(1.0, ($rawScore / 100.0)))
         }
 
-        $w = [math]::Max(1.0, [math]::Round($linkSpeedMbps * (1.0 - $penalty), 2))
+        $w = [math]::Max(1.0, [math]::Round($linkSpeedMbps * $healthFactor, 2))
 
         $weights += $w
         if (-not $s.connectionCounts.ContainsKey($a.Name)) {
@@ -1355,7 +1368,8 @@ $HandlerScript = {
                 $weightsNearlyEqual = ([math]::Abs($maxWeight - $minWeight) -le [math]::Max(5.0, ($maxWeight * 0.05)))
             }
 
-            if ($weightsNearlyEqual -and $sessionKey) {
+            # NetFusion-FIX: 7 - Restrict soft host hints to non-bulk traffic so speed tests and parallel downloads spread per connection.
+            if ($weightsNearlyEqual -and $sessionKey -and $connType -ne 'bulk') {
                 $hintEntry = $null
                 if ($State.sessionMap.TryGetValue($sessionKey, [ref]$hintEntry) -and $hintEntry -and $hintEntry.adapter) {
                     $hintedAdapter = $avail | Where-Object { $_.Name -eq [string]$hintEntry.adapter } | Select-Object -First 1
@@ -1414,8 +1428,14 @@ $HandlerScript = {
                     continue
                 }
 
+                # NetFusion-FIX: 4 - Bind outbound sockets to the chosen adapter's local IPv4 before connect so Windows uses that WAN path.
                 $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
                 $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, 5000, $ifIndex)
+                # NetFusion-FIX: 1 - Keep both tunnel endpoints at 1 MB buffers with eager sends and short linger teardown.
+                $remoteClient.NoDelay = $true
+                $remoteClient.ReceiveBufferSize = 1048576
+                $remoteClient.SendBufferSize = 1048576
+                $remoteClient.Client.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
                 $remoteClient.SendTimeout = 15000
                 $remoteClient.ReceiveTimeout = 15000
 
@@ -1464,6 +1484,7 @@ $HandlerScript = {
             $clientStream.WriteTimeout = [System.Threading.Timeout]::Infinite
             $remoteStream.ReadTimeout = [System.Threading.Timeout]::Infinite
             $remoteStream.WriteTimeout = [System.Threading.Timeout]::Infinite
+            # NetFusion-FIX: 3 - Keep HTTPS tunnels fully bidirectional so ACK and payload paths are not serialized.
             [NetFusion.StreamCopier]::CopyStreamBidirectional(
                 $clientStream,
                 $remoteStream,
@@ -1589,6 +1610,9 @@ Write-Host ""
 Write-ProxyEvent "Proxy v6.2 started on port $Port with $($global:ProxyState.adapters.Count) adapters (connection-level WRR + safety)"
 
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
+# NetFusion-FIX: 1 - Increase the listener socket buffers so accepted proxy sockets inherit a large receive window.
+$listener.Server.ReceiveBufferSize = 1048576
+$listener.Server.SendBufferSize = 1048576
 try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
 
 Update-ProxyStats
@@ -1686,9 +1710,11 @@ try {
         }
 
         $client = $listener.AcceptTcpClient()
+        # NetFusion-FIX: 8 - Disable Nagle on proxy sockets so ACK/control packets are not delayed in the relay.
         $client.NoDelay = $true
-        $client.ReceiveBufferSize = 524288
-        $client.SendBufferSize = 524288
+        $client.ReceiveBufferSize = 1048576
+        $client.SendBufferSize = 1048576
+        $client.Client.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
 
         # Spawn handler in runspace
         $ps = [System.Management.Automation.PowerShell]::Create()
