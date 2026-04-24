@@ -121,11 +121,15 @@ if ($config.proxyPort -eq $config.dashboardPort) {
 # Validate proxy settings
 if ($config.proxy) {
     Check-Number $config.proxy 'connectTimeout' 500 15000 5000
+    Check-Number $config.proxy 'connectIdleTimeoutSec' 15 300 45
     Check-Number $config.proxy 'maxRetries' 1 32 3
     Check-Number $config.proxy 'minThreads' 4 128 64
     Check-Number $config.proxy 'maxThreads' 8 512 256
     Check-Number $config.proxy 'bufferSize' 8192 1048576 262144
-    Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
+    # 0 disables forced relay age killing. This is intentional for long
+    # downloads/uploads; active proxy streams must not be stopped just because
+    # they outlive a short validation window.
+    Check-Number $config.proxy 'jobTimeoutSec' 0 3600 0
     Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 60
 }
 

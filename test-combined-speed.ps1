@@ -6,8 +6,10 @@
 param(
     [string[]]$AdapterNames = @(),
     [int]$Connections = 0,
-    [string]$TestUrl = "https://speed.cloudflare.com/__down?bytes=100000000",
-    [string]$UploadUrl = "https://speed.cloudflare.com/__up",
+    [string]$TestUrl = "http://speedtest-bl.subisu.net.np:8080/speedtest/random4000x4000.jpg",
+    [string[]]$DownloadUrls = @(),
+    [string]$UploadUrl = "http://speedtest-bl.subisu.net.np:8080/speedtest/upload.php",
+    [string[]]$UploadUrls = @(),
     [int]$UploadMegabytes = 32,
     [int]$ProxyPort = 8080,
     [int]$DashboardPort = 9090
@@ -51,6 +53,20 @@ function Add-CacheBuster {
 
     $separator = if ($Url -match '\?') { '&' } else { '?' }
     return ('{0}{1}{2}={3}' -f $Url, $separator, $Name, ([guid]::NewGuid().ToString('N')))
+}
+
+function Select-TestUrl {
+    param(
+        [string[]]$Urls,
+        [int]$Index
+    )
+
+    $usable = @($Urls | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($usable.Count -eq 0) {
+        return ''
+    }
+
+    return $usable[$Index % $usable.Count]
 }
 
 function Get-UsableAdapters {
@@ -130,7 +146,7 @@ function Invoke-BoundCurlDownload {
     }
 
     $format = "SIZE=%{size_download};TIME=%{time_total};SPEED=%{speed_download};IP=%{local_ip};CODE=%{http_code}"
-    $args = @('--interface', $LocalIP, '-L', '-o', 'NUL', '-sS', '-w', $format)
+    $args = @('--interface', $LocalIP, '--connect-timeout', '5', '--max-time', '60', '--speed-time', '15', '--speed-limit', '1024', '-L', '-o', 'NUL', '-sS', '-w', $format)
     if ($Proxy) {
         $args = @('-x', $Proxy) + $args
     } else {
@@ -178,7 +194,7 @@ function Invoke-BoundCurlUpload {
     }
 
     $format = "SIZE=%{size_upload};TIME=%{time_total};SPEED=%{speed_upload};IP=%{local_ip};CODE=%{http_code}"
-    $args = @('--interface', $LocalIP, '-L', '-o', 'NUL', '-sS', '-w', $format, '-X', 'POST', '--data-binary', "@$PayloadPath")
+    $args = @('--interface', $LocalIP, '--connect-timeout', '5', '--max-time', '90', '--speed-time', '15', '--speed-limit', '1024', '-L', '-o', 'NUL', '-sS', '-w', $format, '-X', 'POST', '--data-binary', "@$PayloadPath")
     if ($Proxy) {
         $args = @('-x', $Proxy) + $args
     } else {
@@ -233,6 +249,8 @@ if ($AdapterNames.Count -gt 0) {
 }
 
 $adapters = @($adapters | Sort-Object @{ Expression = { -1 * [double]$_.LinkSpeedMbps } }, Name)
+$effectiveDownloadUrls = if ($DownloadUrls.Count -gt 0) { @($DownloadUrls) } else { @($TestUrl) }
+$effectiveUploadUrls = if ($UploadUrls.Count -gt 0) { @($UploadUrls) } else { @($UploadUrl) }
 
 Write-Host "`n--- STEP 1: Adapter Check ---" -ForegroundColor Yellow
 if ($adapters.Count -lt 2) {
@@ -264,7 +282,7 @@ $directResults = @{}
 foreach ($adapter in $adapters) {
     Write-Host "  Testing $($adapter.Name) ($($adapter.IPAddress))..." -NoNewline
     try {
-        $result = Invoke-BoundCurlDownload -LocalIP $adapter.IPAddress -Url $TestUrl
+        $result = Invoke-BoundCurlDownload -LocalIP $adapter.IPAddress -Url $effectiveDownloadUrls[0]
         $mbps = if ($result.Seconds -gt 0) { [math]::Round(($result.Bytes * 8 / 1MB) / $result.Seconds, 2) } else { 0 }
         $directResults[$adapter.Name] = $mbps
         Write-Host " $mbps Mbps ($([math]::Round($result.Bytes/1MB, 1)) MB in $([math]::Round($result.Seconds, 2))s, source $($result.LocalIP))" -ForegroundColor Green
@@ -287,7 +305,7 @@ $directUploadResults = @{}
 foreach ($adapter in $adapters) {
     Write-Host "  Testing $($adapter.Name) ($($adapter.IPAddress)) upload..." -NoNewline
     try {
-        $uploadResult = Invoke-BoundCurlUpload -LocalIP $adapter.IPAddress -Url (Add-CacheBuster -Url $UploadUrl) -PayloadPath $uploadPayloadPath
+        $uploadResult = Invoke-BoundCurlUpload -LocalIP $adapter.IPAddress -Url (Add-CacheBuster -Url $effectiveUploadUrls[0]) -PayloadPath $uploadPayloadPath
         $uploadMbps = if ($uploadResult.Seconds -gt 0) { [math]::Round(($uploadResult.Bytes * 8 / 1MB) / $uploadResult.Seconds, 2) } else { 0 }
         $directUploadResults[$adapter.Name] = $uploadMbps
         Write-Host " $uploadMbps Mbps ($([math]::Round($uploadResult.Bytes/1MB, 1)) MB in $([math]::Round($uploadResult.Seconds, 2))s, source $($uploadResult.LocalIP))" -ForegroundColor Green
@@ -311,13 +329,13 @@ foreach ($adapter in $adapters) {
 $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
 $proxyAddr = "http://127.0.0.1:$ProxyPort"
 $jobs = 1..$Connections | ForEach-Object {
-    $jobUrl = Add-CacheBuster -Url $TestUrl
+    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveDownloadUrls -Index ($_ - 1))
     Start-Job -ScriptBlock {
         param($url, $proxy)
         try {
             $curlCmd = Get-Command curl.exe -ErrorAction Stop
             $format = "SIZE=%{size_download};TIME=%{time_total};CODE=%{http_code}"
-            $output = & $curlCmd.Source -x $proxy -L -o NUL -sS -w $format $url 2>&1
+            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 90 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format $url 2>&1
             $text = ($output | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) { return 0L }
             if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
@@ -333,6 +351,11 @@ $jobs = 1..$Connections | ForEach-Object {
 Write-Host "  Downloading..." -NoNewline
 $null = Wait-Job -Job $jobs -Timeout 90
 $swTotal.Stop()
+
+$downloadTimedOut = @($jobs | Where-Object { $_.State -eq 'Running' })
+if ($downloadTimedOut.Count -gt 0) {
+    $downloadTimedOut | Stop-Job -ErrorAction SilentlyContinue
+}
 
 $totalBytes = 0L
 foreach ($job in $jobs) {
@@ -353,6 +376,7 @@ foreach ($adapter in $adapters) {
 }
 
 $combinedMbps = if ($swTotal.Elapsed.TotalSeconds -gt 0) { [math]::Round(($totalBytes * 8 / 1MB) / $swTotal.Elapsed.TotalSeconds, 2) } else { 0 }
+$osCounterMbps = if ($swTotal.Elapsed.TotalSeconds -gt 0) { [math]::Round(($totalDelta * 8 / 1MB) / $swTotal.Elapsed.TotalSeconds, 2) } else { 0 }
 $bestDirectMbps = if ($directResults.Count -gt 0) { [double](($directResults.Values | Measure-Object -Maximum).Maximum) } else { 0 }
 $sumDirectMbps = if ($directResults.Count -gt 0) { [double](($directResults.Values | Measure-Object -Sum).Sum) } else { 0 }
 $gainVsBest = [math]::Round(($combinedMbps - $bestDirectMbps), 2)
@@ -364,9 +388,13 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "  Duration:             $([math]::Round($swTotal.Elapsed.TotalSeconds, 2)) seconds"
 Write-Host "  Connections:          $Connections parallel"
 Write-Host "  Total Downloaded:     $([math]::Round($totalBytes / 1MB, 2)) MB"
+if ($downloadTimedOut.Count -gt 0) {
+    Write-Host "  Timed Out Jobs:       $($downloadTimedOut.Count)" -ForegroundColor Yellow
+}
 Write-Host "  Best Single-Link:     $bestDirectMbps Mbps" -ForegroundColor DarkCyan
 Write-Host "  Sum Direct Links:     $([math]::Round($sumDirectMbps, 2)) Mbps" -ForegroundColor DarkCyan
 Write-Host "  Combined Proxy Speed: $combinedMbps Mbps" -ForegroundColor Cyan
+Write-Host "  OS RX Counter Speed:  $osCounterMbps Mbps" -ForegroundColor Cyan
 Write-Host "  Gain vs Best Link:    $gainVsBest Mbps" -ForegroundColor Cyan
 Write-Host "  Efficiency vs Sum:    $efficiencyVsDirectSum%" -ForegroundColor Cyan
 
@@ -408,13 +436,13 @@ foreach ($adapter in $adapters) {
 
 $swUploadTotal = [System.Diagnostics.Stopwatch]::StartNew()
 $uploadJobs = 1..$Connections | ForEach-Object {
-    $jobUrl = Add-CacheBuster -Url $UploadUrl
+    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveUploadUrls -Index ($_ - 1))
     Start-Job -ScriptBlock {
         param($url, $proxy, $payload)
         try {
             $curlCmd = Get-Command curl.exe -ErrorAction Stop
             $format = "SIZE=%{size_upload};TIME=%{time_total};CODE=%{http_code}"
-            $output = & $curlCmd.Source -x $proxy -L -o NUL -sS -w $format -X POST --data-binary "@$payload" $url 2>&1
+            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 120 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format -X POST --data-binary "@$payload" $url 2>&1
             $text = ($output | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) { return 0L }
             if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
@@ -430,6 +458,11 @@ $uploadJobs = 1..$Connections | ForEach-Object {
 Write-Host "  Uploading..." -NoNewline
 $null = Wait-Job -Job $uploadJobs -Timeout 120
 $swUploadTotal.Stop()
+
+$uploadTimedOut = @($uploadJobs | Where-Object { $_.State -eq 'Running' })
+if ($uploadTimedOut.Count -gt 0) {
+    $uploadTimedOut | Stop-Job -ErrorAction SilentlyContinue
+}
 
 $totalUploadBytes = 0L
 foreach ($job in $uploadJobs) {
@@ -450,15 +483,20 @@ foreach ($adapter in $adapters) {
 }
 
 $combinedUploadMbps = if ($swUploadTotal.Elapsed.TotalSeconds -gt 0) { [math]::Round(($totalUploadBytes * 8 / 1MB) / $swUploadTotal.Elapsed.TotalSeconds, 2) } else { 0 }
+$osCounterUploadMbps = if ($swUploadTotal.Elapsed.TotalSeconds -gt 0) { [math]::Round(($totalTxDelta * 8 / 1MB) / $swUploadTotal.Elapsed.TotalSeconds, 2) } else { 0 }
 $bestDirectUploadMbps = if ($directUploadResults.Count -gt 0) { [double](($directUploadResults.Values | Measure-Object -Maximum).Maximum) } else { 0 }
 $sumDirectUploadMbps = if ($directUploadResults.Count -gt 0) { [double](($directUploadResults.Values | Measure-Object -Sum).Sum) } else { 0 }
 $uploadEfficiencyVsDirectSum = if ($sumDirectUploadMbps -gt 0) { [math]::Round(($combinedUploadMbps / $sumDirectUploadMbps) * 100, 1) } else { 0 }
 
 Write-Host "`n  --- Upload Results ---" -ForegroundColor Yellow
 Write-Host "  Total Uploaded:       $([math]::Round($totalUploadBytes / 1MB, 2)) MB"
+if ($uploadTimedOut.Count -gt 0) {
+    Write-Host "  Timed Out Jobs:       $($uploadTimedOut.Count)" -ForegroundColor Yellow
+}
 Write-Host "  Best Upload Link:     $bestDirectUploadMbps Mbps" -ForegroundColor DarkCyan
 Write-Host "  Sum Upload Links:     $([math]::Round($sumDirectUploadMbps, 2)) Mbps" -ForegroundColor DarkCyan
 Write-Host "  Combined Upload:      $combinedUploadMbps Mbps" -ForegroundColor Cyan
+Write-Host "  OS TX Counter Speed:  $osCounterUploadMbps Mbps" -ForegroundColor Cyan
 Write-Host "  Upload Efficiency:    $uploadEfficiencyVsDirectSum%" -ForegroundColor Cyan
 
 Write-Host "`n  --- Per-Adapter Upload Traffic (OS Byte Counters) ---" -ForegroundColor Yellow

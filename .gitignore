@@ -11,6 +11,7 @@ config/*.flag
 config/active-fw-rules.json
 config/routes-applied.flag
 config/safety-state.json
+config/network-state.json
 
 # Logs
 logs/*

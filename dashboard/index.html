@@ -376,7 +376,9 @@ function renderAdapters(list){
   el.innerHTML=list.map((a,idx)=>{
     const tRaw=a.type||a.Type||'Unknown',nRaw=a.name||a.Name||'?';
     const hp=a.health??a.HealthScore??0,hcl=hc(hp);
-    const dl=a.downloadMbps??a.DownloadMbps??0,ul=a.uploadMbps??a.UploadMbps??0;
+    const dlRaw=a.proxyDownloadMbps??a.downloadMbps??a.DownloadMbps??0;
+    const ulRaw=a.proxyUploadMbps??a.uploadMbps??a.UploadMbps??0;
+    const dl=fmt(parseFloat(dlRaw)||0),ul=fmt(parseFloat(ulRaw)||0);
     const lat=a.latencyEWMA??a.InternetLatencyEWMA??a.latency??999;
     const jit=a.jitter??a.Jitter??0,sr=a.successRate??a.SuccessRate??100;
     const deg=a.isDegrading??a.IsDegrading??false;
@@ -417,7 +419,7 @@ function updateProxy(proxy){
     let barHTML='<div class="pp-bar-label"><span>Connections per Adapter</span><span>'+total+' total</span></div><div class="pp-bar">';
     adapters.forEach((a,i)=>{const pct=((a.connections||0)/totalConns*100).toFixed(1);barHTML+=`<div class="pp-bar-seg" style="width:${pct}%;background:${colors[i%4]}" title="${safeText(a.name)}: ${a.connections||0}"></div>`});
     barHTML+='</div><div style="display:flex;gap:10px;margin-top:4px;flex-wrap:wrap">';
-    adapters.forEach((a,i)=>{const safeName=safeText(a.name,'?');barHTML+=`<span style="font-size:9px;color:var(--text2);display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:${colors[i%4]};display:inline-block"></span>${safeName}: ${a.connections||0} (active: ${apa[a.name]||0})</span>`});
+    adapters.forEach((a,i)=>{const safeName=safeText(a.name,'?'),dl=fmt(parseFloat(a.proxyDownloadMbps||0)||0),ul=fmt(parseFloat(a.proxyUploadMbps||0)||0);barHTML+=`<span style="font-size:9px;color:var(--text2);display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:${colors[i%4]};display:inline-block"></span>${safeName}: ${a.connections||0} (active: ${apa[a.name]||0}, DL ${dl}, UL ${ul})</span>`});
     barHTML+='</div>';barWrap.innerHTML=barHTML;
   }
   // connection types
@@ -430,10 +432,10 @@ function updateProxy(proxy){
 }
 
 function updateChart(adapters){
-  const dlA=parseFloat(adapters[0]?.downloadMbps??adapters[0]?.DownloadMbps??0);
-  const ulA=parseFloat(adapters[0]?.uploadMbps??adapters[0]?.UploadMbps??0);
-  const dlB=parseFloat(adapters[1]?.downloadMbps??adapters[1]?.DownloadMbps??0);
-  const ulB=parseFloat(adapters[1]?.uploadMbps??adapters[1]?.UploadMbps??0);
+  const dlA=parseFloat(adapters[0]?.proxyDownloadMbps??adapters[0]?.downloadMbps??adapters[0]?.DownloadMbps??0);
+  const ulA=parseFloat(adapters[0]?.proxyUploadMbps??adapters[0]?.uploadMbps??adapters[0]?.UploadMbps??0);
+  const dlB=parseFloat(adapters[1]?.proxyDownloadMbps??adapters[1]?.downloadMbps??adapters[1]?.DownloadMbps??0);
+  const ulB=parseFloat(adapters[1]?.proxyUploadMbps??adapters[1]?.uploadMbps??adapters[1]?.UploadMbps??0);
   tpData.a_dl.push(dlA);tpData.a_dl.shift();tpData.a_ul.push(ulA);tpData.a_ul.shift();
   tpData.b_dl.push(dlB);tpData.b_dl.shift();tpData.b_ul.push(ulB);tpData.b_ul.shift();
   tpData.t_dl.push(dlA+dlB);tpData.t_dl.shift();tpData.t_ul.push(ulA+ulB);tpData.t_ul.shift();
@@ -449,7 +451,7 @@ function updateChart(adapters){
 function updateActivityLog(adapters){
   const now=new Date().toLocaleTimeString();
   for(const a of adapters){
-    const n=safeText(a.name||a.Name||'?','?');const dl=parseFloat(a.downloadMbps??a.DownloadMbps??0);const ul=parseFloat(a.uploadMbps??a.UploadMbps??0);
+    const n=safeText(a.name||a.Name||'?','?');const dl=parseFloat(a.proxyDownloadMbps??a.downloadMbps??a.DownloadMbps??0);const ul=parseFloat(a.proxyUploadMbps??a.uploadMbps??a.UploadMbps??0);
     if(dl>0.001||ul>0.001)actLog.unshift({time:now,adapter:n,dl,ul});
   }
   while(actLog.length>MAX_LOG)actLog.pop();
@@ -482,6 +484,19 @@ function renderLearning(data){
   el.innerHTML=Object.entries(data.adapterProfiles).map(([k,p])=>`<div class="learn-item"><div class="li-name">${safeText(p.name||k,'?')}</div><div class="li-val" style="color:${hc(p.avgHealth||0)}">${Math.round(p.avgHealth||0)}</div><div class="li-sub">Avg Health · ${p.totalSamples||0} samples · R:${Math.round(p.reliability||0)}%</div></div>`).join('');
 }
 
+function mergeProxyLiveStats(adapters,proxy){
+  const live=new Map((proxy?.adapters||[]).map(a=>[a.name||a.Name,a]));
+  adapters.forEach(a=>{
+    const p=live.get(a.name||a.Name);
+    if(!p)return;
+    const dl=parseFloat(p.proxyDownloadMbps||0)||0,ul=parseFloat(p.proxyUploadMbps||0)||0;
+    a.proxyDownloadMbps=dl;a.proxyUploadMbps=ul;
+    a.proxyDownloadBytes=p.proxyDownloadBytes||0;a.proxyUploadBytes=p.proxyUploadBytes||0;
+    a.proxyCapacityMbps=p.proxyCapacityMbps||0;
+    a.downloadMbps=dl;a.uploadMbps=ul;
+  });
+}
+
 // ===== MAIN UPDATE (SSE) =====
 let lastAdapters = [];
 function processStats(stats){
@@ -505,9 +520,10 @@ function processStats(stats){
       });
     }
     
+    mergeProxyLiveStats(adapters,stats.proxy);
     renderAdapters(adapters);updateChart(adapters);updateActivityLog(adapters);
     // DL/UL totals
-    let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.uploadMbps??a.UploadMbps??0)}
+    let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.proxyDownloadMbps??a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.proxyUploadMbps??a.uploadMbps??a.UploadMbps??0)}
     document.getElementById('sTotalDL').innerHTML=fmt(tdl)+'<span class="unit">Mbps</span>';
     document.getElementById('sTotalUL').innerHTML=fmt(tul)+'<span class="unit">Mbps</span>';
     document.getElementById('sAdapters').innerHTML=adapters.length+'<span class="unit">/ '+adapters.length+'</span>';
@@ -555,7 +571,7 @@ function processStats(stats){
 }
 
 // ===== MAIN UPDATE =====
-async function updateAll(){
+async function updateAll(full=true){
   const stats=await fetchJ('/api/stats');
   if(stats){
     const adapters=stats.health?.adapters||[];
@@ -573,9 +589,10 @@ async function updateAll(){
         }
       });
     }
+    mergeProxyLiveStats(adapters,stats.proxy);
     renderAdapters(adapters);updateChart(adapters);updateActivityLog(adapters);
     // DL/UL totals
-    let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.uploadMbps??a.UploadMbps??0)}
+    let tdl=0,tul=0;for(const a of adapters){tdl+=parseFloat(a.proxyDownloadMbps??a.downloadMbps??a.DownloadMbps??0);tul+=parseFloat(a.proxyUploadMbps??a.uploadMbps??a.UploadMbps??0)}
     document.getElementById('sTotalDL').innerHTML=fmt(tdl)+'<span class="unit">Mbps</span>';
     document.getElementById('sTotalUL').innerHTML=fmt(tul)+'<span class="unit">Mbps</span>';
     document.getElementById('sAdapters').innerHTML=adapters.length+'<span class="unit">/ '+adapters.length+'</span>';
@@ -620,9 +637,11 @@ async function updateAll(){
       setPill('pillSystem','pill pill-err','No Data');
     }
   }
-  const ev=await fetchJ('/api/events');if(ev?.events)renderEvts(ev.events);
-  const dc=await fetchJ('/api/decisions');if(dc?.decisions)renderDecs(dc.decisions);
-  const lr=await fetchJ('/api/learning');if(lr)renderLearning(lr);
+  if(full){
+    const ev=await fetchJ('/api/events');if(ev?.events)renderEvts(ev.events);
+    const dc=await fetchJ('/api/decisions');if(dc?.decisions)renderDecs(dc.decisions);
+    const lr=await fetchJ('/api/learning');if(lr)renderLearning(lr);
+  }
 }
 
 // ===== CONTROLS =====
@@ -659,13 +678,14 @@ document.querySelectorAll('.mbtn').forEach(b=>{
 drawThroughput();
 drawChart('connChart',[connHist],['#3b82f6']);
 let pollInFlight=false;
-async function pollDashboard(){
+async function pollDashboard(full=false){
   if(pollInFlight)return;
   pollInFlight=true;
-  try{await updateAll()}finally{pollInFlight=false}
+  try{await updateAll(full)}finally{pollInFlight=false}
 }
-pollDashboard();
-setInterval(pollDashboard,2000);
+pollDashboard(true);
+setInterval(()=>pollDashboard(false),1000);
+setInterval(()=>pollDashboard(true),5000);
 
 window.addEventListener('resize',()=>{drawThroughput();drawChart('connChart',[connHist],['#3b82f6'])});
 </script>

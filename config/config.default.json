@@ -18,10 +18,11 @@
                     },
     "proxy":  {
                   "connectTimeout":  1500,
+                  "connectIdleTimeoutSec":  45,
                   "maxRetries":  3,
-                  "bufferSize":  262144,
+                  "bufferSize":  1048576,
                   "minThreads":  128,
-                  "maxThreads":  512,
+                  "maxThreads":  256,
                   "jobTimeoutSec":  0,
                   "sessionAffinityTTL":  60,
                   "healthEndpoint":  true

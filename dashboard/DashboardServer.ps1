@@ -33,7 +33,7 @@ $legacyDashboardTokens = @(
     'mpKLZzFlE5tNi3Yw7gcID2QRu06BWjby'
 )
 $script:DashboardSnapshotCache = @{}
-$script:DashboardSnapshotTtlSeconds = 2
+$script:DashboardSnapshotTtlSeconds = 0.5
 
 function Write-AtomicJson {
     param(
@@ -84,7 +84,7 @@ function Get-CachedJsonFile {
     param(
         [string]$Path,
         [object]$DefaultValue = $null,
-        [int]$MaxAgeSeconds = 2
+        [double]$MaxAgeSeconds = 2
     )
 
     $cacheKey = [System.IO.Path]::GetFullPath($Path)
@@ -301,7 +301,8 @@ function Test-IsMutationAuthorized {
 }
 
 function Get-ClientInterfaces {
-    # Serve 1-2s cached snapshots so dashboard polling does not thrash shared telemetry files.
+    # Serve short cached snapshots so live dashboard polling stays fast without
+    # hammering shared telemetry files every browser frame.
     $data = Get-CachedJsonFile -Path (Join-Path $configDir "interfaces.json") -MaxAgeSeconds $script:DashboardSnapshotTtlSeconds
     $interfaces = @()
     if ($data -and $data.interfaces) {
@@ -370,6 +371,11 @@ function Get-ClientProxy {
                 latency = if ($null -ne $a.latency) { [double]$a.latency } else { 999 }
                 jitter = if ($null -ne $a.jitter) { [double]$a.jitter } else { 0 }
                 isDegrading = [bool]$a.isDegrading
+                proxyDownloadBytes = if ($null -ne $a.proxyDownloadBytes) { [int64]$a.proxyDownloadBytes } else { 0 }
+                proxyUploadBytes = if ($null -ne $a.proxyUploadBytes) { [int64]$a.proxyUploadBytes } else { 0 }
+                proxyDownloadMbps = if ($null -ne $a.proxyDownloadMbps) { [double]$a.proxyDownloadMbps } else { 0 }
+                proxyUploadMbps = if ($null -ne $a.proxyUploadMbps) { [double]$a.proxyUploadMbps } else { 0 }
+                proxyCapacityMbps = if ($null -ne $a.proxyCapacityMbps) { [double]$a.proxyCapacityMbps } else { 0 }
             }
         }
     }
