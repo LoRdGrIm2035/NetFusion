@@ -84,7 +84,6 @@ namespace NetFusion
     /// <summary>
     /// Lightweight stream wrapper that counts bytes flowing through without
     /// adding per-iteration delegate or Interlocked overhead.
-    /// Only sync Read/Write are used -- the relay runs on dedicated LongRunning threads.
     /// </summary>
     public sealed class CountingStream : Stream
     {
@@ -147,7 +146,7 @@ namespace NetFusion
         /// Synchronous relay for HTTP (non-CONNECT) fixed-length body copies.
         /// Uses pooled 256 KB buffers to avoid LOH allocations.
         /// </summary>
-        private static void CopyStreamCore(Stream source, Stream dest, long bytesToCopy)
+        private static void CopyStreamCore(Stream source, Stream dest, long bytesToCopy, AtomicCounter progressCounter)
         {
             byte[] buffer = RentBuffer();
             try
@@ -160,6 +159,7 @@ namespace NetFusion
                     int read = source.Read(buffer, 0, toRead);
                     if (read <= 0) break;
                     dest.Write(buffer, 0, read);
+                    if (progressCounter != null) progressCounter.Add(read);
                     if (bytesToCopy >= 0) remaining -= read;
                 }
             }
@@ -176,7 +176,14 @@ namespace NetFusion
         public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred)
         {
             var cs = new CountingStream(source);
-            CopyStreamCore(cs, dest, -1);
+            CopyStreamCore(cs, dest, -1, null);
+            Interlocked.Add(ref bytesTransferred, cs.BytesRead);
+        }
+
+        public static void CopyStream(NetworkStream source, NetworkStream dest, ref long bytesTransferred, AtomicCounter progressCounter)
+        {
+            var cs = new CountingStream(source);
+            CopyStreamCore(cs, dest, -1, progressCounter);
             Interlocked.Add(ref bytesTransferred, cs.BytesRead);
         }
 
@@ -184,64 +191,100 @@ namespace NetFusion
         public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred)
         {
             var cs = new CountingStream(source);
-            CopyStreamCore(cs, dest, bytesToCopy);
+            CopyStreamCore(cs, dest, bytesToCopy, null);
             Interlocked.Add(ref bytesTransferred, cs.BytesRead);
+        }
+
+        public static void CopyStream(NetworkStream source, NetworkStream dest, long bytesToCopy, ref long bytesTransferred, AtomicCounter progressCounter)
+        {
+            var cs = new CountingStream(source);
+            CopyStreamCore(cs, dest, bytesToCopy, progressCounter);
+            Interlocked.Add(ref bytesTransferred, cs.BytesRead);
+        }
+
+        public static long CopyFixedBytes(NetworkStream source, NetworkStream dest, long bytesToCopy, AtomicCounter progressCounter)
+        {
+            var cs = new CountingStream(source);
+            CopyStreamCore(cs, dest, bytesToCopy, progressCounter);
+            return cs.BytesRead;
+        }
+
+        private static async Task<long> CopyStreamCoreAsync(Stream source, Stream dest, AtomicCounter progressCounter)
+        {
+            byte[] buffer = RentBuffer();
+            long bytes = 0;
+            try
+            {
+                while (true)
+                {
+                    int read = await source.ReadAsync(buffer, 0, BufferSize).ConfigureAwait(false);
+                    if (read <= 0) break;
+                    await dest.WriteAsync(buffer, 0, read).ConfigureAwait(false);
+                    bytes += read;
+                    if (progressCounter != null) progressCounter.Add(read);
+                }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { }
+            finally
+            {
+                ReturnBuffer(buffer);
+            }
+
+            return bytes;
         }
 
         /// <summary>
         /// Bidirectional relay for HTTPS CONNECT tunnels.
-        /// Uses dedicated LongRunning threads with 256 KB pooled buffers.
-        /// CountingStream wrappers track bytes without per-iteration delegate overhead.
+        /// Uses true async NetworkStream I/O instead of two dedicated LongRunning
+        /// threads per connection, reducing thread pressure during parallel downloads.
         /// </summary>
         public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes)
         {
-            var countClient = new CountingStream(client);
-            var countRemote = new CountingStream(remote);
+            CopyStreamBidirectional(client, remote, ref clientToRemoteBytes, ref remoteToClientBytes, null, null);
+        }
 
-            var uploadTask = Task.Factory.StartNew(
-                () => CopyStreamCore(countClient, countRemote, -1),
-                CancellationToken.None,
-                TaskCreationOptions.LongRunning,
-                TaskScheduler.Default);
-            var downloadTask = Task.Factory.StartNew(
-                () => CopyStreamCore(countRemote, countClient, -1),
-                CancellationToken.None,
-                TaskCreationOptions.LongRunning,
-                TaskScheduler.Default);
+        public static void CopyStreamBidirectional(NetworkStream client, NetworkStream remote, ref long clientToRemoteBytes, ref long remoteToClientBytes, AtomicCounter clientToRemoteCounter, AtomicCounter remoteToClientCounter)
+        {
+            var uploadTask = CopyStreamCoreAsync(client, remote, clientToRemoteCounter);
+            var downloadTask = CopyStreamCoreAsync(remote, client, remoteToClientCounter);
 
             try { Task.WaitAny(uploadTask, downloadTask); } catch { }
 
             try { client.Close(); } catch { }
             try { remote.Close(); } catch { }
 
-            try { Task.WaitAll(new Task[] { uploadTask, downloadTask }, 5000); } catch { }
+            try { Task.WaitAll(new Task[] { uploadTask, downloadTask }, 1000); } catch { }
 
-            Interlocked.Add(ref clientToRemoteBytes, countClient.BytesRead);
-            Interlocked.Add(ref remoteToClientBytes, countRemote.BytesRead);
+            if (uploadTask.IsCompleted && !uploadTask.IsFaulted && !uploadTask.IsCanceled)
+                Interlocked.Add(ref clientToRemoteBytes, uploadTask.Result);
+            if (downloadTask.IsCompleted && !downloadTask.IsFaulted && !downloadTask.IsCanceled)
+                Interlocked.Add(ref remoteToClientBytes, downloadTask.Result);
         }
     }
 
     public static class SocketConnector
     {
         private const int SocketBufferSize = 1048576;
-        private const int SocketLingerSeconds = 2;
 
         public static TcpClient CreateBoundConnection(string localSourceIp, string remoteHost, int remotePort, int timeoutMs, int interfaceIndex)
         {
-            var client = new TcpClient();
+            var client = new TcpClient(AddressFamily.InterNetwork);
             try
             {
                 client.NoDelay = true;
                 client.ReceiveBufferSize = SocketBufferSize;
                 client.SendBufferSize = SocketBufferSize;
-                client.Client.LingerState = new LingerOption(true, SocketLingerSeconds);
+                client.Client.LingerState = new LingerOption(false, 0);
                 client.Client.Bind(new IPEndPoint(IPAddress.Parse(localSourceIp), 0));
 
                 if (interfaceIndex > 0)
                 {
                     try
                     {
-                        client.Client.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, interfaceIndex);
+                        // Windows IP_UNICAST_IF expects the interface index in network byte order.
+                        client.Client.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, IPAddress.HostToNetworkOrder(interfaceIndex));
                     }
                     catch { }
                 }
@@ -329,6 +372,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     currentMode      = 'maxspeed'
     rrIndex          = 0
     connectTimeout   = 5000
+    maxRetries       = 3
     configFile       = $configFile
     healthFile       = $healthFile
     interfacesFile   = $interfacesFile
@@ -341,10 +385,16 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     adapterHealth    = @{}
     degradationFlags = @{}
     connectionTypes  = [hashtable]::Synchronized(@{})
-    decisions        = @()
+    decisions        = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     maxDecisions     = 100
     bandwidthEstimates = @{}
     uploadBandwidthEstimates = @{}
+    proxyDownloadBytes = [hashtable]::Synchronized(@{})
+    proxyUploadBytes   = [hashtable]::Synchronized(@{})
+    proxyRateMbps      = [hashtable]::Synchronized(@{})
+    proxyLastRateSample = [hashtable]::Synchronized(@{})
+    adapterFailureStreak = [hashtable]::Synchronized(@{})
+    adapterCooldownUntil = [hashtable]::Synchronized(@{})
     uploadHostHints  = [hashtable]::Synchronized(@{})
     uploadHintTTL    = 300
     activeConns      = @{}
@@ -387,7 +437,9 @@ function Write-AtomicJson {
     try {
         $Data | ConvertTo-Json -Depth $Depth -Compress | Set-Content $tmp -Force -Encoding UTF8 -ErrorAction Stop
         Move-Item $tmp $Path -Force -ErrorAction Stop
-        try { Copy-Item $Path "$Path.bak" -Force -ErrorAction SilentlyContinue } catch {}
+        if ($Path -notmatch '(?i)(proxy-stats|decisions)\.json$') {
+            try { Copy-Item $Path "$Path.bak" -Force -ErrorAction SilentlyContinue } catch {}
+        }
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         throw
@@ -432,6 +484,41 @@ function Repair-EventsFile {
     if (-not $data -or -not $data.events) {
         Write-AtomicJson -Path $Path -Data @{ events = @() } -Depth 3
     }
+}
+
+function Clear-SessionAffinityForAdapters {
+    param(
+        [object]$State,
+        [string[]]$AdapterNames
+    )
+
+    if (-not $State -or -not $AdapterNames -or $AdapterNames.Count -eq 0) {
+        return 0
+    }
+
+    $targetAdapters = @($AdapterNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($targetAdapters.Count -eq 0) {
+        return 0
+    }
+
+    $removedCount = 0
+    foreach ($key in @($State.sessionMap.Keys)) {
+        $entry = $State.sessionMap[$key]
+        if (-not $entry -or -not $entry.adapter) {
+            continue
+        }
+
+        if ([string]$entry.adapter -in $targetAdapters) {
+            try {
+                $removedEntry = $null
+                if ($State.sessionMap.TryRemove($key, [ref]$removedEntry)) {
+                    $removedCount++
+                }
+            } catch {}
+        }
+    }
+
+    return $removedCount
 }
 
 function Get-SafeBufferSize {
@@ -496,7 +583,7 @@ function Get-ProxyAdapters {
             } else {
                 ''
             }
-            if ($adapterIp -and $iface.Status -eq 'Up') {
+            if ($adapterIp -and $iface.Status -eq 'Up' -and $adapterIp -notmatch '^169\.254\.' -and $iface.Gateway) {
                 $adapters += @{
                     Name = $iface.Name
                     IP = $adapterIp
@@ -512,9 +599,12 @@ function Get-ProxyAdapters {
     }
     if ($adapters.Count -lt 1) {
         Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|VPN' } | ForEach-Object {
-            $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-            if ($ip) {
-                $type = if ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11' -or $_.Name -match 'Wi-Fi') { if ($_.InterfaceDescription -match 'USB') { 'USB-WiFi' } else { 'WiFi' } } elseif ($_.InterfaceDescription -match 'Ethernet') { 'Ethernet' } else { 'Unknown' }
+            $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } |
+                Sort-Object @{ Expression = { if ($_.PrefixOrigin -eq 'Dhcp') { 0 } elseif ($_.PrefixOrigin -eq 'Manual') { 1 } else { 2 } } }, SkipAsSource |
+                Select-Object -First 1).IPAddress
+            if ($ip -and $ip -notmatch '^169\.254\.') {
+                $type = if ($_.InterfaceDescription -match 'Wi-Fi|Wireless|802\.11' -or $_.Name -match 'Wi-Fi') { if ($_.InterfaceDescription -match 'USB|TP-Link|Ralink|MediaTek.*USB|Realtek.*USB') { 'USB-WiFi' } else { 'WiFi' } } elseif ($_.InterfaceDescription -match 'Ethernet') { 'Ethernet' } else { 'Unknown' }
                 $linkSpeedMbps = 100.0
                 if ($_.LinkSpeed -match '([\d.]+)\s*(Gbps|Mbps|Kbps)') {
                     $value = [double]$Matches[1]
@@ -538,15 +628,17 @@ function Get-ProxyAdapters {
                         $gateway = [string]$routeInfo.NextHop
                     }
                 } catch {}
-                $adapters += @{
-                    Name = $_.Name
-                    IP = $ip
-                    IpAddress = $ip
-                    Type = $type
-                    Speed = $linkSpeedMbps
-                    InterfaceIndex = $_.ifIndex
-                    Gateway = $gateway
-                    DnsServers = $dnsServers
+                if ($gateway) {
+                    $adapters += @{
+                        Name = $_.Name
+                        IP = $ip
+                        IpAddress = $ip
+                        Type = $type
+                        Speed = $linkSpeedMbps
+                        InterfaceIndex = $_.ifIndex
+                        Gateway = $gateway
+                        DnsServers = $dnsServers
+                    }
                 }
             }
         }
@@ -601,9 +693,54 @@ function New-WeightedRoundRobinSchedule {
     return ,$schedule.ToArray()
 }
 
+function Update-ProxyRateSnapshot {
+    param(
+        [object]$State,
+        [object[]]$Adapters
+    )
+
+    if (-not $State -or -not $Adapters) {
+        return
+    }
+
+    $rateNowTicks = [System.DateTimeOffset]::UtcNow.Ticks
+    foreach ($adapter in $Adapters) {
+        try {
+            $downloadCounter = Get-OrCreate-AtomicCounter -Map $State.proxyDownloadBytes -Key $adapter.Name
+            $uploadCounter = Get-OrCreate-AtomicCounter -Map $State.proxyUploadBytes -Key $adapter.Name
+            $downloadBytes = [int64](Get-AtomicCounterValue -Counter $downloadCounter)
+            $uploadBytes = [int64](Get-AtomicCounterValue -Counter $uploadCounter)
+            $lastSample = if ($State.proxyLastRateSample.ContainsKey($adapter.Name)) { $State.proxyLastRateSample[$adapter.Name] } else { $null }
+
+            if ($lastSample -and $lastSample.Ticks) {
+                $seconds = ($rateNowTicks - [int64]$lastSample.Ticks) / [double][System.TimeSpan]::TicksPerSecond
+                if ($seconds -lt 0.25) {
+                    continue
+                }
+
+                $downloadDelta = [math]::Max(0L, $downloadBytes - [int64]$lastSample.DownloadBytes)
+                $uploadDelta = [math]::Max(0L, $uploadBytes - [int64]$lastSample.UploadBytes)
+                $State.proxyRateMbps[$adapter.Name] = @{
+                    DownloadMbps = [math]::Round(($downloadDelta * 8.0) / $seconds / 1000000.0, 2)
+                    UploadMbps = [math]::Round(($uploadDelta * 8.0) / $seconds / 1000000.0, 2)
+                }
+            } elseif (-not $State.proxyRateMbps.ContainsKey($adapter.Name)) {
+                $State.proxyRateMbps[$adapter.Name] = @{ DownloadMbps = 0.0; UploadMbps = 0.0 }
+            }
+
+            $State.proxyLastRateSample[$adapter.Name] = @{
+                Ticks = $rateNowTicks
+                DownloadBytes = $downloadBytes
+                UploadBytes = $uploadBytes
+            }
+        } catch {}
+    }
+}
+
 function Update-AdaptersAndWeights {
     $s = $global:ProxyState
     $s.adapters = @(Get-ProxyAdapters)
+    Update-ProxyRateSnapshot -State $s -Adapters $s.adapters
 
     # v5.0: Check safe mode
     if (Test-Path $s.safetyFile) {
@@ -682,6 +819,12 @@ function Update-AdaptersAndWeights {
             $cfg = Read-JsonFile -Path $s.configFile -DefaultValue $null
             if (-not $cfg) { throw "Config data unavailable." }
             if ($cfg.mode) { $s.currentMode = $cfg.mode }
+            if ($cfg.proxy -and $null -ne $cfg.proxy.connectTimeout -and [int]$cfg.proxy.connectTimeout -gt 0) {
+                $s.connectTimeout = [int]$cfg.proxy.connectTimeout
+            }
+            if ($cfg.proxy -and $null -ne $cfg.proxy.maxRetries -and [int]$cfg.proxy.maxRetries -gt 0) {
+                $s.maxRetries = [int]$cfg.proxy.maxRetries
+            }
             # NetFusion-FIX-7: Keep soft affinity short-lived so new bulk flows rebalance quickly across both WAN adapters.
             if ($cfg.proxy -and $null -ne $cfg.proxy.sessionAffinityTTL) {
                 $ttl = [int]$cfg.proxy.sessionAffinityTTL
@@ -717,15 +860,41 @@ function Update-AdaptersAndWeights {
     foreach ($a in $s.adapters) {
         $h = $health[$a.Name]
         $observedMbps = Get-AdapterObservedMbps -State $s -Adapter $a
-        if ($observedMbps -le 0.0) {
-            if ($a.Type -match 'USB') {
-                $observedMbps = 300.0
-            } elseif ($a.Type -match 'WiFi|Ethernet') {
-                $observedMbps = 500.0
-            } else {
-                $observedMbps = 100.0
-            }
+        $linkSpeedMbps = if ($null -ne $a.Speed -and [double]$a.Speed -gt 0) {
+            [double]$a.Speed
+        } elseif ($h -and $h.ContainsKey('LinkSpeedMbps') -and [double]$h.LinkSpeedMbps -gt 0) {
+            [double]$h.LinkSpeedMbps
+        } else {
+            0.0
         }
+
+        $capacityFloor = 100.0
+        if ($linkSpeedMbps -gt 0.0) {
+            if ($a.Type -match 'Ethernet') {
+                $capacityFloor = [math]::Max(100.0, [math]::Min($linkSpeedMbps, $linkSpeedMbps * 0.80))
+            } elseif ($a.Type -match 'WiFi') {
+                # Wi-Fi LinkSpeed is PHY rate, not usable WAN throughput. Seed
+                # mixed Wi-Fi systems toward practical WAN targets so the USB
+                # adapter receives enough discovery and bulk flows to prove or
+                # disprove its real capacity instead of being starved by PHY math.
+                $wifiSeed = [math]::Sqrt($linkSpeedMbps) * 12.0
+                $practicalSeed = if ($a.Type -match 'USB') {
+                    if ($linkSpeedMbps -ge 150.0) { 300.0 } elseif ($linkSpeedMbps -ge 72.0) { 150.0 } else { 80.0 }
+                } else {
+                    if ($linkSpeedMbps -ge 866.0) { 500.0 } elseif ($linkSpeedMbps -ge 300.0) { 300.0 } else { 150.0 }
+                }
+                $capacityFloor = [math]::Max(80.0, [math]::Max($wifiSeed, $practicalSeed))
+            } else {
+                $capacityFloor = [math]::Max(50.0, [math]::Min($linkSpeedMbps, $linkSpeedMbps * 0.35))
+            }
+        } elseif ($a.Type -match 'WiFi|Ethernet') {
+            $capacityFloor = 300.0
+        }
+
+        # Weight by the best current evidence of capacity, not only current traffic.
+        # Pure observed-throughput weighting causes positive feedback: an idle but
+        # healthy second adapter decays toward zero and stops receiving discovery flows.
+        $observedMbps = [math]::Max($observedMbps, $capacityFloor)
 
         $latencyAdjustment = 1.0
         if ($h) {
@@ -777,7 +946,20 @@ function Get-AdapterObservedMbps {
         }
     }
 
-    return [double]($bestDown + $bestUp)
+    $healthObserved = [double]($bestDown + $bestUp)
+    $proxyObserved = 0.0
+    if ($State.PSObject.Properties['proxyRateMbps'] -or $State.ContainsKey('proxyRateMbps')) {
+        try {
+            if ($State.proxyRateMbps.ContainsKey($Adapter.Name)) {
+                $rateEntry = $State.proxyRateMbps[$Adapter.Name]
+                if ($rateEntry) {
+                    $proxyObserved = [double]$rateEntry.DownloadMbps + [double]$rateEntry.UploadMbps
+                }
+            }
+        } catch {}
+    }
+
+    return [math]::Max($healthObserved, $proxyObserved)
 }
 
 function Get-AdapterSelectionOrder {
@@ -808,6 +990,22 @@ function Get-AdapterSelectionOrder {
         }
     }
 
+    $proxyMbpsByAdapter = @{}
+    $totalProxyMbps = 0.0
+    foreach ($adapter in $Adapters) {
+        $adapterProxyMbps = 0.0
+        try {
+            if ($State.proxyRateMbps.ContainsKey($adapter.Name)) {
+                $rateEntry = $State.proxyRateMbps[$adapter.Name]
+                if ($rateEntry) {
+                    $adapterProxyMbps = [math]::Max(0.0, [double]$rateEntry.DownloadMbps + [double]$rateEntry.UploadMbps)
+                }
+            }
+        } catch {}
+        $proxyMbpsByAdapter[$adapter.Name] = $adapterProxyMbps
+        $totalProxyMbps += $adapterProxyMbps
+    }
+
     if ($PreferredIndex -lt 0 -or $PreferredIndex -ge $Adapters.Count) {
         $PreferredIndex = 0
     }
@@ -819,6 +1017,7 @@ function Get-AdapterSelectionOrder {
         $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
         $activeCount = if ($State.activePerAdapter.ContainsKey($adapter.Name)) { [int](Get-AtomicCounterValue -Counter $State.activePerAdapter[$adapter.Name]) } else { 0 }
         $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
+        $currentRateShare = if ($totalProxyMbps -gt 10.0 -and $proxyMbpsByAdapter.ContainsKey($adapter.Name)) { [double]$proxyMbpsByAdapter[$adapter.Name] / [double]$totalProxyMbps } else { $currentShare }
 
         $h = $State.adapterHealth[$adapter.Name]
         $linkSpeedMbps = if ($null -ne $adapter.Speed -and [double]$adapter.Speed -gt 0) {
@@ -839,7 +1038,8 @@ function Get-AdapterSelectionOrder {
         # Keep weighted round-robin as the base policy, but prefer adapters that are below their target live share.
         $rrBoost = if ($i -eq $PreferredIndex) { 0.02 } else { 0.0 }
         $deficit = $targetShare - $currentShare
-        $score = ($deficit * 2.0) + ((1.0 - $utilization) * 0.15) - ($failRate * 0.40) + $rrBoost
+        $rateDeficit = if ($totalProxyMbps -gt 10.0) { $targetShare - $currentRateShare } else { 0.0 }
+        $score = ($deficit * 1.0) + ($rateDeficit * 3.0) + ((1.0 - $utilization) * 0.10) - ($failRate * 0.50) + $rrBoost
 
         $ranked += [pscustomobject]@{
             Adapter = $adapter
@@ -855,17 +1055,73 @@ function Get-AdapterSelectionOrder {
 function Update-ProxyStats {
     $s = $global:ProxyState
     $aStats = @()
+    $rateNowTicks = [System.DateTimeOffset]::UtcNow.Ticks
     foreach ($a in $s.adapters) {
         $h = $s.adapterHealth[$a.Name]
+        $downloadCounter = Get-OrCreate-AtomicCounter -Map $s.proxyDownloadBytes -Key $a.Name
+        $uploadCounter = Get-OrCreate-AtomicCounter -Map $s.proxyUploadBytes -Key $a.Name
+        $downloadBytes = [int64](Get-AtomicCounterValue -Counter $downloadCounter)
+        $uploadBytes = [int64](Get-AtomicCounterValue -Counter $uploadCounter)
+        $downloadMbps = 0.0
+        $uploadMbps = 0.0
+        try {
+            $lastSample = if ($s.proxyLastRateSample.ContainsKey($a.Name)) { $s.proxyLastRateSample[$a.Name] } else { $null }
+            if ($lastSample -and $lastSample.Ticks) {
+                $seconds = ($rateNowTicks - [int64]$lastSample.Ticks) / [double][System.TimeSpan]::TicksPerSecond
+                if ($seconds -gt 0.25) {
+                    $downloadDelta = [math]::Max(0L, $downloadBytes - [int64]$lastSample.DownloadBytes)
+                    $uploadDelta = [math]::Max(0L, $uploadBytes - [int64]$lastSample.UploadBytes)
+                    $downloadMbps = [math]::Round(($downloadDelta * 8.0) / $seconds / 1000000.0, 2)
+                    $uploadMbps = [math]::Round(($uploadDelta * 8.0) / $seconds / 1000000.0, 2)
+                    $s.proxyLastRateSample[$a.Name] = @{
+                        Ticks = $rateNowTicks
+                        DownloadBytes = $downloadBytes
+                        UploadBytes = $uploadBytes
+                    }
+                    $s.proxyRateMbps[$a.Name] = @{
+                        DownloadMbps = $downloadMbps
+                        UploadMbps = $uploadMbps
+                    }
+                }
+            } else {
+                $s.proxyLastRateSample[$a.Name] = @{
+                    Ticks = $rateNowTicks
+                    DownloadBytes = $downloadBytes
+                    UploadBytes = $uploadBytes
+                }
+                if (-not $s.proxyRateMbps.ContainsKey($a.Name)) {
+                    $s.proxyRateMbps[$a.Name] = @{
+                        DownloadMbps = 0.0
+                        UploadMbps = 0.0
+                    }
+                }
+            }
+        } catch {}
+        try {
+            if ($s.proxyRateMbps.ContainsKey($a.Name)) {
+                $rateEntry = $s.proxyRateMbps[$a.Name]
+                if ($rateEntry) {
+                    $downloadMbps = [double]$rateEntry.DownloadMbps
+                    $uploadMbps = [double]$rateEntry.UploadMbps
+                }
+            }
+        } catch {}
+
         $aStats += @{
             name = $a.Name; type = $a.Type; ip = $a.IP
             connections = [int](Get-AtomicCounterValue -Counter $s.connectionCounts[$a.Name])
             successes = [int](Get-AtomicCounterValue -Counter $s.successCounts[$a.Name])
             failures = [int](Get-AtomicCounterValue -Counter $s.failCounts[$a.Name])
+            failureStreak = if ($s.adapterFailureStreak.ContainsKey($a.Name)) { [int]$s.adapterFailureStreak[$a.Name] } else { 0 }
+            cooldownRemainingSec = if ($s.adapterCooldownUntil.ContainsKey($a.Name)) { [math]::Max(0.0, [math]::Round((([int64]$s.adapterCooldownUntil[$a.Name] - [System.DateTimeOffset]::UtcNow.Ticks) / [double][System.TimeSpan]::TicksPerSecond), 1)) } else { 0.0 }
             health = if ($h) { $h.Score } else { 0 }
             latency = if ($h) { $h.LatencyEWMA } else { 999 }
             jitter = if ($h) { $h.Jitter } else { 0 }
             isDegrading = if ($h) { $h.IsDegrading } else { $false }
+            proxyDownloadBytes = $downloadBytes
+            proxyUploadBytes = $uploadBytes
+            proxyDownloadMbps = $downloadMbps
+            proxyUploadMbps = $uploadMbps
         }
     }
     # Build per-adapter active counts
@@ -916,7 +1172,22 @@ function Update-ProxyStats {
     try { Write-AtomicJson -Path $s.statsFile -Data $statsSnapshot -Depth 3 } catch {}
 
     try {
-        Write-AtomicJson -Path $s.decisionsFile -Data @{ decisions = $s.decisions } -Depth 3
+        if ($s.decisions -and $s.decisions -is [System.Collections.Concurrent.ConcurrentQueue[object]]) {
+            while ($s.decisions.Count -gt ($s.maxDecisions * 2)) {
+                $discardedDecision = $null
+                [void]$s.decisions.TryDequeue([ref]$discardedDecision)
+            }
+
+            $decisionSnapshot = @($s.decisions.ToArray())
+            [array]::Reverse($decisionSnapshot)
+            if ($decisionSnapshot.Count -gt $s.maxDecisions) {
+                $decisionSnapshot = @($decisionSnapshot | Select-Object -First $s.maxDecisions)
+            }
+        } else {
+            $decisionSnapshot = @($s.decisions | Select-Object -First $s.maxDecisions)
+        }
+
+        Write-AtomicJson -Path $s.decisionsFile -Data @{ decisions = $decisionSnapshot } -Depth 3
     } catch {}
 }
 
@@ -1049,6 +1320,62 @@ $HandlerScript = {
         return [int64]$Counter.Read()
     }
 
+    function Get-AdapterCooldownRemainingSeconds {
+        param(
+            [object]$ProxyState,
+            [string]$AdapterName
+        )
+
+        try {
+            if (-not $ProxyState.adapterCooldownUntil.ContainsKey($AdapterName)) {
+                return 0.0
+            }
+
+            $untilTicks = [int64]$ProxyState.adapterCooldownUntil[$AdapterName]
+            $remaining = ($untilTicks - [System.DateTimeOffset]::UtcNow.Ticks) / [double][System.TimeSpan]::TicksPerSecond
+            if ($remaining -gt 0.0) {
+                return $remaining
+            }
+
+            [void]$ProxyState.adapterCooldownUntil.Remove($AdapterName)
+            return 0.0
+        } catch {
+            return 0.0
+        }
+    }
+
+    function Clear-AdapterConnectFailure {
+        param(
+            [object]$ProxyState,
+            [string]$AdapterName
+        )
+
+        try { $ProxyState.adapterFailureStreak[$AdapterName] = 0 } catch {}
+        try { [void]$ProxyState.adapterCooldownUntil.Remove($AdapterName) } catch {}
+    }
+
+    function Register-AdapterConnectFailure {
+        param(
+            [object]$ProxyState,
+            [string]$AdapterName
+        )
+
+        $streak = 1
+        try {
+            if ($ProxyState.adapterFailureStreak.ContainsKey($AdapterName)) {
+                $streak = [int]$ProxyState.adapterFailureStreak[$AdapterName] + 1
+            }
+            $ProxyState.adapterFailureStreak[$AdapterName] = $streak
+
+            if ($streak -ge 2) {
+                $cooldownSeconds = [math]::Min(45, 5 * $streak)
+                $ProxyState.adapterCooldownUntil[$AdapterName] = [System.DateTimeOffset]::UtcNow.AddSeconds($cooldownSeconds).Ticks
+            }
+        } catch {}
+
+        return $streak
+    }
+
     function Read-HttpLine {
         param([System.IO.Stream]$Stream)
 
@@ -1131,17 +1458,72 @@ $HandlerScript = {
         return $body.ToArray()
     }
 
+    function Write-AsciiText {
+        param(
+            [System.IO.Stream]$Stream,
+            [string]$Text
+        )
+
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text)
+        $Stream.Write($bytes, 0, $bytes.Length)
+    }
+
+    function Copy-ChunkedRequestBody {
+        param(
+            [System.Net.Sockets.NetworkStream]$Source,
+            [System.Net.Sockets.NetworkStream]$Destination,
+            [object]$UploadCounter
+        )
+
+        $bytesCopied = [long]0
+        while ($true) {
+            $sizeLine = Read-HttpLine -Stream $Source
+            if ($null -eq $sizeLine) { throw "Unexpected end of stream while reading chunk size." }
+            Write-AsciiText -Stream $Destination -Text "$sizeLine`r`n"
+
+            if ([string]::IsNullOrWhiteSpace($sizeLine)) {
+                continue
+            }
+
+            $sizeToken = $sizeLine.Split(';')[0].Trim()
+            $chunkSize = [Convert]::ToInt64($sizeToken, 16)
+            if ($chunkSize -gt 0) {
+                $bytesCopied += [NetFusion.StreamCopier]::CopyFixedBytes($Source, $Destination, $chunkSize, $UploadCounter)
+
+                $chunkTerminator = New-Object byte[] 2
+                if ((Read-ExactBytes -Stream $Source -Buffer $chunkTerminator -Count 2) -ne 2) {
+                    throw "Unexpected end of stream while reading chunk terminator."
+                }
+                $Destination.Write($chunkTerminator, 0, 2)
+                continue
+            }
+
+            while ($true) {
+                $trailerLine = Read-HttpLine -Stream $Source
+                if ($null -eq $trailerLine) {
+                    Write-AsciiText -Stream $Destination -Text "`r`n"
+                    break
+                }
+                Write-AsciiText -Stream $Destination -Text "$trailerLine`r`n"
+                if ($trailerLine -eq '') { break }
+            }
+            break
+        }
+
+        return $bytesCopied
+    }
+
     function Set-UploadHostHint {
         param(
             [hashtable]$ProxyState,
-            [string]$Host,
+            [string]$HostName,
             [string]$Reason,
             [long]$ClientToRemoteBytes = 0,
             [long]$RemoteToClientBytes = 0
         )
 
-        if ([string]::IsNullOrWhiteSpace($Host)) { return }
-        $ProxyState.uploadHostHints[$Host] = @{
+        if ([string]::IsNullOrWhiteSpace($HostName)) { return }
+        $ProxyState.uploadHostHints[$HostName] = @{
             time = [System.DateTimeOffset]::UtcNow.Ticks
             reason = $Reason
             clientToRemoteBytes = $ClientToRemoteBytes
@@ -1180,7 +1562,18 @@ $HandlerScript = {
             }
         }
 
-        return [double]($bestDown + $bestUp)
+        $healthObserved = [double]($bestDown + $bestUp)
+        $proxyObserved = 0.0
+        try {
+            if ($ProxyState.proxyRateMbps.ContainsKey($Adapter.Name)) {
+                $rateEntry = $ProxyState.proxyRateMbps[$Adapter.Name]
+                if ($rateEntry) {
+                    $proxyObserved = [double]$rateEntry.DownloadMbps + [double]$rateEntry.UploadMbps
+                }
+            }
+        } catch {}
+
+        return [math]::Max($healthObserved, $proxyObserved)
     }
 
     function Get-LocalAdapterSelectionOrder {
@@ -1211,6 +1604,22 @@ $HandlerScript = {
             }
         }
 
+        $proxyMbpsByAdapter = @{}
+        $totalProxyMbps = 0.0
+        foreach ($adapter in $Adapters) {
+            $adapterProxyMbps = 0.0
+            try {
+                if ($ProxyState.proxyRateMbps.ContainsKey($adapter.Name)) {
+                    $rateEntry = $ProxyState.proxyRateMbps[$adapter.Name]
+                    if ($rateEntry) {
+                        $adapterProxyMbps = [math]::Max(0.0, [double]$rateEntry.DownloadMbps + [double]$rateEntry.UploadMbps)
+                    }
+                }
+            } catch {}
+            $proxyMbpsByAdapter[$adapter.Name] = $adapterProxyMbps
+            $totalProxyMbps += $adapterProxyMbps
+        }
+
         if ($PreferredIndex -lt 0 -or $PreferredIndex -ge $Adapters.Count) {
             $PreferredIndex = 0
         }
@@ -1222,6 +1631,7 @@ $HandlerScript = {
             $targetShare = if ($totalWeight -gt 0.0) { $weight / $totalWeight } else { 1.0 / [double]$Adapters.Count }
             $activeCount = if ($ProxyState.activePerAdapter.ContainsKey($adapter.Name)) { [int](Get-LocalAtomicCounterValue -Counter $ProxyState.activePerAdapter[$adapter.Name]) } else { 0 }
             $currentShare = if ($totalActive -gt 0) { [double]$activeCount / [double]$totalActive } else { 0.0 }
+            $currentRateShare = if ($totalProxyMbps -gt 10.0 -and $proxyMbpsByAdapter.ContainsKey($adapter.Name)) { [double]$proxyMbpsByAdapter[$adapter.Name] / [double]$totalProxyMbps } else { $currentShare }
 
             $h = $ProxyState.adapterHealth[$adapter.Name]
             $linkSpeedMbps = if ($null -ne $adapter.Speed -and [double]$adapter.Speed -gt 0) {
@@ -1241,7 +1651,13 @@ $HandlerScript = {
 
             $rrBoost = if ($i -eq $PreferredIndex) { 0.02 } else { 0.0 }
             $deficit = $targetShare - $currentShare
-            $score = ($deficit * 2.0) + ((1.0 - $utilization) * 0.15) - ($failRate * 0.40) + $rrBoost
+            $rateDeficit = if ($totalProxyMbps -gt 10.0) { $targetShare - $currentRateShare } else { 0.0 }
+            # NetFusion-FIX-21: Keep maxspeed scheduling capacity-stable. The old
+            # rate-deficit multiplier was aggressive enough to swing bursts toward
+            # a slower USB Wi-Fi adapter during short samples, which can reduce
+            # total throughput below the strong single-link baseline. Prefer the
+            # smooth capacity schedule and use live rate only as a damped nudge.
+            $score = ($deficit * 1.25) + ($rateDeficit * 1.0) + ((1.0 - $utilization) * 0.05) - ($failRate * 0.75) + $rrBoost
 
             $ranked += [pscustomobject]@{
                 Adapter = $adapter
@@ -1254,6 +1670,77 @@ $HandlerScript = {
         @($ranked | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Weight }; Descending = $true }, @{ Expression = { $_.Preferred }; Descending = $true })
     }
 
+    function Get-LocalWeightedPreferredIndex {
+        param(
+            [object]$ProxyState,
+            [object[]]$Adapters,
+            [double[]]$Weights
+        )
+
+        if (-not $Adapters -or $Adapters.Count -eq 0) {
+            return 0
+        }
+
+        $tick = [int64]$ProxyState.rrCounter.Increment()
+
+        # Fast path: when all adapters are eligible, use the precomputed smooth
+        # WRR schedule refreshed with the current capacity weights. This avoids
+        # the old 500/300 score-walk behavior where the first hundreds of burst
+        # connections could prefer the first adapter before the second adapter's
+        # share was reached.
+        try {
+            $stateAdapters = @($ProxyState.adapters)
+            $schedule = @($ProxyState.rrSchedule)
+            if ($schedule.Count -gt 0 -and $stateAdapters.Count -eq $Adapters.Count) {
+                $sameOrder = $true
+                for ($i = 0; $i -lt $Adapters.Count; $i++) {
+                    if ([string]$stateAdapters[$i].Name -ne [string]$Adapters[$i].Name) {
+                        $sameOrder = $false
+                        break
+                    }
+                }
+
+                if ($sameOrder) {
+                    $slot = [int]($tick % [int64]$schedule.Count)
+                    if ($slot -lt 0) { $slot += $schedule.Count }
+                    $scheduledIndex = [int]$schedule[$slot]
+                    if ($scheduledIndex -ge 0 -and $scheduledIndex -lt $Adapters.Count) {
+                        return $scheduledIndex
+                    }
+                }
+            }
+        } catch {}
+
+        # Fallback for filtered adapter sets. Build a small smooth schedule on
+        # demand instead of walking a huge cumulative score range.
+        $slotCount = [math]::Min(64, [math]::Max(16, $Adapters.Count * 8))
+        $targetSlot = [int]($tick % [int64]$slotCount)
+        if ($targetSlot -lt 0) { $targetSlot += $slotCount }
+
+        $accumulators = New-Object double[] $Adapters.Count
+        $bestIndex = 0
+        for ($slotIndex = 0; $slotIndex -le $targetSlot; $slotIndex++) {
+            $bestScore = [double]::NegativeInfinity
+            for ($i = 0; $i -lt $Adapters.Count; $i++) {
+                $weight = if ($i -lt $Weights.Count) { [double]$Weights[$i] } else { 1.0 }
+                $accumulators[$i] += [math]::Max(1.0, $weight)
+                if ($accumulators[$i] -gt $bestScore) {
+                    $bestScore = $accumulators[$i]
+                    $bestIndex = $i
+                }
+            }
+
+            $totalWeight = 0.0
+            for ($i = 0; $i -lt $Adapters.Count; $i++) {
+                $weight = if ($i -lt $Weights.Count) { [double]$Weights[$i] } else { 1.0 }
+                $totalWeight += [math]::Max(1.0, $weight)
+            }
+            $accumulators[$bestIndex] -= $totalWeight
+        }
+
+        return $bestIndex
+    }
+
     $connAdapter = $null  # track which adapter this connection uses
     $hostKey = $null
     $sessionKey = $null
@@ -1264,6 +1751,8 @@ $HandlerScript = {
     $remoteStream = $null
     $clientToRemoteBytes = [long]0
     $remoteToClientBytes = [long]0
+    $proxyUploadCounter = $null
+    $proxyDownloadCounter = $null
     $uri = $null
     $selectionPlan = @()
     try {
@@ -1277,7 +1766,7 @@ $HandlerScript = {
         $clientSocketRef.NoDelay = $true
         $clientSocketRef.ReceiveTimeout = 60000
         $clientSocketRef.SendTimeout = 60000
-        $clientSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+        $clientSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($false, 0)
 
         # NetFusion-FIX-18: Use NetworkStream with socket ownership disabled and close the TcpClient exactly once during cleanup.
         $clientStream = [System.Net.Sockets.NetworkStream]::new($clientSocketRef, $false)
@@ -1442,7 +1931,7 @@ $HandlerScript = {
         }
 
         if ($method -ne 'CONNECT' -and $isBulkHint -and ($isUploadMethod -or $uploadContentLength -gt 0 -or $requestContentLength -ge 262144 -or $isChunkedRequest -or $hasTusResumable -or $hasContentRange)) {
-            Set-UploadHostHint -ProxyState $State -Host $targetHost -Reason 'http-upload-signal' -ClientToRemoteBytes ([math]::Max($requestContentLength, $uploadContentLength)) -RemoteToClientBytes 0
+            Set-UploadHostHint -ProxyState $State -HostName $targetHost -Reason 'http-upload-signal' -ClientToRemoteBytes ([math]::Max($requestContentLength, $uploadContentLength)) -RemoteToClientBytes 0
         }
 
         # v5.1: Track host concurrency for dynamic download manager detection
@@ -1486,9 +1975,28 @@ $HandlerScript = {
             if ($candidateStatus -eq 'offline' -or $candidateScore -le 0.0) {
                 continue
             }
+            if ((Get-AdapterCooldownRemainingSeconds -ProxyState $State -AdapterName $candidateAdapter.Name) -gt 0.0) {
+                continue
+            }
 
             $avail += $candidateAdapter
             $aw += $State.weights[$i]
+        }
+        if ($avail.Count -eq 0 -and $State.adapters.Count -gt 0) {
+            # If every adapter is in cooldown, fall back to the healthiest known
+            # adapter instead of dropping traffic. This preserves internet access
+            # while still avoiding repeated dead-secondary probes under load.
+            for ($i = 0; $i -lt $State.adapters.Count; $i++) {
+                $candidateAdapter = $State.adapters[$i]
+                $healthEntry = if ($State.adapterHealth.ContainsKey($candidateAdapter.Name)) { $State.adapterHealth[$candidateAdapter.Name] } else { $null }
+                $candidateStatus = if ($healthEntry -and $healthEntry.ContainsKey('Status')) { [string]$healthEntry.Status } else { '' }
+                $candidateScore = if ($healthEntry -and $healthEntry.ContainsKey('Score') -and $null -ne $healthEntry.Score) { [double]$healthEntry.Score } else { 1.0 }
+                if ($candidateStatus -eq 'offline' -or $candidateScore -le 0.0) {
+                    continue
+                }
+                $avail += $candidateAdapter
+                $aw += $State.weights[$i]
+            }
         }
         if ($avail.Count -eq 0) { $ClientSocket.Close(); return }
         $null = $State.totalConnections.Increment()
@@ -1507,28 +2015,7 @@ $HandlerScript = {
             $selectionReason = 'only-adapter'
         } else {
             # NetFusion-FIX-5: Prefer adapters for new connections using measured-throughput weights, not latency-heavy health scores.
-            $adapterScores = @()
-            for ($scoreIndex = 0; $scoreIndex -lt $avail.Count; $scoreIndex++) {
-                $selectionWeight = if ($scoreIndex -lt $aw.Count) { [double]$aw[$scoreIndex] } else { 1.0 }
-                $adapterScores += [pscustomobject]@{
-                    Index = $scoreIndex
-                    Score = [Math]::Max(1, [int][Math]::Round($selectionWeight))
-                }
-            }
-
-            $totalScore = [int](($adapterScores | Measure-Object -Property Score -Sum).Sum)
-            if ($totalScore -le 0) { $totalScore = [Math]::Max(1, $avail.Count) }
-            $tick = [int]$State.rrCounter.Increment()
-            $target = $tick % [Math]::Max(1, $totalScore)
-            $preferredIndex = 0
-            $cumulativeScore = 0
-            foreach ($scoreEntry in @($adapterScores | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Index }; Descending = $false })) {
-                $cumulativeScore += [int]$scoreEntry.Score
-                if ($target -lt $cumulativeScore) {
-                    $preferredIndex = [int]$scoreEntry.Index
-                    break
-                }
-            }
+            $preferredIndex = Get-LocalWeightedPreferredIndex -ProxyState $State -Adapters $avail -Weights ([double[]]$aw)
 
             $selectionPlan = Get-LocalAdapterSelectionOrder -ProxyState $State -Adapters $avail -Weights ([double[]]$aw) -PreferredIndex $preferredIndex
             if ($selectionPlan.Count -gt 0) {
@@ -1574,7 +2061,11 @@ $HandlerScript = {
             reason = $selectionReason
             affinity_mode = $affinityMode
         }
-        $State.decisions = @($decision) + @($State.decisions | Select-Object -First ($State.maxDecisions - 1))
+        try {
+            $State.decisions.Enqueue($decision)
+        } catch {
+            $State.decisions = @($decision) + @($State.decisions | Select-Object -First ($State.maxDecisions - 1))
+        }
 
         # ===== Connect to remote via chosen adapter (with failover) =====
         $remoteClient = $null
@@ -1597,7 +2088,8 @@ $HandlerScript = {
             }
         }
 
-        $maxRetries = [math]::Min($candidateAdapters.Count, 3)
+        $configuredRetries = if ($State.maxRetries -and [int]$State.maxRetries -gt 0) { [int]$State.maxRetries } else { 3 }
+        $maxRetries = [math]::Min($candidateAdapters.Count, $configuredRetries)
 
         for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
             $adapter = $candidateAdapters[$attempt]
@@ -1613,7 +2105,8 @@ $HandlerScript = {
 
                 # NetFusion-FIX-5: Bind outbound sockets to the chosen adapter's local IPv4 before connect so Windows uses that WAN path.
                 $ifIndex = if ($null -ne $adapter.InterfaceIndex) { [int]$adapter.InterfaceIndex } else { 0 }
-                $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, 5000, $ifIndex)
+                $connectTimeoutMs = if ($State.connectTimeout -and [int]$State.connectTimeout -gt 0) { [int]$State.connectTimeout } else { 5000 }
+                $remoteClient = [NetFusion.SocketConnector]::CreateBoundConnection($adapter.IP, $rHost, $rPort, $connectTimeoutMs, $ifIndex)
                 # NetFusion-FIX-1: Cache the outbound socket wrapper once so socket property changes reliably apply after source-IP binding.
                 $remoteSocketRef = $remoteClient.Client
                 $remoteSocketRef.ReceiveBufferSize = 1048576
@@ -1621,11 +2114,13 @@ $HandlerScript = {
                 $remoteSocketRef.NoDelay = $true
                 $remoteSocketRef.ReceiveTimeout = 60000
                 $remoteSocketRef.SendTimeout = 60000
-                $remoteSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+                $remoteSocketRef.LingerState = New-Object System.Net.Sockets.LingerOption($false, 0)
                 $remoteClient.SendTimeout = 60000
                 $remoteClient.ReceiveTimeout = 60000
 
                 $null = (Get-OrCreate-LocalAtomicCounter -Map $State.activePerAdapter -Key $adapter.Name).Increment()
+                $proxyUploadCounter = Get-OrCreate-LocalAtomicCounter -Map $State.proxyUploadBytes -Key $adapter.Name
+                $proxyDownloadCounter = Get-OrCreate-LocalAtomicCounter -Map $State.proxyDownloadBytes -Key $adapter.Name
                 $connAdapter = $adapter.Name
 
                 if ($sessionKey) {
@@ -1642,6 +2137,7 @@ $HandlerScript = {
 
                 $null = (Get-OrCreate-LocalAtomicCounter -Map $State.connectionCounts -Key $adapter.Name).Increment()
                 $null = (Get-OrCreate-LocalAtomicCounter -Map $State.successCounts -Key $adapter.Name).Increment()
+                Clear-AdapterConnectFailure -ProxyState $State -AdapterName $adapter.Name
                 break
             } catch {
                 try { $remoteClient.Close() } catch {}
@@ -1650,6 +2146,7 @@ $HandlerScript = {
             }
             $null = (Get-OrCreate-LocalAtomicCounter -Map $State.failCounts -Key $adapter.Name).Increment()
             $null = $State.totalFails.Increment()
+            [void](Register-AdapterConnectFailure -ProxyState $State -AdapterName $adapter.Name)
         }
 
         if (-not $remoteClient) {
@@ -1686,21 +2183,30 @@ $HandlerScript = {
                 $clientStream,
                 $remoteStream,
                 [ref]$clientToRemoteBytes,
-                [ref]$remoteToClientBytes
+                [ref]$remoteToClientBytes,
+                $proxyUploadCounter,
+                $proxyDownloadCounter
             )
         } else {
             $reqPath = $uri.PathAndQuery; if (-not $reqPath) { $reqPath = '/' }
             $req = "$method $reqPath HTTP/1.1`r`n"
-            $hasHost = $false; $contentLength = 0; $isChunked = $false
+            $hasHost = $false; $contentLength = 0L; $isChunked = $false; $expectsContinue = $false
             $forwardHeaders = [System.Collections.Generic.List[string]]::new()
             for ($i = 1; $i -lt $lines.Count; $i++) {
                 $l = $lines[$i]
                 if ($l -match '^Proxy-') { continue }
                 if ($l -match '^Connection:') { continue }
+                if ($l -match '^Expect:\s*100-continue\s*$') {
+                    $expectsContinue = $true
+                    continue
+                }
                 if ($l -match '^Host:') { $hasHost = $true }
-                if ($l -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1]; continue }
+                if ($l -match '^Content-Length:\s*(\d+)') { $contentLength = [int64]$Matches[1]; continue }
                 if ($l -match '^Transfer-Encoding:\s*(.+)$') {
-                    if ($Matches[1] -match '(?i)\bchunked\b') { $isChunked = $true }
+                    if ($Matches[1] -match '(?i)\bchunked\b') {
+                        $isChunked = $true
+                        $forwardHeaders.Add($l)
+                    }
                     continue
                 }
                 $forwardHeaders.Add($l)
@@ -1712,8 +2218,6 @@ $HandlerScript = {
 
             $chunkedBody = $null
             if ($isChunked) {
-                $chunkedBody = Read-ChunkedRequestBody -Stream $clientStream
-                $req += "Content-Length: $($chunkedBody.Length)`r`n"
             } elseif ($contentLength -gt 0) {
                 $req += "Content-Length: $contentLength`r`n"
             }
@@ -1721,19 +2225,30 @@ $HandlerScript = {
             $reqBytes = [System.Text.Encoding]::ASCII.GetBytes($req)
             $remoteStream.Write($reqBytes, 0, $reqBytes.Length)
 
-            if ($isChunked) {
-                if ($chunkedBody.Length -gt 0) {
-                    $remoteStream.Write($chunkedBody, 0, $chunkedBody.Length)
-                    $clientToRemoteBytes += [long]$chunkedBody.Length
-                }
-            } elseif ($contentLength -gt 0) {
-                [NetFusion.StreamCopier]::CopyStream($clientStream, $remoteStream, [int64]$contentLength, [ref]$clientToRemoteBytes)
+            if ($expectsContinue -and ($isChunked -or $contentLength -gt 0)) {
+                $continueBytes = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n")
+                $clientStream.Write($continueBytes, 0, $continueBytes.Length)
+                $clientStream.Flush()
             }
 
-            [NetFusion.StreamCopier]::CopyStream($remoteStream, $clientStream, [ref]$remoteToClientBytes)
+            if ($isChunked) {
+                $clientToRemoteBytes += [long](Copy-ChunkedRequestBody -Source $clientStream -Destination $remoteStream -UploadCounter $proxyUploadCounter)
+            } elseif ($contentLength -gt 0) {
+                [NetFusion.StreamCopier]::CopyStream($clientStream, $remoteStream, [int64]$contentLength, [ref]$clientToRemoteBytes, $proxyUploadCounter)
+            }
+
+            [NetFusion.StreamCopier]::CopyStream($remoteStream, $clientStream, [ref]$remoteToClientBytes, $proxyDownloadCounter)
         }
 
-    } catch {} finally {
+    } catch {
+        try {
+            $logDir = Split-Path -Parent $State.eventsFile
+            if ($logDir) {
+                $errLine = "{0} method={1} host={2} error={3}`r`n" -f (Get-Date -Format 'o'), $method, $targetHost, $_.Exception.Message
+                [System.IO.File]::AppendAllText((Join-Path $logDir 'proxy-errors.log'), $errLine)
+            }
+        } catch {}
+    } finally {
         # NetFusion-FIX-6: Use atomic decrement paths for shared connection counters during cleanup.
         if ($State.activeConnections.Read() -gt 0) { $null = $State.activeConnections.Decrement() }
         if ($connAdapter -and $State.activePerAdapter.ContainsKey($connAdapter)) {
@@ -1762,8 +2277,25 @@ if (Test-Path $configFile) {
 $minThreads = if ($cfgProxy -and $cfgProxy.minThreads -gt 0) { [int]$cfgProxy.minThreads } else { 64 }
 $maxThreads = if ($cfgProxy -and $cfgProxy.maxThreads -gt 0) { [int]$cfgProxy.maxThreads } else { 256 }
 $maxThreads = [math]::Max(50, [math]::Max($minThreads, $maxThreads))
-$currentMaxThreads = [math]::Max(50, [math]::Min($maxThreads, [math]::Max($minThreads, 96)))
+$currentMaxThreads = $maxThreads
 $global:ProxyState.currentMaxThreads = $currentMaxThreads
+$lockPoolAtMax = ([string]$global:ProxyState.currentMode -eq 'maxspeed')
+
+# NetFusion-FIX-19: In maxspeed mode, throughput bursts should not wait for
+# reactive pool growth. Raise .NET worker and I/O completion thread minima to
+# the configured proxy ceiling so parallel download/upload relays are scheduled
+# immediately instead of queuing behind conservative CLR defaults.
+try {
+    $workerMinNow = 0; $ioMinNow = 0
+    [System.Threading.ThreadPool]::GetMinThreads([ref]$workerMinNow, [ref]$ioMinNow)
+    $threadFloor = [math]::Min(512, [math]::Max($minThreads, $maxThreads))
+    if ($workerMinNow -lt $threadFloor -or $ioMinNow -lt $threadFloor) {
+        [void][System.Threading.ThreadPool]::SetMinThreads(
+            [math]::Max($workerMinNow, $threadFloor),
+            [math]::Max($ioMinNow, $threadFloor)
+        )
+    }
+} catch {}
 
 # NetFusion-FIX-17: Keep the accept loop backed by a large adaptive runspace pool so burst traffic does not queue behind a small worker cap.
 $rsPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($minThreads, $currentMaxThreads)
@@ -1787,7 +2319,7 @@ if ($global:ProxyState.adapters.Count -lt 1) {
 
 Write-Host "  HTTP Proxy:      127.0.0.1:${Port}" -ForegroundColor Green
 Write-Host "  Mode:            $($global:ProxyState.currentMode)" -ForegroundColor Green
-Write-Host "  Thread pool:     $minThreads-$maxThreads (adaptive)" -ForegroundColor Green
+Write-Host "  Thread pool:     $minThreads-$maxThreads $(if($lockPoolAtMax){'(maxspeed locked)'}else{'(adaptive)'})" -ForegroundColor Green
 Write-Host "  Soft host hints: $($global:ProxyState.sessionTTL)s TTL" -ForegroundColor Green
 Write-Host "  Health endpoint: /health (loopback only)" -ForegroundColor Green
 Write-Host "  Safety aware:    yes" -ForegroundColor Green
@@ -1811,7 +2343,11 @@ $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Lo
 $listenerSocket = $listener.Server
 $listenerSocket.ReceiveBufferSize = 1048576
 $listenerSocket.SendBufferSize = 1048576
-try { $listener.Start() } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
+# NetFusion-FIX-20: Give the local listener enough pending accept backlog for
+# browser, launcher, torrent, and download-manager bursts. A shallow backlog
+# can look like low WAN throughput because clients stall before the proxy ever
+# dispatches the connection to an adapter.
+try { $listener.Start(1024) } catch { Write-Host "  [ERROR] Port ${Port} in use. $_" -ForegroundColor Red; exit 1 }
 
 Update-ProxyStats
 $lastRefreshTicks = [System.DateTimeOffset]::UtcNow.Ticks
@@ -1821,13 +2357,15 @@ $lastSessionCleanTicks = $lastRefreshTicks
 $cleanupIntervalTicks = [System.TimeSpan]::FromMilliseconds(500).Ticks
 # NetFusion-FIX-7: Sweep session affinity more frequently than the 30s inactivity TTL so stale pinning does not linger.
 $sessionCleanIntervalTicks = [System.TimeSpan]::FromSeconds(15).Ticks
-$logIntervalTicks = [System.TimeSpan]::FromSeconds(1).Ticks
-$staleJobTicks = [System.TimeSpan]::FromSeconds(180).Ticks
+$logIntervalTicks = [System.TimeSpan]::FromSeconds(5).Ticks
+$jobTimeoutSec = if ($cfgProxy -and $cfgProxy.jobTimeoutSec -gt 0) { [int]$cfgProxy.jobTimeoutSec } else { 0 }
+$staleJobTicks = if ($jobTimeoutSec -gt 0) { [System.TimeSpan]::FromSeconds($jobTimeoutSec).Ticks } else { 0 }
 $lowThreadHoldTicks = [System.TimeSpan]::FromSeconds(120).Ticks
 $lowThreadTicks = $null
 
 try {
     while ($script:IsRunning) {
+        try {
         $nowTicks = [System.DateTimeOffset]::UtcNow.Ticks
 
         # Refresh adapter data and weights every 5 seconds
@@ -1848,8 +2386,10 @@ try {
                     $toRemove += $j
                 } else {
                     $activeCount++
-                    if ($j.StartTicks -and (($nowTicks - [int64]$j.StartTicks) -gt $staleJobTicks)) {
-                        # Stale job -- force dispose (180s timeout, reduced from 600s)
+                    if ($staleJobTicks -gt 0 -and $j.StartTicks -and (($nowTicks - [int64]$j.StartTicks) -gt $staleJobTicks)) {
+                        # Optional stale-job breaker. Disabled by default because long
+                        # browser/download-manager/torrent flows are legitimate and may
+                        # run for many minutes while still transferring data.
                         try { $j.PS.Stop() } catch {}
                         $toRemove += $j
                     }
@@ -1872,7 +2412,7 @@ try {
                 Write-ProxyEvent "Pool scaled UP: $currentMaxThreads (queue pending, active=$activeThreads)"
                 Write-Host "  [Scale UP] Thread pool expanded to $currentMaxThreads" -ForegroundColor Cyan
                 $lowThreadTicks = $null
-            } elseif ($activeThreads -lt [math]::Floor($currentMaxThreads * 0.4) -and $currentMaxThreads -gt $minThreads) {
+            } elseif ((-not $lockPoolAtMax) -and $activeThreads -lt [math]::Floor($currentMaxThreads * 0.4) -and $currentMaxThreads -gt $minThreads) {
                 if ($null -eq $lowThreadTicks) {
                     $lowThreadTicks = $nowTicks
                 } elseif (($nowTicks - [int64]$lowThreadTicks) -gt $lowThreadHoldTicks) {
@@ -1930,7 +2470,7 @@ try {
         $clientSocket.NoDelay = $true
         $clientSocket.ReceiveTimeout = 30000
         $clientSocket.SendTimeout = 30000
-        $clientSocket.LingerState = New-Object System.Net.Sockets.LingerOption($true, 2)
+        $clientSocket.LingerState = New-Object System.Net.Sockets.LingerOption($false, 0)
 
         # NetFusion-FIX-17: Dispatch each accepted connection asynchronously into the existing runspace pool; never block the accept loop on relay work.
         $ps = [System.Management.Automation.PowerShell]::Create()
@@ -1938,7 +2478,6 @@ try {
         $ps.AddScript($HandlerScript).AddArgument($client).AddArgument($global:ProxyState) | Out-Null
         $handle = $ps.BeginInvoke()
         $jobs.Add(@{ PS = $ps; Handle = $handle; StartTicks = $nowTicks })
-        $script:ActivePowershells.Enqueue($ps)
 
         # Log connection activity
         if (($nowTicks - $lastLogTicks) -gt $logIntervalTicks) {
@@ -1953,6 +2492,13 @@ try {
             $ts = [System.DateTimeOffset]::Now.ToString('HH:mm:ss')
             Write-Host "  [$ts] conns=$(Get-AtomicCounterValue -Counter $s.totalConnections) | $($connParts -join ' | ') | threads=$($jobs.Count) | sessions=$($s.sessionMap.Count)$safeFlag | $($typeStr -join ' ')" -ForegroundColor DarkGray
             $lastLogTicks = $nowTicks
+        }
+        } catch {
+            try {
+                $errLine = "{0} proxy-loop error={1}`r`n" -f (Get-Date -Format 'o'), $_.Exception.Message
+                [System.IO.File]::AppendAllText((Join-Path $logsDir 'proxy-errors.log'), $errLine)
+            } catch {}
+            Start-Sleep -Milliseconds 100
         }
     }
 } finally {
@@ -1972,40 +2518,5 @@ try {
     try { Write-AtomicJson -Path $global:ProxyState.statsFile -Data @{ running = $false } -Depth 3 } catch {}
     Write-ProxyEvent "Proxy stopped"
     Write-Host "`n  Proxy stopped." -ForegroundColor Yellow
-}
-
-function Clear-SessionAffinityForAdapters {
-    param(
-        [object]$State,
-        [string[]]$AdapterNames
-    )
-
-    if (-not $State -or -not $AdapterNames -or $AdapterNames.Count -eq 0) {
-        return 0
-    }
-
-    $targetAdapters = @($AdapterNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    if ($targetAdapters.Count -eq 0) {
-        return 0
-    }
-
-    $removedCount = 0
-    foreach ($key in @($State.sessionMap.Keys)) {
-        $entry = $State.sessionMap[$key]
-        if (-not $entry -or -not $entry.adapter) {
-            continue
-        }
-
-        if ([string]$entry.adapter -in $targetAdapters) {
-            try {
-                $removedEntry = $null
-                if ($State.sessionMap.TryRemove($key, [ref]$removedEntry)) {
-                    $removedCount++
-                }
-            } catch {}
-        }
-    }
-
-    return $removedCount
 }
 

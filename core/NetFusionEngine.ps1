@@ -103,9 +103,12 @@ function Write-AtomicJson {
 }
 
 function Start-SmartProxyProcess {
-    param([string]$ScriptPath)
+    param(
+        [string]$ScriptPath,
+        [int]$Port
+    )
 
-    return (Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$ScriptPath`"" -WindowStyle Hidden -PassThru)
+    return (Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$ScriptPath`" -Port $Port" -WindowStyle Hidden -PassThru)
 }
 
 function Wait-ProxyBind {
@@ -116,7 +119,6 @@ function Wait-ProxyBind {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
         try {
             $tcp = New-Object System.Net.Sockets.TcpClient
             $tcpSocket = $tcp.Client
@@ -130,6 +132,7 @@ function Wait-ProxyBind {
             }
             $tcp.Close()
         } catch {}
+        Start-Sleep -Milliseconds 250
     }
 
     return $false
@@ -172,13 +175,10 @@ try {
         }
 } catch {}
 $script:ExitRestoreEvent = $null
-try {
-    $script:ExitRestoreEvent = Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
-        try {
-            & powershell.exe -ExecutionPolicy Bypass -NoProfile -File "$using:networkStateScript" -Action Restore -Quiet | Out-Null
-        } catch {}
-    }
-} catch {}
+# Do not restore networking from the engine process exit event. A transient
+# engine host exit must not tear down an otherwise healthy proxy path during
+# large transfers. NetFusion-STOP.bat and NetFusion-SAFE.bat remain the explicit
+# rollback paths; the watchdog clears proxy settings if the proxy port dies.
 
 try {
 Write-Host "=================================================" -ForegroundColor Cyan
@@ -200,11 +200,19 @@ Write-Host "  [Engine] Loading Subsystems..." -ForegroundColor DarkGray
 . (Join-Path $scriptDir "RouteController.ps1")
 . (Join-Path $scriptDir "LearningEngine.ps1")
 
+# Build a fresh adapter inventory before the proxy starts. A stale interfaces.json
+# from the previous run can make the proxy select a disconnected/no-gateway USB
+# adapter during startup, causing slow connection timeouts and bad first tests.
+Write-Host "  [Engine] Refreshing adapter inventory..." -ForegroundColor DarkGray
+$interfaces = Update-NetworkState -ForceRefresh
+Write-Host "  [Engine] Running initial fast source-bound health check..." -ForegroundColor DarkGray
+$health = Update-HealthState -PrimaryOnly
+
 # 3. Launch SmartProxy as a background process
 Write-Host "  [Engine] Booting SmartProxy..." -ForegroundColor DarkGray
 try {
     $proxyScript = Join-Path $scriptDir "SmartProxy.ps1"
-    $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript
+    $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript -Port $proxyPort
     Write-Host "  [+] SmartProxy Process Started (PID: $($proxyProc.Id))." -ForegroundColor Green
 } catch {
     Write-Host "  [Engine] CRUCIAL FAILURE: SmartProxy could not start! $_" -ForegroundColor Red
@@ -321,7 +329,7 @@ while ($true) {
             Start-Sleep -Seconds $backoffSeconds
 
             try {
-                $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript
+                $proxyProc = Start-SmartProxyProcess -ScriptPath $proxyScript -Port $proxyPort
             } catch {
                 Write-Host "  [Engine] Failed to restart SmartProxy: $_" -ForegroundColor Red
                 exit 1
@@ -345,10 +353,9 @@ while ($true) {
         # 2. Ping Health Monitor (Every ~2s)
         $health = Update-HealthState
         
-        # 3. Route Controller Dynamic Update (Every ~10s)
-        if ($loopCount % 5 -eq 0 -and $interfaces.Count -ge 2) {
+        # 3. Route Controller Dynamic Update (Every ~30s)
+        if ($loopCount % 15 -eq 0 -and $interfaces.Count -ge 2) {
             Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
-            Ensure-EngineNetworkRoutes
         }
         
         # 4. Learning Engine Analytics (Every ~60s)
@@ -359,32 +366,30 @@ while ($true) {
         # 5. v6.1: DHCP Auto-Recovery (Every ~30s)
         if ($loopCount % 15 -eq 0) {
             Repair-AdapterDHCP -Interfaces $interfaces
+            $interfaces = Update-NetworkState -ForceRefresh
         }
         
-        # 6. v6.1: ECMP Enforcement (Every ~30s)
-        if ($loopCount % 15 -eq 0) {
-            Enforce-ECMP
+        # 6. v6.2: Update safety-state uptime every ~10s instead of every loop.
+        if ($loopCount % 5 -eq 0) {
+            try {
+                $uptimeMin = [math]::Round(((Get-Date) - $engineStartTime).TotalMinutes, 1)
+                $curSafety = @{
+                    safeMode = $false; version = $script:NetFusionVersion; circuitBreakerOpen = $false
+                    startTime = $engineStartTime.ToString('o')
+                }
+                if (Test-Path $safetyFile) {
+                    try {
+                        $ex = Get-Content $safetyFile -Raw | ConvertFrom-Json
+                        if ($ex -and $ex.lastEvent -and $ex.lastEvent -ne 'Engine running normally') {
+                            $curSafety.lastEvent = [string]$ex.lastEvent
+                        }
+                    } catch {}
+                }
+                $curSafety.uptime = $uptimeMin
+                $curSafety.lastEvent = 'Engine running normally'
+                Write-AtomicJson -Path $safetyFile -Data $curSafety -Depth 3
+            } catch {}
         }
-        
-        # 7. v6.2: Update safety-state uptime every loop
-        try {
-            $uptimeMin = [math]::Round(((Get-Date) - $engineStartTime).TotalMinutes, 1)
-            $curSafety = @{
-                safeMode = $false; version = $script:NetFusionVersion; circuitBreakerOpen = $false
-                startTime = $engineStartTime.ToString('o')
-            }
-            if (Test-Path $safetyFile) {
-                try {
-                    $ex = Get-Content $safetyFile -Raw | ConvertFrom-Json
-                    if ($ex -and $ex.lastEvent -and $ex.lastEvent -ne 'Engine running normally') {
-                        $curSafety.lastEvent = [string]$ex.lastEvent
-                    }
-                } catch {}
-            }
-            $curSafety.uptime = $uptimeMin
-            $curSafety.lastEvent = 'Engine running normally'
-            Write-AtomicJson -Path $safetyFile -Data $curSafety -Depth 3
-        } catch {}
         
     } catch {
         Write-Host "  [Engine] Inner Loop Sync Error: $_" -ForegroundColor Red
@@ -395,16 +400,12 @@ while ($true) {
 }
 } finally {
     try {
-        if ($proxyProc -and -not $proxyProc.HasExited) {
-            Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-    try {
         if ($script:ExitRestoreEvent) {
             Unregister-Event -SubscriptionId $script:ExitRestoreEvent.SubscriptionId -Force -ErrorAction SilentlyContinue
         }
     } catch {}
     try {
-        Invoke-EngineNetworkRestore
+        $engineExitFile = Join-Path $projectDir 'logs\engine-exit.log'
+        Add-Content -Path $engineExitFile -Value ("{0} Engine exited; proxy/network state left active for watchdog or explicit STOP/SAFE cleanup." -f (Get-Date -Format 'o')) -ErrorAction SilentlyContinue
     } catch {}
 }

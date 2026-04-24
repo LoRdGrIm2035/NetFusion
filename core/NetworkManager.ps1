@@ -19,7 +19,7 @@ param(
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $projectDir = Split-Path $scriptDir -Parent
 $OutputFile = Join-Path $projectDir "config\interfaces.json"
-$script:AdapterCacheTtlSeconds = 60
+$script:AdapterCacheTtlSeconds = 10
 $script:LastInterfaceRefresh = $null
 $script:CachedInterfaces = @()
 
@@ -76,7 +76,8 @@ function Get-AdapterCapabilityScore {
 
     # Wi-Fi generation bonus (Wi-Fi 1 -> latest)
     switch ($WiFiGen) {
-        { $_ -ge 8 } { $score += 18 }  # Wi-Fi latest (802.11bn+)
+        { $_ -ge 8 } { $score += 18 }   # Wi-Fi latest (802.11bn+)
+        { $_ -eq 7.1 } { $score += 16 } # Wi-Fi 7E / 6GHz 802.11be
         7 { $score += 15 }              # Wi-Fi 7 (802.11be)
         { $_ -eq 6.1 } { $score += 12 } # Wi-Fi 6E (6GHz)
         6 { $score += 10 }              # Wi-Fi 6 (802.11ax)
@@ -132,6 +133,49 @@ function Get-LinkSpeedMbps {
     return 0
 }
 
+function Test-GatewayNeighborUsable {
+    param(
+        [int]$InterfaceIndex,
+        [string]$Gateway
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Gateway) -or $Gateway -eq '0.0.0.0') {
+        return $false
+    }
+
+    try {
+        $neighbor = Get-NetNeighbor -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -IPAddress $Gateway -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $neighbor) {
+            return $false
+        }
+
+        $state = [string]$neighbor.State
+        return ($state -in @('Reachable', 'Stale', 'Delay', 'Probe', 'Permanent'))
+    } catch {
+        return $false
+    }
+}
+
+function Select-BestDefaultRoute {
+    param(
+        [int]$InterfaceIndex,
+        [object[]]$Routes
+    )
+
+    if (-not $Routes -or $Routes.Count -eq 0) {
+        return $null
+    }
+
+    $ordered = @($Routes | Sort-Object RouteMetric, NextHop)
+    foreach ($route in $ordered) {
+        if (Test-GatewayNeighborUsable -InterfaceIndex $InterfaceIndex -Gateway ([string]$route.NextHop)) {
+            return $route
+        }
+    }
+
+    return @($ordered | Select-Object -First 1)
+}
+
 function Get-AllNetworkInterfaces {
     <#
     .SYNOPSIS
@@ -143,6 +187,7 @@ function Get-AllNetworkInterfaces {
     }
 
     $results = @()
+    $wlanInterfaceOutput = $null
 
     foreach ($adapter in $adapters) {
         # Determine adapter type
@@ -160,7 +205,7 @@ function Get-AllNetworkInterfaces {
         $linkSpeedMbps = Get-LinkSpeedMbps -LinkSpeed ([string]$adapter.LinkSpeed)
 
         # Detect Wi-Fi generation from adapter description
-        # Supports: Wi-Fi 1 (802.11b) through Wi-Fi 7 (802.11be) and latest (802.11bn+)
+        # Supports: Wi-Fi 1 (802.11b) through Wi-Fi 7/7E (802.11be) and latest (802.11bn+)
         $wifiGen = 0
         $wifiGenLabel = ''
         $ethernetGen = 0
@@ -169,6 +214,8 @@ function Get-AllNetworkInterfaces {
         if ($type -match 'WiFi') {
             if ($desc -match '802\.11bn|Wi-?Fi\s*8') {
                 $wifiGen = 8; $wifiGenLabel = 'Wi-Fi Latest (802.11bn+)'
+            } elseif ($desc -match '(?i)(Wi-?Fi\s*7E|802\.11be.*6\s*GHz|6\s*GHz.*802\.11be|BE200|BE202|KILLER.*BE|QCA6698|QCN9274|MT7925|RTL8922)') {
+                $wifiGen = 7.1; $wifiGenLabel = 'Wi-Fi 7E / 6GHz (802.11be)'
             } elseif ($desc -match '802\.11be|Wi-?Fi\s*7|BE200|BE202|KILLER.*BE|QCA6698|QCN9274|MT7925|RTL8922') {
                 $wifiGen = 7; $wifiGenLabel = 'Wi-Fi 7 (802.11be)'
             } elseif ($desc -match '6\s*GHz|Wi-?Fi\s*6E|AX2[01]1|AX411|AX1690|KILLER.*AX.*6E') {
@@ -223,12 +270,17 @@ function Get-AllNetworkInterfaces {
 
         # NetFusion-FIX-12: Capture link speed, IPv4, gateway, and DNS metadata during adapter discovery so routing and source-bound sockets use the selected WAN.
         # Get IP address
-        $ipInfo = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        $ipAddr = if ($ipInfo) { $ipInfo.IPAddress } else { $null }
+        $ipInfo = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } |
+            Sort-Object @{ Expression = { if ($_.PrefixOrigin -eq 'Dhcp') { 0 } elseif ($_.PrefixOrigin -eq 'Manual') { 1 } else { 2 } } }, SkipAsSource |
+            Select-Object -First 1
+        $ipAddr = if ($ipInfo) { [string]$ipInfo.IPAddress } else { $null }
 
-        # Get gateway
-        $routeInfo = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                     Sort-Object RouteMetric | Select-Object -First 1
+        # Get gateway. Prefer a reachable neighbor over a lower-metric dead
+        # gateway so a secondary adapter is not advertised to the proxy with
+        # an unusable next hop.
+        $routeCandidates = @(Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+        $routeInfo = Select-BestDefaultRoute -InterfaceIndex ([int]$adapter.ifIndex) -Routes $routeCandidates
         $gateway = if ($routeInfo) { $routeInfo.NextHop } else { $null }
 
         # Get interface metric
@@ -240,9 +292,11 @@ function Get-AllNetworkInterfaces {
         $ssid = ''
         if ($type -match 'WiFi') {
             try {
-                $netshOutput = netsh wlan show interfaces
+                if ($null -eq $wlanInterfaceOutput) {
+                    $wlanInterfaceOutput = netsh wlan show interfaces
+                }
                 $currentAdapter = $null
-                foreach ($line in ($netshOutput -split "`n")) {
+                foreach ($line in ($wlanInterfaceOutput -split "`n")) {
                     if ($line -match '^\s*Name\s*:\s*(.+)$') {
                         $currentAdapter = $Matches[1].Trim()
                     }
@@ -308,11 +362,12 @@ function Update-NetworkState {
         }
 
         $interfaces = Get-AllNetworkInterfaces
+        $interfaceList = @($interfaces)
         $data = @{
             timestamp  = (Get-Date).ToString('o')
             version    = '4.0'
-            count      = $interfaces.Count
-            interfaces = $interfaces
+            count      = $interfaceList.Count
+            interfaces = $interfaceList
         }
         Write-AtomicJson -Path $OutputFile -Data $data -Depth 4
         $script:CachedInterfaces = @($interfaces)

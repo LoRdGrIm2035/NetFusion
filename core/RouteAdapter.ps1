@@ -36,7 +36,7 @@ function Get-NetworkAdapters {
     if ($global:RouteAdapterDryRun) {
         Write-Output @()
     } else {
-        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier' } | Sort-Object InterfaceMetric | Select-Object -First 3
+        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|Loopback|Bluetooth|WAN Miniport|Tunnel|OpenVPN|WireGuard|TAP-Windows|Cisco AnyConnect|Tailscale|ZeroTier' } | Sort-Object InterfaceMetric
         Write-Output $adapters
     }
 }

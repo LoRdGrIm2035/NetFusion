@@ -17,12 +17,12 @@
                         "failThreshold":  3
                     },
     "proxy":  {
-                  "connectTimeout":  5000,
+                  "connectTimeout":  1500,
                   "maxRetries":  3,
                   "bufferSize":  262144,
-                  "minThreads":  64,
-                  "maxThreads":  256,
-                  "jobTimeoutSec":  120,
+                  "minThreads":  128,
+                  "maxThreads":  512,
+                  "jobTimeoutSec":  0,
                   "sessionAffinityTTL":  60,
                   "healthEndpoint":  true
               },
@@ -35,7 +35,7 @@
     "safety":  {
                    "watchdogInterval":  10,
                    "maxProxyRestarts":  3,
-                   "cpuThresholdPercent":  15,
+                   "cpuThresholdPercent":  85,
                    "memoryThresholdMB":  2000,
                    "circuitBreakerCooldownSec":  60,
                    "circuitBreaker": {

@@ -120,8 +120,10 @@ if ($config.proxyPort -eq $config.dashboardPort) {
 
 # Validate proxy settings
 if ($config.proxy) {
+    Check-Number $config.proxy 'connectTimeout' 500 15000 5000
+    Check-Number $config.proxy 'maxRetries' 1 32 3
     Check-Number $config.proxy 'minThreads' 4 128 64
-    Check-Number $config.proxy 'maxThreads' 8 256 256
+    Check-Number $config.proxy 'maxThreads' 8 512 256
     Check-Number $config.proxy 'bufferSize' 8192 1048576 262144
     Check-Number $config.proxy 'jobTimeoutSec' 10 3600 120
     Check-Number $config.proxy 'sessionAffinityTTL' 10 3600 60

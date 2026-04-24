@@ -2,16 +2,26 @@
 .SYNOPSIS
     NetFusionWatchdog v6.2 -- Failsafe Guardian
 .DESCRIPTION
-    A micro-script that ensures if NetFusionEngine dies or port 8080 stops responding,
-    the system instantly clears the Windows proxy, preventing the "No Internet" offline state.
+    A micro-script that ensures if the local proxy port stops responding, the
+    system clears the Windows proxy, preventing the "No Internet" offline state.
+    Engine process loss alone is not treated as fatal while the proxy is still
+    listening, because killing a working proxy creates avoidable throughput drops.
 #>
 
 [CmdletBinding()]
 param()
 
-$proxyPort = 8080
 $failCount = 0
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+$projectDir = Split-Path $scriptDir -Parent
+$configPath = Join-Path $projectDir 'config\config.json'
+$proxyPort = 8080
+try {
+    if (Test-Path $configPath) {
+        $watchdogConfig = Get-Content $configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($watchdogConfig.proxyPort) { $proxyPort = [int]$watchdogConfig.proxyPort }
+    }
+} catch {}
 $networkStateScript = Join-Path $scriptDir 'NetworkState.ps1'
 
 Write-Host "  [Watchdog] Active. Guarding proxy on port $proxyPort..." -ForegroundColor Cyan
@@ -48,7 +58,7 @@ while ($true) {
         }
     } catch {}
 
-    if (-not $isListening -or $engineProcs.Count -eq 0) {
+    if (-not $isListening) {
         $failCount++
         if ($failCount -ge 2) {
             Clear-Proxy
@@ -57,6 +67,9 @@ while ($true) {
             exit 1
         }
     } else {
+        if ($engineProcs.Count -eq 0) {
+            Write-Host "  [Watchdog] Engine process not detected, but proxy is alive; keeping internet path active." -ForegroundColor Yellow
+        }
         $failCount = 0
     }
 }

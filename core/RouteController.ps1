@@ -597,25 +597,28 @@ function Invoke-WatchMode {
 }
 
 # --- Main ---
-$interfaces = Get-ActiveInterfaces
+$script:IsRouteControllerDotSourced = $MyInvocation.InvocationName -eq '.'
+if (-not $script:IsRouteControllerDotSourced) {
+    $interfaces = Get-ActiveInterfaces
 
-switch ($Action) {
-    'Enable' {
-        Write-RouteEvent "Enabling load balancing on $($interfaces.Count) interfaces (v4.0 dynamic)"
-        Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
-        Add-SplitRoutes -Interfaces $interfaces
-        Show-Status
-    }
-    'Disable' {
-        Write-RouteEvent "Disabling load balancing"
-        Remove-SplitRoutes
-        Restore-AutoMetrics -Interfaces $interfaces
-        Show-Status
-    }
-    'Status' {
-        Show-Status
-    }
-    'Watch' {
-        Invoke-WatchMode
+    switch ($Action) {
+        'Enable' {
+            Write-RouteEvent "Enabling load balancing on $($interfaces.Count) interfaces (v4.0 dynamic)"
+            Set-DynamicMetrics -Interfaces $interfaces -BaseMetric $TargetMetric
+            Add-SplitRoutes -Interfaces $interfaces
+            Show-Status
+        }
+        'Disable' {
+            Write-RouteEvent "Disabling load balancing"
+            Remove-SplitRoutes
+            Restore-AutoMetrics -Interfaces $interfaces
+            Show-Status
+        }
+        'Status' {
+            Show-Status
+        }
+        'Watch' {
+            Invoke-WatchMode
+        }
     }
 }

@@ -13,9 +13,8 @@ config/routes-applied.flag
 config/safety-state.json
 
 # Logs
-logs/*.json
-logs/*.log
-logs/*.txt
+logs/*
+!logs/.gitkeep
 
 # OS / editor clutter
 .DS_Store

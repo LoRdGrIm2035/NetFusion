@@ -217,7 +217,9 @@ function Test-GatewayLatency {
 
 function Test-InternetLatency {
     param([string]$SourceIP, [string]$Target, [int]$Timeout)
-    # Method 1: ping with source binding
+    # Method 1: ping with source binding. Never fall back to an unbound probe here:
+    # an unbound success can run over the primary adapter and falsely mark a weak
+    # secondary adapter healthy, which then sends proxy flows into slow failover.
     try {
         $result = ping.exe -S $SourceIP -n 1 -w $Timeout $Target 2>$null
         $joined = $result -join "`n"
@@ -226,22 +228,14 @@ function Test-InternetLatency {
         if ($joined -match 'Reply from') { return 1 }
     } catch {}
 
-    # Method 2: plain ping (no source binding)
-    try {
-        $result = ping.exe -n 1 -w $Timeout $Target 2>$null
-        $joined = $result -join "`n"
-        if ($joined -match 'time[=<](\d+)\s*ms') { return [int]$Matches[1] }
-        if ($joined -match 'time[=<](\d+)') { return [int]$Matches[1] }
-        if ($joined -match 'Reply from') { return 1 }
-    } catch {}
-
-    # Method 3: TCP connect test to DNS port
+    # Method 2: TCP connect test bound to the same source IP.
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $tcpSocket = $tcp.Client
         $tcpSocket.NoDelay = $true
         $tcpSocket.ReceiveBufferSize = 1048576
         $tcpSocket.SendBufferSize = 1048576
+        $tcpSocket.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($SourceIP), 0))
         $asyncResult = $tcp.BeginConnect($Target, 53, $null, $null)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $connected = $asyncResult.AsyncWaitHandle.WaitOne($Timeout, $false)
@@ -477,7 +471,20 @@ function Measure-InterfaceHealth {
     $previousHealth = if ($script:lastHealthByAdapter.ContainsKey($name)) { $script:lastHealthByAdapter[$name] } else { $null }
 
     # --- Gateway latency ---
-    $gwLatencyMeasured = Test-GatewayLatency -Gateway $gateway
+    # Primary checks run frequently and must stay cheap. Gateway ICMP can be
+    # blocked or delayed by some routers, so reuse the last full sample during
+    # primary checks and let the bound TCP internet probe decide reachability.
+    if ($PrimaryOnly) {
+        if ($previousHealth -and $previousHealth.GatewayLatency) {
+            $gwLatencyMeasured = [double]$previousHealth.GatewayLatency
+        } elseif ($gateway) {
+            $gwLatencyMeasured = 1
+        } else {
+            $gwLatencyMeasured = 999
+        }
+    } else {
+        $gwLatencyMeasured = Test-GatewayLatency -Gateway $gateway
+    }
     $gwLatencyRaw = $gwLatencyMeasured
     if ($gwLatencyRaw -ge 999 -and $previousHealth -and $previousHealth.GatewayLatency) {
         $gwLatencyRaw = [double]$previousHealth.GatewayLatency
@@ -655,6 +662,8 @@ if (-not (Test-Path $LogFile)) {
 }
 
 function Update-HealthState {
+    param([switch]$PrimaryOnly)
+
     try {
         $now = Get-Date
         if ($script:lastHealthOutput -and $script:lastHealthRun -and (($now - $script:lastHealthRun).TotalSeconds -lt $script:healthPrimaryIntervalSeconds)) {
@@ -673,7 +682,7 @@ function Update-HealthState {
 
         $ifaceData = Get-Content $InterfacesFile -Raw | ConvertFrom-Json
         $healthResults = @()
-        $fullMeasurementDue = (-not $script:lastFullHealthRun) -or (($now - $script:lastFullHealthRun).TotalSeconds -ge $script:healthFullMeasurementIntervalSeconds)
+        $fullMeasurementDue = (-not $PrimaryOnly) -and ((-not $script:lastFullHealthRun) -or (($now - $script:lastFullHealthRun).TotalSeconds -ge $script:healthFullMeasurementIntervalSeconds))
 
         foreach ($iface in $ifaceData.interfaces) {
             $ifHash = @{}
@@ -700,7 +709,7 @@ function Update-HealthState {
                 primarySeconds = $script:healthPrimaryIntervalSeconds
                 fullSeconds = $script:healthFullMeasurementIntervalSeconds
             }
-            adapters    = $healthResults
+            adapters    = @($healthResults)
             degradation = $script:degradationWarnings
         }
         Write-AtomicJson -Path $HealthFile -Data $healthOutput -Depth 4

@@ -262,7 +262,8 @@ Configure:
 | `core/` | Engine, proxy, routing, telemetry, learning, watchdog, and cleanup modules |
 | `dashboard/` | Dashboard UI and server logic |
 | `config/config.default.json` | Default configuration shipped with the repository |
-| `test-*.ps1` and `fix-*.ps1` | Throughput validation, adapter repair, and debugging helpers |
+| `scripts/diagnostics/` | Legacy and focused diagnostic helpers |
+| `scripts/repair/` | Adapter repair helpers for known local recovery cases |
 
 </details>
 
@@ -399,9 +400,9 @@ Get-NetRoute -InterfaceAlias 'Wi-Fi 4' -DestinationPrefix '0.0.0.0/0'
 
 2. If the adapter has no valid address or no usable route, run one of the recovery helpers as Administrator.
 
-- `test-wifi4-fix.ps1`
-- `fix-wifi4.ps1`
-- `fix-wifi4-arp.ps1`
+- `scripts/repair/repair-wifi4-basic.ps1`
+- `scripts/repair/repair-wifi4-route.ps1`
+- `scripts/repair/repair-wifi4-arp.ps1`
 
 3. Re-check the adapter after the recovery script finishes.
 

@@ -352,6 +352,79 @@ function Test-RouteExists {
     return $null -ne $route
 }
 
+function Get-InterfaceSourceIPv4 {
+    param([int]$InterfaceIndex)
+
+    $ip = Get-NetIPAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' -and $_.SkipAsSource -eq $false } |
+        Sort-Object @{ Expression = { if ($_.PrefixOrigin -eq 'Dhcp') { 0 } elseif ($_.PrefixOrigin -eq 'Manual') { 1 } else { 2 } } } |
+        Select-Object -First 1
+
+    if ($ip) { return [string]$ip.IPAddress }
+    return $null
+}
+
+function Test-InterfaceGatewayUsable {
+    param(
+        [int]$InterfaceIndex,
+        [string]$Gateway,
+        [string]$SourceIP = $null
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Gateway) -or $Gateway -eq '0.0.0.0') {
+        return $false
+    }
+
+    try {
+        $neighbor = Get-NetNeighbor -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -IPAddress $Gateway -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($neighbor) {
+            $state = [string]$neighbor.State
+            if ($state -in @('Reachable', 'Stale', 'Delay', 'Probe', 'Permanent')) {
+                return $true
+            }
+            if ($state -in @('Incomplete', 'Unreachable')) {
+                return $false
+            }
+        }
+    } catch {}
+
+    if (-not $SourceIP) {
+        $SourceIP = Get-InterfaceSourceIPv4 -InterfaceIndex $InterfaceIndex
+    }
+    if (-not $SourceIP) {
+        return $false
+    }
+
+    try {
+        $null = & ping.exe -n 1 -w 350 -S $SourceIP $Gateway 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Select-ReachableDefaultRoute {
+    param(
+        [object]$Interface,
+        [object[]]$Routes
+    )
+
+    if (-not $Interface -or -not $Routes -or $Routes.Count -eq 0) {
+        return $null
+    }
+
+    $sourceIP = if ($Interface.IPAddress) { [string]$Interface.IPAddress } else { Get-InterfaceSourceIPv4 -InterfaceIndex ([int]$Interface.InterfaceIndex) }
+    $orderedRoutes = @($Routes | Sort-Object RouteMetric, NextHop)
+    foreach ($route in $orderedRoutes) {
+        $nextHop = Resolve-NextHopString -NextHop $route.NextHop
+        if (Test-InterfaceGatewayUsable -InterfaceIndex ([int]$Interface.InterfaceIndex) -Gateway $nextHop -SourceIP $sourceIP) {
+            return $route
+        }
+    }
+
+    return @($orderedRoutes | Select-Object -First 1)
+}
+
 function Get-RouteRecords {
     param(
         [string]$DestinationPrefix,
@@ -361,6 +434,86 @@ function Get-RouteRecords {
 
     @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -ErrorAction SilentlyContinue |
         Where-Object { [string]$_.NextHop -eq [string]$NextHop })
+}
+
+function Test-OriginalRouteRecord {
+    param(
+        [object]$State,
+        [string]$DestinationPrefix,
+        [int]$InterfaceIndex,
+        [string]$NextHop
+    )
+
+    if (-not $State -or -not $State.originalRoutes) {
+        return $false
+    }
+
+    return (@($State.originalRoutes | Where-Object {
+        [string]$_.DestinationPrefix -eq [string]$DestinationPrefix -and
+        [int]$_.InterfaceIndex -eq [int]$InterfaceIndex -and
+        [string](Resolve-NextHopString -NextHop $_.NextHop) -eq [string]$NextHop
+    }).Count -gt 0)
+}
+
+function Remove-CrossAdapterDefaultRoutes {
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+    if ($routes.Count -lt 2) {
+        return 0
+    }
+
+    $bestByInterface = @{}
+    foreach ($group in ($routes | Group-Object InterfaceIndex)) {
+        $best = @($group.Group | Sort-Object RouteMetric, NextHop | Select-Object -First 1)
+        if ($best.Count -gt 0) {
+            $bestByInterface[[int]$group.Name] = @{
+                InterfaceIndex = [int]$best[0].InterfaceIndex
+                InterfaceAlias = [string]$best[0].InterfaceAlias
+                NextHop = Resolve-NextHopString -NextHop $best[0].NextHop
+                RouteMetric = [int]$best[0].RouteMetric
+            }
+        }
+    }
+
+    $removed = 0
+    foreach ($route in $routes) {
+        $interfaceIndex = [int]$route.InterfaceIndex
+        if (-not $bestByInterface.ContainsKey($interfaceIndex)) {
+            continue
+        }
+
+        $best = $bestByInterface[$interfaceIndex]
+        $nextHop = Resolve-NextHopString -NextHop $route.NextHop
+        if (-not $nextHop -or $nextHop -eq $best.NextHop) {
+            continue
+        }
+
+        $sourceIP = Get-InterfaceSourceIPv4 -InterfaceIndex $interfaceIndex
+        $bestUsable = Test-InterfaceGatewayUsable -InterfaceIndex $interfaceIndex -Gateway ([string]$best.NextHop) -SourceIP $sourceIP
+        $routeUsable = Test-InterfaceGatewayUsable -InterfaceIndex $interfaceIndex -Gateway $nextHop -SourceIP $sourceIP
+        if ($routeUsable -and -not $bestUsable) {
+            continue
+        }
+
+        $pointsToAnotherAdapterGateway = $false
+        foreach ($other in $bestByInterface.Values) {
+            if ([int]$other.InterfaceIndex -ne $interfaceIndex -and [string]$other.NextHop -eq [string]$nextHop) {
+                $pointsToAnotherAdapterGateway = $true
+                break
+            }
+        }
+
+        if (-not $pointsToAnotherAdapterGateway) {
+            continue
+        }
+
+        try {
+            Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $interfaceIndex -NextHop $nextHop -Confirm:$false -ErrorAction SilentlyContinue
+            $removed++
+            Write-NetworkStateMessage ("Removed cross-adapter default route: {0} via {1}" -f $route.InterfaceAlias, $nextHop) 'Yellow'
+        } catch {}
+    }
+
+    return $removed
 }
 
 function Get-MinRouteMetric {
@@ -415,6 +568,8 @@ function Ensure-NetFusionRoutes {
         throw 'Original network state has not been saved yet.'
     }
 
+    [void](Remove-CrossAdapterDefaultRoutes)
+
     $interfaces = @(Get-LiveInterfaces | Where-Object { $_.Gateway })
     if ($interfaces.Count -lt 1) {
         throw 'No active interfaces with IPv4 gateways were found.'
@@ -455,8 +610,37 @@ function Ensure-NetFusionRoutes {
             Write-NetworkStateMessage "Failed to set metric for $($iface.Name): $($_.Exception.Message)" 'Yellow'
         }
 
-        foreach ($liveRoute in @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -ErrorAction SilentlyContinue)) {
-            Ensure-RouteMetric -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop ([string]$liveRoute.NextHop) -DesiredMetric $desiredRouteMetric
+        $liveRoutes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -ErrorAction SilentlyContinue)
+        $selectedRoute = Select-ReachableDefaultRoute -Interface $iface -Routes $liveRoutes
+        if ($selectedRoute) {
+            $selectedGateway = Resolve-NextHopString -NextHop $selectedRoute.NextHop
+            if ($selectedGateway -and $selectedGateway -ne [string]$iface.Gateway) {
+                Write-NetworkStateMessage "Using reachable gateway for $($iface.Name): $selectedGateway (was $($iface.Gateway))" 'Yellow'
+                $iface.Gateway = $selectedGateway
+            }
+        }
+
+        foreach ($liveRoute in $liveRoutes) {
+            $liveNextHop = Resolve-NextHopString -NextHop $liveRoute.NextHop
+            if ($liveNextHop -and $iface.Gateway -and $liveNextHop -ne [string]$iface.Gateway -and -not (Test-OriginalRouteRecord -State $state -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $liveNextHop)) {
+                try {
+                    Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $liveNextHop -Confirm:$false -ErrorAction SilentlyContinue
+                    Write-NetworkStateMessage "Removed stale secondary default route: $($iface.Name) via $liveNextHop" 'Yellow'
+                } catch {}
+                continue
+            }
+
+            if ($liveNextHop -and $liveNextHop -ne [string]$iface.Gateway) {
+                $sourceIP = if ($iface.IPAddress) { [string]$iface.IPAddress } else { Get-InterfaceSourceIPv4 -InterfaceIndex ([int]$iface.InterfaceIndex) }
+                $usable = Test-InterfaceGatewayUsable -InterfaceIndex ([int]$iface.InterfaceIndex) -Gateway $liveNextHop -SourceIP $sourceIP
+                if (-not $usable) {
+                    Ensure-RouteMetric -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $liveNextHop -DesiredMetric ($desiredRouteMetric + 500)
+                    Write-NetworkStateMessage "Demoted unreachable secondary gateway: $($iface.Name) via $liveNextHop" 'Yellow'
+                    continue
+                }
+            }
+
+            Ensure-RouteMetric -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $liveNextHop -DesiredMetric $desiredRouteMetric
         }
 
         if (-not (Test-RouteExists -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $iface.InterfaceIndex -NextHop $iface.Gateway)) {
@@ -643,15 +827,22 @@ function Restore-OriginalDhcpSettings {
                 continue
             }
 
+            $manualIps = @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' })
+            $currentDhcp = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            $needsDhcpRepair = ($manualIps.Count -gt 0) -or (-not $currentDhcp) -or ([string]$currentDhcp.Dhcp -notmatch 'Enabled|True')
+
+            if (-not $needsDhcpRepair) {
+                continue
+            }
+
             # NetFusion-FIX-19: If a previous session forced a static IPv4 during repair, revert DHCP-enabled interfaces back to DHCP.
-            foreach ($manualIp in @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' })) {
+            foreach ($manualIp in $manualIps) {
                 try {
                     Remove-NetIPAddress -InterfaceIndex $idx -IPAddress $manualIp.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
                 } catch {}
             }
 
             Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
-            Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
 
             if ($dhcpEntry.InterfaceAlias) {
                 try { ipconfig /renew "$($dhcpEntry.InterfaceAlias)" | Out-Null } catch {}
@@ -680,12 +871,42 @@ function Remove-AddedRoutes {
     }
 }
 
-function Test-DirectInternet {
+function Test-TcpInternetTarget {
+    param(
+        [string]$TargetHost,
+        [int]$Port,
+        [int]$TimeoutMs = 1200
+    )
+
+    $tcp = $null
     try {
-        if (Test-Connection -ComputerName '8.8.8.8' -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+        $tcp = [System.Net.Sockets.TcpClient]::new([System.Net.Sockets.AddressFamily]::InterNetwork)
+        $tcp.NoDelay = $true
+        $tcp.ReceiveTimeout = $TimeoutMs
+        $tcp.SendTimeout = $TimeoutMs
+        $ar = $tcp.BeginConnect($TargetHost, $Port, $null, $null)
+        if ($ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            try { $tcp.EndConnect($ar) } catch {}
+            return $tcp.Connected
+        }
+    } catch {
+    } finally {
+        try { if ($tcp) { $tcp.Close() } } catch {}
+    }
+
+    return $false
+}
+
+function Test-DirectInternet {
+    foreach ($target in @(
+        @{ Host = '1.1.1.1'; Port = 80 },
+        @{ Host = '8.8.8.8'; Port = 53 },
+        @{ Host = '9.9.9.9'; Port = 53 }
+    )) {
+        if (Test-TcpInternetTarget -TargetHost $target.Host -Port $target.Port) {
             return $true
         }
-    } catch {}
+    }
 
     try {
         if (Test-Connection -ComputerName '1.1.1.1' -Count 1 -Quiet -ErrorAction SilentlyContinue) {
@@ -699,13 +920,42 @@ function Test-DirectInternet {
 function Test-ProxyInternet {
     param([int]$Port = 8080)
 
-    foreach ($uri in @('https://example.com/', 'http://example.com/')) {
+    foreach ($target in @(
+        @{ Uri = 'http://www.msftconnecttest.com/connecttest.txt'; Host = 'www.msftconnecttest.com' },
+        @{ Uri = 'http://example.com/'; Host = 'example.com' }
+    )) {
+        $tcp = $null
         try {
-            $response = Invoke-WebRequest -Uri $uri -Proxy ("http://127.0.0.1:{0}" -f $Port) -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $tcp.NoDelay = $true
+            $tcp.ReceiveTimeout = 5000
+            $tcp.SendTimeout = 5000
+            $ar = $tcp.BeginConnect('127.0.0.1', $Port, $null, $null)
+            if (-not $ar.AsyncWaitHandle.WaitOne(1500, $false)) {
+                try { $tcp.Close() } catch {}
+                continue
+            }
+            try { $tcp.EndConnect($ar) } catch {}
+
+            $stream = $tcp.GetStream()
+            $requestText = "GET $($target.Uri) HTTP/1.1`r`nHost: $($target.Host)`r`nConnection: close`r`n`r`n"
+            $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($requestText)
+            $stream.Write($requestBytes, 0, $requestBytes.Length)
+
+            $buffer = New-Object byte[] 256
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) {
+                continue
+            }
+
+            $responseHead = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            if ($responseHead -match '^HTTP/\d(?:\.\d)?\s+([234]\d\d)') {
                 return $true
             }
-        } catch {}
+        } catch {
+        } finally {
+            try { if ($tcp) { $tcp.Close() } } catch {}
+        }
     }
 
     return $false
@@ -738,6 +988,8 @@ function Invoke-NetworkRestore {
 }
 
 function Save-OriginalNetworkState {
+    [void](Remove-CrossAdapterDefaultRoutes)
+
     $state = @{
         version = '6.2'
         savedAt = [System.DateTimeOffset]::UtcNow.ToString('o')
