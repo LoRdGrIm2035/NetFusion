@@ -124,7 +124,7 @@ if ($config.proxy) {
     Check-Number $config.proxy 'connectIdleTimeoutSec' 15 300 45
     Check-Number $config.proxy 'maxRetries' 1 32 3
     Check-Number $config.proxy 'minThreads' 4 128 64
-    Check-Number $config.proxy 'maxThreads' 8 512 256
+    Check-Number $config.proxy 'maxThreads' 8 5000 256
     Check-Number $config.proxy 'bufferSize' 8192 1048576 262144
     # 0 disables forced relay age killing. This is intentional for long
     # downloads/uploads; active proxy streams must not be stopped just because

@@ -242,6 +242,40 @@ function Get-TxBytes {
     return 0L
 }
 
+function New-SpeedTestGate {
+    param([string]$Name)
+
+    $id = "{0}-{1}" -f $PID, ([guid]::NewGuid().ToString('N'))
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $readyDir = Join-Path $tempRoot ("netfusion-{0}-ready-{1}" -f $Name, $id)
+    New-Item -ItemType Directory -Path $readyDir -Force | Out-Null
+
+    return [pscustomobject]@{
+        GatePath = Join-Path $tempRoot ("netfusion-{0}-gate-{1}.go" -f $Name, $id)
+        ReadyDir = $readyDir
+    }
+}
+
+function Wait-SpeedJobsReady {
+    param(
+        [string]$ReadyDir,
+        [int]$Expected,
+        [int]$TimeoutSec = 20
+    )
+
+    $readyWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $readyCount = 0
+    while ($readyWatch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $readyCount = @(
+            Get-ChildItem -LiteralPath $ReadyDir -Filter '*.ready' -ErrorAction SilentlyContinue
+        ).Count
+        if ($readyCount -ge $Expected) { break }
+        Start-Sleep -Milliseconds 100
+    }
+
+    return $readyCount
+}
+
 $adapters = @(Get-UsableAdapters)
 if ($AdapterNames.Count -gt 0) {
     $nameSet = @($AdapterNames | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -249,8 +283,26 @@ if ($AdapterNames.Count -gt 0) {
 }
 
 $adapters = @($adapters | Sort-Object @{ Expression = { -1 * [double]$_.LinkSpeedMbps } }, Name)
-$effectiveDownloadUrls = if ($DownloadUrls.Count -gt 0) { @($DownloadUrls) } else { @($TestUrl) }
-$effectiveUploadUrls = if ($UploadUrls.Count -gt 0) { @($UploadUrls) } else { @($UploadUrl) }
+
+$effectiveDownloadUrls = @()
+if ($DownloadUrls.Count -gt 0) {
+    foreach ($url in $DownloadUrls) {
+        if (-not [string]::IsNullOrWhiteSpace($url)) { $effectiveDownloadUrls += [string]$url }
+    }
+}
+if ($effectiveDownloadUrls.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($TestUrl)) {
+    $effectiveDownloadUrls += [string]$TestUrl
+}
+
+$effectiveUploadUrls = @()
+if ($UploadUrls.Count -gt 0) {
+    foreach ($url in $UploadUrls) {
+        if (-not [string]::IsNullOrWhiteSpace($url)) { $effectiveUploadUrls += [string]$url }
+    }
+}
+if ($effectiveUploadUrls.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($UploadUrl)) {
+    $effectiveUploadUrls += [string]$UploadUrl
+}
 
 Write-Host "`n--- STEP 1: Adapter Check ---" -ForegroundColor Yellow
 if ($adapters.Count -lt 2) {
@@ -282,7 +334,7 @@ $directResults = @{}
 foreach ($adapter in $adapters) {
     Write-Host "  Testing $($adapter.Name) ($($adapter.IPAddress))..." -NoNewline
     try {
-        $result = Invoke-BoundCurlDownload -LocalIP $adapter.IPAddress -Url $effectiveDownloadUrls[0]
+        $result = Invoke-BoundCurlDownload -LocalIP $adapter.IPAddress -Url (Select-TestUrl -Urls $effectiveDownloadUrls -Index 0)
         $mbps = if ($result.Seconds -gt 0) { [math]::Round(($result.Bytes * 8 / 1MB) / $result.Seconds, 2) } else { 0 }
         $directResults[$adapter.Name] = $mbps
         Write-Host " $mbps Mbps ($([math]::Round($result.Bytes/1MB, 1)) MB in $([math]::Round($result.Seconds, 2))s, source $($result.LocalIP))" -ForegroundColor Green
@@ -305,7 +357,7 @@ $directUploadResults = @{}
 foreach ($adapter in $adapters) {
     Write-Host "  Testing $($adapter.Name) ($($adapter.IPAddress)) upload..." -NoNewline
     try {
-        $uploadResult = Invoke-BoundCurlUpload -LocalIP $adapter.IPAddress -Url (Add-CacheBuster -Url $effectiveUploadUrls[0]) -PayloadPath $uploadPayloadPath
+        $uploadResult = Invoke-BoundCurlUpload -LocalIP $adapter.IPAddress -Url (Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveUploadUrls -Index 0)) -PayloadPath $uploadPayloadPath
         $uploadMbps = if ($uploadResult.Seconds -gt 0) { [math]::Round(($uploadResult.Bytes * 8 / 1MB) / $uploadResult.Seconds, 2) } else { 0 }
         $directUploadResults[$adapter.Name] = $uploadMbps
         Write-Host " $uploadMbps Mbps ($([math]::Round($uploadResult.Bytes/1MB, 1)) MB in $([math]::Round($uploadResult.Seconds, 2))s, source $($uploadResult.LocalIP))" -ForegroundColor Green
@@ -321,34 +373,50 @@ if ($Connections -le 0) {
 }
 Write-Host "  Using $Connections parallel connections through proxy 127.0.0.1:$ProxyPort"
 
+$proxyAddr = "http://127.0.0.1:$ProxyPort"
+$downloadGate = New-SpeedTestGate -Name 'download'
+$jobs = 1..$Connections | ForEach-Object {
+    $jobIndex = $_
+    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveDownloadUrls -Index ($_ - 1))
+    $readyPath = Join-Path $downloadGate.ReadyDir ("{0}.ready" -f $jobIndex)
+    Start-Job -ScriptBlock {
+        param($url, $proxy, $gatePath, $readyPath)
+        try {
+            Set-Content -LiteralPath $readyPath -Value 'ready' -NoNewline -Force -ErrorAction SilentlyContinue
+            while (-not (Test-Path -LiteralPath $gatePath)) {
+                Start-Sleep -Milliseconds 10
+            }
+
+            $curlCmd = Get-Command curl.exe -ErrorAction Stop
+            $format = "SIZE=%{size_download};TIME=%{time_total};CODE=%{http_code}"
+            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 90 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format $url 2>&1
+            $text = ($output | Out-String).Trim()
+            if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
+            $bytes = [int64]$Matches[1]
+            if ($LASTEXITCODE -ne 0) { return $bytes }
+            $code = [int]$Matches[3]
+            if ($code -lt 200 -or $code -ge 400) { return 0L }
+            return $bytes
+        } catch {
+            return 0L
+        }
+    } -ArgumentList $jobUrl, $proxyAddr, $downloadGate.GatePath, $readyPath
+}
+
+Write-Host "  Downloading..." -NoNewline
+Write-Host " waiting for workers..." -NoNewline
+$downloadReady = Wait-SpeedJobsReady -ReadyDir $downloadGate.ReadyDir -Expected $Connections
+if ($downloadReady -lt $Connections) {
+    Write-Host " $downloadReady/$Connections ready..." -NoNewline
+}
+
 $before = @{}
 foreach ($adapter in $adapters) {
     $before[$adapter.Name] = Get-RxBytes -Name $adapter.Name
 }
 
 $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
-$proxyAddr = "http://127.0.0.1:$ProxyPort"
-$jobs = 1..$Connections | ForEach-Object {
-    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveDownloadUrls -Index ($_ - 1))
-    Start-Job -ScriptBlock {
-        param($url, $proxy)
-        try {
-            $curlCmd = Get-Command curl.exe -ErrorAction Stop
-            $format = "SIZE=%{size_download};TIME=%{time_total};CODE=%{http_code}"
-            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 90 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format $url 2>&1
-            $text = ($output | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) { return 0L }
-            if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
-            $code = [int]$Matches[3]
-            if ($code -lt 200 -or $code -ge 400) { return 0L }
-            return [int64]$Matches[1]
-        } catch {
-            return 0L
-        }
-    } -ArgumentList $jobUrl, $proxyAddr
-}
-
-Write-Host "  Downloading..." -NoNewline
+Set-Content -LiteralPath $downloadGate.GatePath -Value 'go' -NoNewline -Force
 $null = Wait-Job -Job $jobs -Timeout 90
 $swTotal.Stop()
 
@@ -363,6 +431,8 @@ foreach ($job in $jobs) {
     if ($result) { $totalBytes += [int64]$result }
 }
 Remove-Job -Job $jobs -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $downloadGate.GatePath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $downloadGate.ReadyDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host " Done!" -ForegroundColor Green
 
 $after = @{}
@@ -429,33 +499,50 @@ if ($bestDirectMbps -gt 0) {
 }
 
 Write-Host "`n--- STEP 6: Combined Proxy Upload Throughput Test ---" -ForegroundColor Yellow
+
+$uploadGate = New-SpeedTestGate -Name 'upload'
+$uploadJobs = 1..$Connections | ForEach-Object {
+    $jobIndex = $_
+    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveUploadUrls -Index ($_ - 1))
+    $readyPath = Join-Path $uploadGate.ReadyDir ("{0}.ready" -f $jobIndex)
+    Start-Job -ScriptBlock {
+        param($url, $proxy, $payload, $gatePath, $readyPath)
+        try {
+            Set-Content -LiteralPath $readyPath -Value 'ready' -NoNewline -Force -ErrorAction SilentlyContinue
+            while (-not (Test-Path -LiteralPath $gatePath)) {
+                Start-Sleep -Milliseconds 10
+            }
+
+            $curlCmd = Get-Command curl.exe -ErrorAction Stop
+            $format = "SIZE=%{size_upload};TIME=%{time_total};CODE=%{http_code}"
+            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 120 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format -X POST --data-binary "@$payload" $url 2>&1
+            $text = ($output | Out-String).Trim()
+            if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
+            $bytes = [int64]$Matches[1]
+            if ($LASTEXITCODE -ne 0) { return $bytes }
+            $code = [int]$Matches[3]
+            if ($code -lt 200 -or $code -ge 400) { return 0L }
+            return $bytes
+        } catch {
+            return 0L
+        }
+    } -ArgumentList $jobUrl, $proxyAddr, $uploadPayloadPath, $uploadGate.GatePath, $readyPath
+}
+
+Write-Host "  Uploading..." -NoNewline
+Write-Host " waiting for workers..." -NoNewline
+$uploadReady = Wait-SpeedJobsReady -ReadyDir $uploadGate.ReadyDir -Expected $Connections
+if ($uploadReady -lt $Connections) {
+    Write-Host " $uploadReady/$Connections ready..." -NoNewline
+}
+
 $beforeTx = @{}
 foreach ($adapter in $adapters) {
     $beforeTx[$adapter.Name] = Get-TxBytes -Name $adapter.Name
 }
 
 $swUploadTotal = [System.Diagnostics.Stopwatch]::StartNew()
-$uploadJobs = 1..$Connections | ForEach-Object {
-    $jobUrl = Add-CacheBuster -Url (Select-TestUrl -Urls $effectiveUploadUrls -Index ($_ - 1))
-    Start-Job -ScriptBlock {
-        param($url, $proxy, $payload)
-        try {
-            $curlCmd = Get-Command curl.exe -ErrorAction Stop
-            $format = "SIZE=%{size_upload};TIME=%{time_total};CODE=%{http_code}"
-            $output = & $curlCmd.Source -x $proxy --connect-timeout 5 --max-time 120 --speed-time 20 --speed-limit 1024 -L -o NUL -sS -w $format -X POST --data-binary "@$payload" $url 2>&1
-            $text = ($output | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) { return 0L }
-            if ($text -notmatch 'SIZE=(\d+);TIME=([0-9.]+);CODE=(\d+)') { return 0L }
-            $code = [int]$Matches[3]
-            if ($code -lt 200 -or $code -ge 400) { return 0L }
-            return [int64]$Matches[1]
-        } catch {
-            return 0L
-        }
-    } -ArgumentList $jobUrl, $proxyAddr, $uploadPayloadPath
-}
-
-Write-Host "  Uploading..." -NoNewline
+Set-Content -LiteralPath $uploadGate.GatePath -Value 'go' -NoNewline -Force
 $null = Wait-Job -Job $uploadJobs -Timeout 120
 $swUploadTotal.Stop()
 
@@ -470,6 +557,8 @@ foreach ($job in $uploadJobs) {
     if ($uploadJobResult) { $totalUploadBytes += [int64]$uploadJobResult }
 }
 Remove-Job -Job $uploadJobs -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $uploadGate.GatePath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $uploadGate.ReadyDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host " Done!" -ForegroundColor Green
 
 $afterTx = @{}

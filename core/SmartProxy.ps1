@@ -451,6 +451,7 @@ $global:ProxyState = [hashtable]::Synchronized(@{
     proxyLastRateSample = [hashtable]::Synchronized(@{})
     adapterFailureStreak = [hashtable]::Synchronized(@{})
     adapterCooldownUntil = [hashtable]::Synchronized(@{})
+    adapterEndpoints = [hashtable]::Synchronized(@{})
     uploadHostHints  = [hashtable]::Synchronized(@{})
     uploadHintTTL    = 300
     activeConns      = @{}
@@ -624,6 +625,63 @@ function Write-ProxyEvent {
     } catch {}
 }
 
+function Reset-AdapterRuntimeStateForEndpointChanges {
+    param(
+        [object]$State,
+        [object[]]$Adapters
+    )
+
+    if (-not $State -or -not $Adapters) {
+        return
+    }
+
+    $currentNames = @{}
+    $changedNames = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($adapter in @($Adapters)) {
+        if (-not $adapter -or [string]::IsNullOrWhiteSpace([string]$adapter.Name)) {
+            continue
+        }
+
+        $name = [string]$adapter.Name
+        $currentNames[$name] = $true
+        $endpoint = "{0}|{1}|{2}" -f ([string]$adapter.IP), ([string]$adapter.InterfaceIndex), ([string]$adapter.Gateway)
+
+        $previousEndpoint = $null
+        if ($State.adapterEndpoints.ContainsKey($name)) {
+            $previousEndpoint = [string]$State.adapterEndpoints[$name]
+        }
+
+        if ($previousEndpoint -and $previousEndpoint -ne $endpoint) {
+            $changedNames.Add($name)
+            try { [void]$State.adapterFailureStreak.Remove($name) } catch {}
+            try { [void]$State.adapterCooldownUntil.Remove($name) } catch {}
+            try { [void]$State.bandwidthEstimates.Remove($name) } catch {}
+            try { [void]$State.uploadBandwidthEstimates.Remove($name) } catch {}
+            try { [void]$State.proxyCapacityMbps.Remove($name) } catch {}
+            try { [void]$State.proxyRateMbps.Remove($name) } catch {}
+            try { [void]$State.proxyLastRateSample.Remove($name) } catch {}
+        }
+
+        $State.adapterEndpoints[$name] = $endpoint
+    }
+
+    foreach ($knownName in @($State.adapterEndpoints.Keys)) {
+        if (-not $currentNames.ContainsKey([string]$knownName)) {
+            $changedNames.Add([string]$knownName)
+            try { [void]$State.adapterEndpoints.Remove([string]$knownName) } catch {}
+            try { [void]$State.adapterFailureStreak.Remove([string]$knownName) } catch {}
+            try { [void]$State.adapterCooldownUntil.Remove([string]$knownName) } catch {}
+        }
+    }
+
+    if ($changedNames.Count -gt 0) {
+        $uniqueNames = @($changedNames | Select-Object -Unique)
+        [void](Clear-SessionAffinityForAdapters -State $State -AdapterNames $uniqueNames)
+        Write-ProxyEvent ("Adapter endpoint changed; cleared stale runtime state for {0}" -f ($uniqueNames -join ', '))
+    }
+}
+
 function Get-ProxyAdapters {
     $adapters = @()
     $ifFile = $global:ProxyState.interfacesFile
@@ -795,7 +853,9 @@ function Update-ProxyRateSnapshot {
 
 function Update-AdaptersAndWeights {
     $s = $global:ProxyState
-    $s.adapters = @(Get-ProxyAdapters)
+    $freshAdapters = @(Get-ProxyAdapters)
+    Reset-AdapterRuntimeStateForEndpointChanges -State $s -Adapters $freshAdapters
+    $s.adapters = $freshAdapters
     Update-ProxyRateSnapshot -State $s -Adapters $s.adapters
 
     # v5.0: Check safe mode
