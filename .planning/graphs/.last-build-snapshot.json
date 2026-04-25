@@ -1,0 +1,2140 @@
+{
+  "version": 1,
+  "timestamp": "2026-04-25T22:06:54.719Z",
+  "nodes": [
+    {
+      "label": "Install-Service.ps1",
+      "file_type": "code",
+      "source_file": "Install-Service.ps1",
+      "source_location": "L1",
+      "id": "install_service_ps1",
+      "community": 15,
+      "norm_label": "install-service.ps1"
+    },
+    {
+      "label": "Setup-NetFusion.ps1",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L1",
+      "id": "setup_netfusion_ps1",
+      "community": 7,
+      "norm_label": "setup-netfusion.ps1"
+    },
+    {
+      "label": "Write-Step()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L13",
+      "id": "setup_netfusion_write_step",
+      "community": 7,
+      "norm_label": "write-step()"
+    },
+    {
+      "label": "Write-Ok()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L19",
+      "id": "setup_netfusion_write_ok",
+      "community": 7,
+      "norm_label": "write-ok()"
+    },
+    {
+      "label": "Write-Warn()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L24",
+      "id": "setup_netfusion_write_warn",
+      "community": 7,
+      "norm_label": "write-warn()"
+    },
+    {
+      "label": "Write-Info()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L29",
+      "id": "setup_netfusion_write_info",
+      "community": 7,
+      "norm_label": "write-info()"
+    },
+    {
+      "label": "Test-IsAdmin()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L34",
+      "id": "setup_netfusion_test_isadmin",
+      "community": 7,
+      "norm_label": "test-isadmin()"
+    },
+    {
+      "label": "Get-UsableAdapters()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L40",
+      "id": "setup_netfusion_get_usableadapters",
+      "community": 7,
+      "norm_label": "get-usableadapters()"
+    },
+    {
+      "label": "Show-ProxyGuidance()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L54",
+      "id": "setup_netfusion_show_proxyguidance",
+      "community": 7,
+      "norm_label": "show-proxyguidance()"
+    },
+    {
+      "label": "Show-MetricGuidance()",
+      "file_type": "code",
+      "source_file": "Setup-NetFusion.ps1",
+      "source_location": "L71",
+      "id": "setup_netfusion_show_metricguidance",
+      "community": 7,
+      "norm_label": "show-metricguidance()"
+    },
+    {
+      "label": "test-combined-speed.ps1",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L1",
+      "id": "test_combined_speed_ps1",
+      "community": 5,
+      "norm_label": "test-combined-speed.ps1"
+    },
+    {
+      "label": "Get-DashboardStats()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L22",
+      "id": "test_combined_speed_get_dashboardstats",
+      "community": 5,
+      "norm_label": "get-dashboardstats()"
+    },
+    {
+      "label": "Get-LinkSpeedMbps()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L34",
+      "id": "test_combined_speed_get_linkspeedmbps",
+      "community": 5,
+      "norm_label": "get-linkspeedmbps()"
+    },
+    {
+      "label": "Add-CacheBuster()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L48",
+      "id": "test_combined_speed_add_cachebuster",
+      "community": 5,
+      "norm_label": "add-cachebuster()"
+    },
+    {
+      "label": "Select-TestUrl()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L58",
+      "id": "test_combined_speed_select_testurl",
+      "community": 5,
+      "norm_label": "select-testurl()"
+    },
+    {
+      "label": "Get-UsableAdapters()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L72",
+      "id": "test_combined_speed_get_usableadapters",
+      "community": 5,
+      "norm_label": "get-usableadapters()"
+    },
+    {
+      "label": "Invoke-BoundCurlDownload()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L136",
+      "id": "test_combined_speed_invoke_boundcurldownload",
+      "community": 5,
+      "norm_label": "invoke-boundcurldownload()"
+    },
+    {
+      "label": "Invoke-BoundCurlUpload()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L183",
+      "id": "test_combined_speed_invoke_boundcurlupload",
+      "community": 5,
+      "norm_label": "invoke-boundcurlupload()"
+    },
+    {
+      "label": "Get-RxBytes()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L231",
+      "id": "test_combined_speed_get_rxbytes",
+      "community": 5,
+      "norm_label": "get-rxbytes()"
+    },
+    {
+      "label": "Get-TxBytes()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L238",
+      "id": "test_combined_speed_get_txbytes",
+      "community": 5,
+      "norm_label": "get-txbytes()"
+    },
+    {
+      "label": "New-SpeedTestGate()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L245",
+      "id": "test_combined_speed_new_speedtestgate",
+      "community": 5,
+      "norm_label": "new-speedtestgate()"
+    },
+    {
+      "label": "Wait-SpeedJobsReady()",
+      "file_type": "code",
+      "source_file": "test-combined-speed.ps1",
+      "source_location": "L259",
+      "id": "test_combined_speed_wait_speedjobsready",
+      "community": 5,
+      "norm_label": "wait-speedjobsready()"
+    },
+    {
+      "label": "Cleanup-OnCrash.ps1",
+      "file_type": "code",
+      "source_file": "core\\Cleanup-OnCrash.ps1",
+      "source_location": "L1",
+      "id": "core_cleanup_oncrash_ps1",
+      "community": 16,
+      "norm_label": "cleanup-oncrash.ps1"
+    },
+    {
+      "label": "ConfigValidator.ps1",
+      "file_type": "code",
+      "source_file": "core\\ConfigValidator.ps1",
+      "source_location": "L1",
+      "id": "core_configvalidator_ps1",
+      "community": 10,
+      "norm_label": "configvalidator.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\ConfigValidator.ps1",
+      "source_location": "L12",
+      "id": "configvalidator_write_atomicjson",
+      "community": 10,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Check-Number()",
+      "file_type": "code",
+      "source_file": "core\\ConfigValidator.ps1",
+      "source_location": "L54",
+      "id": "configvalidator_check_number",
+      "community": 10,
+      "norm_label": "check-number()"
+    },
+    {
+      "label": "Check-Bool()",
+      "file_type": "code",
+      "source_file": "core\\ConfigValidator.ps1",
+      "source_location": "L74",
+      "id": "configvalidator_check_bool",
+      "community": 10,
+      "norm_label": "check-bool()"
+    },
+    {
+      "label": "Check-Enum()",
+      "file_type": "code",
+      "source_file": "core\\ConfigValidator.ps1",
+      "source_location": "L93",
+      "id": "configvalidator_check_enum",
+      "community": 10,
+      "norm_label": "check-enum()"
+    },
+    {
+      "label": "InterfaceMonitor.ps1",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L1",
+      "id": "core_interfacemonitor_ps1",
+      "community": 4,
+      "norm_label": "interfacemonitor.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L80",
+      "id": "interfacemonitor_write_atomicjson",
+      "community": 4,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Repair-EventsFile()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L102",
+      "id": "interfacemonitor_repair_eventsfile",
+      "community": 4,
+      "norm_label": "repair-eventsfile()"
+    },
+    {
+      "label": "Get-ConfiguredEwmaAlphaMap()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L120",
+      "id": "interfacemonitor_get_configuredewmaalphamap",
+      "community": 4,
+      "norm_label": "get-configuredewmaalphamap()"
+    },
+    {
+      "label": "Get-EwmaAlphaForMode()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L143",
+      "id": "interfacemonitor_get_ewmaalphaformode",
+      "community": 4,
+      "norm_label": "get-ewmaalphaformode()"
+    },
+    {
+      "label": "Write-Event()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L165",
+      "id": "interfacemonitor_write_event",
+      "community": 4,
+      "norm_label": "write-event()"
+    },
+    {
+      "label": "Test-GatewayLatency()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L205",
+      "id": "interfacemonitor_test_gatewaylatency",
+      "community": 4,
+      "norm_label": "test-gatewaylatency()"
+    },
+    {
+      "label": "Test-InternetLatency()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L218",
+      "id": "interfacemonitor_test_internetlatency",
+      "community": 4,
+      "norm_label": "test-internetlatency()"
+    },
+    {
+      "label": "Test-BoundTcpLatency()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L250",
+      "id": "interfacemonitor_test_boundtcplatency",
+      "community": 4,
+      "norm_label": "test-boundtcplatency()"
+    },
+    {
+      "label": "Update-EWMALatency()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L289",
+      "id": "interfacemonitor_update_ewmalatency",
+      "community": 4,
+      "norm_label": "update-ewmalatency()"
+    },
+    {
+      "label": "Update-LatencyHistory()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L312",
+      "id": "interfacemonitor_update_latencyhistory",
+      "community": 4,
+      "norm_label": "update-latencyhistory()"
+    },
+    {
+      "label": "Measure-Jitter()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L328",
+      "id": "interfacemonitor_measure_jitter",
+      "community": 4,
+      "norm_label": "measure-jitter()"
+    },
+    {
+      "label": "Update-HealthTrend()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L347",
+      "id": "interfacemonitor_update_healthtrend",
+      "community": 4,
+      "norm_label": "update-healthtrend()"
+    },
+    {
+      "label": "Test-PredictiveDegradation()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L376",
+      "id": "interfacemonitor_test_predictivedegradation",
+      "community": 4,
+      "norm_label": "test-predictivedegradation()"
+    },
+    {
+      "label": "Get-StabilityScore()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L408",
+      "id": "interfacemonitor_get_stabilityscore",
+      "community": 4,
+      "norm_label": "get-stabilityscore()"
+    },
+    {
+      "label": "Update-SuccessRate()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L430",
+      "id": "interfacemonitor_update_successrate",
+      "community": 4,
+      "norm_label": "update-successrate()"
+    },
+    {
+      "label": "Measure-InterfaceHealth()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L461",
+      "id": "interfacemonitor_measure_interfacehealth",
+      "community": 4,
+      "norm_label": "measure-interfacehealth()"
+    },
+    {
+      "label": "Rotate-CSVLog()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L638",
+      "id": "interfacemonitor_rotate_csvlog",
+      "community": 4,
+      "norm_label": "rotate-csvlog()"
+    },
+    {
+      "label": "Update-HealthState()",
+      "file_type": "code",
+      "source_file": "core\\InterfaceMonitor.ps1",
+      "source_location": "L664",
+      "id": "interfacemonitor_update_healthstate",
+      "community": 4,
+      "norm_label": "update-healthstate()"
+    },
+    {
+      "label": "LearningEngine.ps1",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L1",
+      "id": "core_learningengine_ps1",
+      "community": 6,
+      "norm_label": "learningengine.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L44",
+      "id": "learningengine_write_atomicjson",
+      "community": 6,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Repair-EventsFile()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L66",
+      "id": "learningengine_repair_eventsfile",
+      "community": 6,
+      "norm_label": "repair-eventsfile()"
+    },
+    {
+      "label": "Write-LearningEvent()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L111",
+      "id": "learningengine_write_learningevent",
+      "community": 6,
+      "norm_label": "write-learningevent()"
+    },
+    {
+      "label": "Load-LearningData()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L143",
+      "id": "learningengine_load_learningdata",
+      "community": 6,
+      "norm_label": "load-learningdata()"
+    },
+    {
+      "label": "Save-LearningData()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L194",
+      "id": "learningengine_save_learningdata",
+      "community": 6,
+      "norm_label": "save-learningdata()"
+    },
+    {
+      "label": "Get-HourBucket()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L204",
+      "id": "learningengine_get_hourbucket",
+      "community": 6,
+      "norm_label": "get-hourbucket()"
+    },
+    {
+      "label": "Update-AdapterProfile()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L208",
+      "id": "learningengine_update_adapterprofile",
+      "community": 6,
+      "norm_label": "update-adapterprofile()"
+    },
+    {
+      "label": "Update-Recommendations()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L276",
+      "id": "learningengine_update_recommendations",
+      "community": 6,
+      "norm_label": "update-recommendations()"
+    },
+    {
+      "label": "Apply-Decay()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L320",
+      "id": "learningengine_apply_decay",
+      "community": 6,
+      "norm_label": "apply-decay()"
+    },
+    {
+      "label": "Detect-Patterns()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L334",
+      "id": "learningengine_detect_patterns",
+      "community": 6,
+      "norm_label": "detect-patterns()"
+    },
+    {
+      "label": "Update-LearningState()",
+      "file_type": "code",
+      "source_file": "core\\LearningEngine.ps1",
+      "source_location": "L398",
+      "id": "learningengine_update_learningstate",
+      "community": 6,
+      "norm_label": "update-learningstate()"
+    },
+    {
+      "label": "LogRotation.ps1",
+      "file_type": "code",
+      "source_file": "core\\LogRotation.ps1",
+      "source_location": "L1",
+      "id": "core_logrotation_ps1",
+      "community": 17,
+      "norm_label": "logrotation.ps1"
+    },
+    {
+      "label": "NetFusionEngine.ps1",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L1",
+      "id": "core_netfusionengine_ps1",
+      "community": 8,
+      "norm_label": "netfusionengine.ps1"
+    },
+    {
+      "label": "Test-ProxyProcessHealth()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L41",
+      "id": "netfusionengine_test_proxyprocesshealth",
+      "community": 8,
+      "norm_label": "test-proxyprocesshealth()"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L83",
+      "id": "netfusionengine_write_atomicjson",
+      "community": 8,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Start-SmartProxyProcess()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L105",
+      "id": "netfusionengine_start_smartproxyprocess",
+      "community": 8,
+      "norm_label": "start-smartproxyprocess()"
+    },
+    {
+      "label": "Wait-ProxyBind()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L114",
+      "id": "netfusionengine_wait_proxybind",
+      "community": 8,
+      "norm_label": "wait-proxybind()"
+    },
+    {
+      "label": "Invoke-EngineNetworkRestore()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L141",
+      "id": "netfusionengine_invoke_enginenetworkrestore",
+      "community": 8,
+      "norm_label": "invoke-enginenetworkrestore()"
+    },
+    {
+      "label": "Ensure-EngineNetworkRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L160",
+      "id": "netfusionengine_ensure_enginenetworkroutes",
+      "community": 8,
+      "norm_label": "ensure-enginenetworkroutes()"
+    },
+    {
+      "label": "Repair-AdapterDHCP()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L255",
+      "id": "netfusionengine_repair_adapterdhcp",
+      "community": 8,
+      "norm_label": "repair-adapterdhcp()"
+    },
+    {
+      "label": "Enforce-ECMP()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionEngine.ps1",
+      "source_location": "L304",
+      "id": "netfusionengine_enforce_ecmp",
+      "community": 8,
+      "norm_label": "enforce-ecmp()"
+    },
+    {
+      "label": "NetFusionWatchdog.ps1",
+      "file_type": "code",
+      "source_file": "core\\NetFusionWatchdog.ps1",
+      "source_location": "L1",
+      "id": "core_netfusionwatchdog_ps1",
+      "community": 12,
+      "norm_label": "netfusionwatchdog.ps1"
+    },
+    {
+      "label": "Clear-Proxy()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionWatchdog.ps1",
+      "source_location": "L30",
+      "id": "netfusionwatchdog_clear_proxy",
+      "community": 12,
+      "norm_label": "clear-proxy()"
+    },
+    {
+      "label": "Test-ProxyHealthEndpoint()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionWatchdog.ps1",
+      "source_location": "L40",
+      "id": "netfusionwatchdog_test_proxyhealthendpoint",
+      "community": 12,
+      "norm_label": "test-proxyhealthendpoint()"
+    },
+    {
+      "label": "Test-ProxyStatsFresh()",
+      "file_type": "code",
+      "source_file": "core\\NetFusionWatchdog.ps1",
+      "source_location": "L74",
+      "id": "netfusionwatchdog_test_proxystatsfresh",
+      "community": 12,
+      "norm_label": "test-proxystatsfresh()"
+    },
+    {
+      "label": "NetworkManager.ps1",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L1",
+      "id": "core_networkmanager_ps1",
+      "community": 9,
+      "norm_label": "networkmanager.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L26",
+      "id": "networkmanager_write_atomicjson",
+      "community": 9,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Get-AdapterCapabilityScore()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L48",
+      "id": "networkmanager_get_adaptercapabilityscore",
+      "community": 9,
+      "norm_label": "get-adaptercapabilityscore()"
+    },
+    {
+      "label": "Get-AdapterFingerprint()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L111",
+      "id": "networkmanager_get_adapterfingerprint",
+      "community": 9,
+      "norm_label": "get-adapterfingerprint()"
+    },
+    {
+      "label": "Get-LinkSpeedMbps()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L121",
+      "id": "networkmanager_get_linkspeedmbps",
+      "community": 9,
+      "norm_label": "get-linkspeedmbps()"
+    },
+    {
+      "label": "Test-GatewayNeighborUsable()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L136",
+      "id": "networkmanager_test_gatewayneighborusable",
+      "community": 9,
+      "norm_label": "test-gatewayneighborusable()"
+    },
+    {
+      "label": "Select-BestDefaultRoute()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L159",
+      "id": "networkmanager_select_bestdefaultroute",
+      "community": 9,
+      "norm_label": "select-bestdefaultroute()"
+    },
+    {
+      "label": "Get-AllNetworkInterfaces()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L179",
+      "id": "networkmanager_get_allnetworkinterfaces",
+      "community": 9,
+      "norm_label": "get-allnetworkinterfaces()"
+    },
+    {
+      "label": "Update-NetworkState()",
+      "file_type": "code",
+      "source_file": "core\\NetworkManager.ps1",
+      "source_location": "L354",
+      "id": "networkmanager_update_networkstate",
+      "community": 9,
+      "norm_label": "update-networkstate()"
+    },
+    {
+      "label": "NetworkState.ps1",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L1",
+      "id": "core_networkstate_ps1",
+      "community": 0,
+      "norm_label": "networkstate.ps1"
+    },
+    {
+      "label": "Write-NetworkStateMessage()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L17",
+      "id": "networkstate_write_networkstatemessage",
+      "community": 0,
+      "norm_label": "write-networkstatemessage()"
+    },
+    {
+      "label": "Write-NetworkStateJson()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L28",
+      "id": "networkstate_write_networkstatejson",
+      "community": 0,
+      "norm_label": "write-networkstatejson()"
+    },
+    {
+      "label": "Read-NetworkState()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L50",
+      "id": "networkstate_read_networkstate",
+      "community": 0,
+      "norm_label": "read-networkstate()"
+    },
+    {
+      "label": "Save-NetworkState()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L62",
+      "id": "networkstate_save_networkstate",
+      "community": 0,
+      "norm_label": "save-networkstate()"
+    },
+    {
+      "label": "Get-RegistryValueOrNull()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L67",
+      "id": "networkstate_get_registryvalueornull",
+      "community": 0,
+      "norm_label": "get-registryvalueornull()"
+    },
+    {
+      "label": "Get-OriginalProxySettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L81",
+      "id": "networkstate_get_originalproxysettings",
+      "community": 0,
+      "norm_label": "get-originalproxysettings()"
+    },
+    {
+      "label": "Get-OriginalIdmSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L89",
+      "id": "networkstate_get_originalidmsettings",
+      "community": 0,
+      "norm_label": "get-originalidmsettings()"
+    },
+    {
+      "label": "Get-OriginalMetrics()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L108",
+      "id": "networkstate_get_originalmetrics",
+      "community": 0,
+      "norm_label": "get-originalmetrics()"
+    },
+    {
+      "label": "Get-OriginalRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L115",
+      "id": "networkstate_get_originalroutes",
+      "community": 0,
+      "norm_label": "get-originalroutes()"
+    },
+    {
+      "label": "Get-OriginalDnsSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L122",
+      "id": "networkstate_get_originaldnssettings",
+      "community": 0,
+      "norm_label": "get-originaldnssettings()"
+    },
+    {
+      "label": "Get-OriginalDhcpSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L129",
+      "id": "networkstate_get_originaldhcpsettings",
+      "community": 0,
+      "norm_label": "get-originaldhcpsettings()"
+    },
+    {
+      "label": "Get-MetricLookup()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L136",
+      "id": "networkstate_get_metriclookup",
+      "community": 0,
+      "norm_label": "get-metriclookup()"
+    },
+    {
+      "label": "Resolve-PrimaryInterfaceIndex()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L146",
+      "id": "networkstate_resolve_primaryinterfaceindex",
+      "community": 0,
+      "norm_label": "resolve-primaryinterfaceindex()"
+    },
+    {
+      "label": "Get-OriginalMetricValue()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L204",
+      "id": "networkstate_get_originalmetricvalue",
+      "community": 0,
+      "norm_label": "get-originalmetricvalue()"
+    },
+    {
+      "label": "Resolve-NextHopString()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L218",
+      "id": "networkstate_resolve_nexthopstring",
+      "community": 0,
+      "norm_label": "resolve-nexthopstring()"
+    },
+    {
+      "label": "Get-LiveInterfaces()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L263",
+      "id": "networkstate_get_liveinterfaces",
+      "community": 0,
+      "norm_label": "get-liveinterfaces()"
+    },
+    {
+      "label": "Set-NeutralDnsServers()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L319",
+      "id": "networkstate_set_neutraldnsservers",
+      "community": 0,
+      "norm_label": "set-neutraldnsservers()"
+    },
+    {
+      "label": "Test-RouteExists()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L342",
+      "id": "networkstate_test_routeexists",
+      "community": 0,
+      "norm_label": "test-routeexists()"
+    },
+    {
+      "label": "Get-InterfaceSourceIPv4()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L355",
+      "id": "networkstate_get_interfacesourceipv4",
+      "community": 0,
+      "norm_label": "get-interfacesourceipv4()"
+    },
+    {
+      "label": "Test-InterfaceGatewayUsable()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L367",
+      "id": "networkstate_test_interfacegatewayusable",
+      "community": 0,
+      "norm_label": "test-interfacegatewayusable()"
+    },
+    {
+      "label": "Select-ReachableDefaultRoute()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L406",
+      "id": "networkstate_select_reachabledefaultroute",
+      "community": 0,
+      "norm_label": "select-reachabledefaultroute()"
+    },
+    {
+      "label": "Get-RouteRecords()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L428",
+      "id": "networkstate_get_routerecords",
+      "community": 0,
+      "norm_label": "get-routerecords()"
+    },
+    {
+      "label": "Test-OriginalRouteRecord()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L439",
+      "id": "networkstate_test_originalrouterecord",
+      "community": 0,
+      "norm_label": "test-originalrouterecord()"
+    },
+    {
+      "label": "Remove-CrossAdapterDefaultRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L458",
+      "id": "networkstate_remove_crossadapterdefaultroutes",
+      "community": 0,
+      "norm_label": "remove-crossadapterdefaultroutes()"
+    },
+    {
+      "label": "Get-MinRouteMetric()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L519",
+      "id": "networkstate_get_minroutemetric",
+      "community": 0,
+      "norm_label": "get-minroutemetric()"
+    },
+    {
+      "label": "Ensure-RouteMetric()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L534",
+      "id": "networkstate_ensure_routemetric",
+      "community": 0,
+      "norm_label": "ensure-routemetric()"
+    },
+    {
+      "label": "Normalize-RouteRecord()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L553",
+      "id": "networkstate_normalize_routerecord",
+      "community": 0,
+      "norm_label": "normalize-routerecord()"
+    },
+    {
+      "label": "Ensure-NetFusionRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L565",
+      "id": "networkstate_ensure_netfusionroutes",
+      "community": 0,
+      "norm_label": "ensure-netfusionroutes()"
+    },
+    {
+      "label": "Set-SystemProxyState()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L678",
+      "id": "networkstate_set_systemproxystate",
+      "community": 0,
+      "norm_label": "set-systemproxystate()"
+    },
+    {
+      "label": "Restore-ProxySettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L715",
+      "id": "networkstate_restore_proxysettings",
+      "community": 0,
+      "norm_label": "restore-proxysettings()"
+    },
+    {
+      "label": "Restore-IdmSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L743",
+      "id": "networkstate_restore_idmsettings",
+      "community": 0,
+      "norm_label": "restore-idmsettings()"
+    },
+    {
+      "label": "Restore-OriginalMetrics()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L768",
+      "id": "networkstate_restore_originalmetrics",
+      "community": 0,
+      "norm_label": "restore-originalmetrics()"
+    },
+    {
+      "label": "Restore-OriginalRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L786",
+      "id": "networkstate_restore_originalroutes",
+      "community": 0,
+      "norm_label": "restore-originalroutes()"
+    },
+    {
+      "label": "Restore-OriginalDnsSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L802",
+      "id": "networkstate_restore_originaldnssettings",
+      "community": 0,
+      "norm_label": "restore-originaldnssettings()"
+    },
+    {
+      "label": "Restore-OriginalDhcpSettings()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L819",
+      "id": "networkstate_restore_originaldhcpsettings",
+      "community": 0,
+      "norm_label": "restore-originaldhcpsettings()"
+    },
+    {
+      "label": "Remove-AddedRoutes()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L856",
+      "id": "networkstate_remove_addedroutes",
+      "community": 0,
+      "norm_label": "remove-addedroutes()"
+    },
+    {
+      "label": "Test-TcpInternetTarget()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L874",
+      "id": "networkstate_test_tcpinternettarget",
+      "community": 0,
+      "norm_label": "test-tcpinternettarget()"
+    },
+    {
+      "label": "Test-DirectInternet()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L900",
+      "id": "networkstate_test_directinternet",
+      "community": 0,
+      "norm_label": "test-directinternet()"
+    },
+    {
+      "label": "Test-ProxyInternet()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L920",
+      "id": "networkstate_test_proxyinternet",
+      "community": 0,
+      "norm_label": "test-proxyinternet()"
+    },
+    {
+      "label": "Invoke-NetworkRestore()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L964",
+      "id": "networkstate_invoke_networkrestore",
+      "community": 0,
+      "norm_label": "invoke-networkrestore()"
+    },
+    {
+      "label": "Save-OriginalNetworkState()",
+      "file_type": "code",
+      "source_file": "core\\NetworkState.ps1",
+      "source_location": "L990",
+      "id": "networkstate_save_originalnetworkstate",
+      "community": 0,
+      "norm_label": "save-originalnetworkstate()"
+    },
+    {
+      "label": "QuicBlocker.ps1",
+      "file_type": "code",
+      "source_file": "core\\QuicBlocker.ps1",
+      "source_location": "L1",
+      "id": "core_quicblocker_ps1",
+      "community": 13,
+      "norm_label": "quicblocker.ps1"
+    },
+    {
+      "label": "Write-QuicEvent()",
+      "file_type": "code",
+      "source_file": "core\\QuicBlocker.ps1",
+      "source_location": "L17",
+      "id": "quicblocker_write_quicevent",
+      "community": 13,
+      "norm_label": "write-quicevent()"
+    },
+    {
+      "label": "RouteAdapter.ps1",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L1",
+      "id": "core_routeadapter_ps1",
+      "community": 3,
+      "norm_label": "routeadapter.ps1"
+    },
+    {
+      "label": "Write-AdapterLog()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L19",
+      "id": "routeadapter_write_adapterlog",
+      "community": 3,
+      "norm_label": "write-adapterlog()"
+    },
+    {
+      "label": "Get-NetworkAdapters()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L34",
+      "id": "routeadapter_get_networkadapters",
+      "community": 3,
+      "norm_label": "get-networkadapters()"
+    },
+    {
+      "label": "Set-InterfaceMetric()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L44",
+      "id": "routeadapter_set_interfacemetric",
+      "community": 3,
+      "norm_label": "set-interfacemetric()"
+    },
+    {
+      "label": "Enable-AutomaticMetric()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L53",
+      "id": "routeadapter_enable_automaticmetric",
+      "community": 3,
+      "norm_label": "enable-automaticmetric()"
+    },
+    {
+      "label": "Add-Route()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L61",
+      "id": "routeadapter_add_route",
+      "community": 3,
+      "norm_label": "add-route()"
+    },
+    {
+      "label": "Remove-Route()",
+      "file_type": "code",
+      "source_file": "core\\RouteAdapter.ps1",
+      "source_location": "L69",
+      "id": "routeadapter_remove_route",
+      "community": 3,
+      "norm_label": "remove-route()"
+    },
+    {
+      "label": "RouteController.ps1",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L1",
+      "id": "core_routecontroller_ps1",
+      "community": 3,
+      "norm_label": "routecontroller.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L51",
+      "id": "routecontroller_write_atomicjson",
+      "community": 3,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Repair-EventsFile()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L73",
+      "id": "routecontroller_repair_eventsfile",
+      "community": 3,
+      "norm_label": "repair-eventsfile()"
+    },
+    {
+      "label": "Test-SafeMode()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L91",
+      "id": "routecontroller_test_safemode",
+      "community": 3,
+      "norm_label": "test-safemode()"
+    },
+    {
+      "label": "Write-RouteEvent()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L102",
+      "id": "routecontroller_write_routeevent",
+      "community": 3,
+      "norm_label": "write-routeevent()"
+    },
+    {
+      "label": "Get-ActiveInterfaces()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L135",
+      "id": "routecontroller_get_activeinterfaces",
+      "community": 3,
+      "norm_label": "get-activeinterfaces()"
+    },
+    {
+      "label": "Get-AdapterHealthScore()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L163",
+      "id": "routecontroller_get_adapterhealthscore",
+      "community": 3,
+      "norm_label": "get-adapterhealthscore()"
+    },
+    {
+      "label": "Set-DynamicMetrics()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L182",
+      "id": "routecontroller_set_dynamicmetrics",
+      "community": 3,
+      "norm_label": "set-dynamicmetrics()"
+    },
+    {
+      "label": "Restore-AutoMetrics()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L247",
+      "id": "routecontroller_restore_autometrics",
+      "community": 3,
+      "norm_label": "restore-autometrics()"
+    },
+    {
+      "label": "Get-SplitPrefixes()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L259",
+      "id": "routecontroller_get_splitprefixes",
+      "community": 3,
+      "norm_label": "get-splitprefixes()"
+    },
+    {
+      "label": "Add-SplitRoutes()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L268",
+      "id": "routecontroller_add_splitroutes",
+      "community": 3,
+      "norm_label": "add-splitroutes()"
+    },
+    {
+      "label": "Remove-SplitRoutes()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L316",
+      "id": "routecontroller_remove_splitroutes",
+      "community": 3,
+      "norm_label": "remove-splitroutes()"
+    },
+    {
+      "label": "Test-RoutesIntact()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L333",
+      "id": "routecontroller_test_routesintact",
+      "community": 3,
+      "norm_label": "test-routesintact()"
+    },
+    {
+      "label": "Test-DNSResolution()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L348",
+      "id": "routecontroller_test_dnsresolution",
+      "community": 3,
+      "norm_label": "test-dnsresolution()"
+    },
+    {
+      "label": "Test-GatewayChanged()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L379",
+      "id": "routecontroller_test_gatewaychanged",
+      "community": 3,
+      "norm_label": "test-gatewaychanged()"
+    },
+    {
+      "label": "Show-Status()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L395",
+      "id": "routecontroller_show_status",
+      "community": 3,
+      "norm_label": "show-status()"
+    },
+    {
+      "label": "Invoke-WatchMode()",
+      "file_type": "code",
+      "source_file": "core\\RouteController.ps1",
+      "source_location": "L425",
+      "id": "routecontroller_invoke_watchmode",
+      "community": 3,
+      "norm_label": "invoke-watchmode()"
+    },
+    {
+      "label": "SmartProxy.ps1",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1",
+      "id": "core_smartproxy_ps1",
+      "community": 2,
+      "norm_label": "smartproxy.ps1"
+    },
+    {
+      "label": "Get-OrCreate-AtomicCounter()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L387",
+      "id": "smartproxy_get_orcreate_atomiccounter",
+      "community": 2,
+      "norm_label": "get-orcreate-atomiccounter()"
+    },
+    {
+      "label": "Get-AtomicCounterValue()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L402",
+      "id": "smartproxy_get_atomiccountervalue",
+      "community": 2,
+      "norm_label": "get-atomiccountervalue()"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L481",
+      "id": "smartproxy_write_atomicjson",
+      "community": 2,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Read-JsonFile()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L506",
+      "id": "smartproxy_read_jsonfile",
+      "community": 2,
+      "norm_label": "read-jsonfile()"
+    },
+    {
+      "label": "Repair-EventsFile()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L532",
+      "id": "smartproxy_repair_eventsfile",
+      "community": 2,
+      "norm_label": "repair-eventsfile()"
+    },
+    {
+      "label": "Clear-SessionAffinityForAdapters()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L546",
+      "id": "smartproxy_clear_sessionaffinityforadapters",
+      "community": 2,
+      "norm_label": "clear-sessionaffinityforadapters()"
+    },
+    {
+      "label": "Get-SafeBufferSize()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L581",
+      "id": "smartproxy_get_safebuffersize",
+      "community": 2,
+      "norm_label": "get-safebuffersize()"
+    },
+    {
+      "label": "Write-ProxyEvent()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L598",
+      "id": "smartproxy_write_proxyevent",
+      "community": 2,
+      "norm_label": "write-proxyevent()"
+    },
+    {
+      "label": "Reset-AdapterRuntimeStateForEndpointChanges()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L628",
+      "id": "smartproxy_reset_adapterruntimestateforendpointchanges",
+      "community": 2,
+      "norm_label": "reset-adapterruntimestateforendpointchanges()"
+    },
+    {
+      "label": "Get-ProxyAdapters()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L685",
+      "id": "smartproxy_get_proxyadapters",
+      "community": 2,
+      "norm_label": "get-proxyadapters()"
+    },
+    {
+      "label": "New-WeightedRoundRobinSchedule()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L763",
+      "id": "smartproxy_new_weightedroundrobinschedule",
+      "community": 2,
+      "norm_label": "new-weightedroundrobinschedule()"
+    },
+    {
+      "label": "Update-ProxyRateSnapshot()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L810",
+      "id": "smartproxy_update_proxyratesnapshot",
+      "community": 2,
+      "norm_label": "update-proxyratesnapshot()"
+    },
+    {
+      "label": "Update-AdaptersAndWeights()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L854",
+      "id": "smartproxy_update_adaptersandweights",
+      "community": 2,
+      "norm_label": "update-adaptersandweights()"
+    },
+    {
+      "label": "Get-AdapterObservedMbps()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1054",
+      "id": "smartproxy_get_adapterobservedmbps",
+      "community": 2,
+      "norm_label": "get-adapterobservedmbps()"
+    },
+    {
+      "label": "Get-AdapterSelectionOrder()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1109",
+      "id": "smartproxy_get_adapterselectionorder",
+      "community": 2,
+      "norm_label": "get-adapterselectionorder()"
+    },
+    {
+      "label": "Update-ProxyStats()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1203",
+      "id": "smartproxy_update_proxystats",
+      "community": 2,
+      "norm_label": "update-proxystats()"
+    },
+    {
+      "label": "Clear-ExpiredSessions()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1395",
+      "id": "smartproxy_clear_expiredsessions",
+      "community": 2,
+      "norm_label": "clear-expiredsessions()"
+    },
+    {
+      "label": "Clear-ExpiredUploadHostHints()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1457",
+      "id": "smartproxy_clear_expireduploadhosthints",
+      "community": 2,
+      "norm_label": "clear-expireduploadhosthints()"
+    },
+    {
+      "label": "Get-OrCreate-LocalAtomicCounter()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1498",
+      "id": "smartproxy_get_orcreate_localatomiccounter",
+      "community": 2,
+      "norm_label": "get-orcreate-localatomiccounter()"
+    },
+    {
+      "label": "Get-LocalAtomicCounterValue()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1513",
+      "id": "smartproxy_get_localatomiccountervalue",
+      "community": 2,
+      "norm_label": "get-localatomiccountervalue()"
+    },
+    {
+      "label": "Get-AdapterCooldownRemainingSeconds()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1523",
+      "id": "smartproxy_get_adaptercooldownremainingseconds",
+      "community": 2,
+      "norm_label": "get-adaptercooldownremainingseconds()"
+    },
+    {
+      "label": "Clear-AdapterConnectFailure()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1547",
+      "id": "smartproxy_clear_adapterconnectfailure",
+      "community": 2,
+      "norm_label": "clear-adapterconnectfailure()"
+    },
+    {
+      "label": "Register-AdapterConnectFailure()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1557",
+      "id": "smartproxy_register_adapterconnectfailure",
+      "community": 2,
+      "norm_label": "register-adapterconnectfailure()"
+    },
+    {
+      "label": "Read-HttpLine()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1583",
+      "id": "smartproxy_read_httpline",
+      "community": 2,
+      "norm_label": "read-httpline()"
+    },
+    {
+      "label": "Read-ExactBytes()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1614",
+      "id": "smartproxy_read_exactbytes",
+      "community": 2,
+      "norm_label": "read-exactbytes()"
+    },
+    {
+      "label": "Read-ChunkedRequestBody()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1631",
+      "id": "smartproxy_read_chunkedrequestbody",
+      "community": 2,
+      "norm_label": "read-chunkedrequestbody()"
+    },
+    {
+      "label": "Write-AsciiText()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1665",
+      "id": "smartproxy_write_asciitext",
+      "community": 2,
+      "norm_label": "write-asciitext()"
+    },
+    {
+      "label": "Copy-ChunkedRequestBody()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1675",
+      "id": "smartproxy_copy_chunkedrequestbody",
+      "community": 2,
+      "norm_label": "copy-chunkedrequestbody()"
+    },
+    {
+      "label": "Set-UploadHostHint()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1720",
+      "id": "smartproxy_set_uploadhosthint",
+      "community": 2,
+      "norm_label": "set-uploadhosthint()"
+    },
+    {
+      "label": "Get-LocalAdapterObservedMbps()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1738",
+      "id": "smartproxy_get_localadapterobservedmbps",
+      "community": 2,
+      "norm_label": "get-localadapterobservedmbps()"
+    },
+    {
+      "label": "Get-LocalAdapterSelectionOrder()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1791",
+      "id": "smartproxy_get_localadapterselectionorder",
+      "community": 2,
+      "norm_label": "get-localadapterselectionorder()"
+    },
+    {
+      "label": "Get-LocalWeightedPreferredIndex()",
+      "file_type": "code",
+      "source_file": "core\\SmartProxy.ps1",
+      "source_location": "L1886",
+      "id": "smartproxy_get_localweightedpreferredindex",
+      "community": 2,
+      "norm_label": "get-localweightedpreferredindex()"
+    },
+    {
+      "label": "DashboardServer.ps1",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L1",
+      "id": "dashboard_dashboardserver_ps1",
+      "community": 1,
+      "norm_label": "dashboardserver.ps1"
+    },
+    {
+      "label": "Write-AtomicJson()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L38",
+      "id": "dashboardserver_write_atomicjson",
+      "community": 1,
+      "norm_label": "write-atomicjson()"
+    },
+    {
+      "label": "Read-JsonFile()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L61",
+      "id": "dashboardserver_read_jsonfile",
+      "community": 1,
+      "norm_label": "read-jsonfile()"
+    },
+    {
+      "label": "Get-CachedJsonFile()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L83",
+      "id": "dashboardserver_get_cachedjsonfile",
+      "community": 1,
+      "norm_label": "get-cachedjsonfile()"
+    },
+    {
+      "label": "Normalize-DisplayText()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L108",
+      "id": "dashboardserver_normalize_displaytext",
+      "community": 1,
+      "norm_label": "normalize-displaytext()"
+    },
+    {
+      "label": "Get-ValidMode()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L116",
+      "id": "dashboardserver_get_validmode",
+      "community": 1,
+      "norm_label": "get-validmode()"
+    },
+    {
+      "label": "New-RandomSecret()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L125",
+      "id": "dashboardserver_new_randomsecret",
+      "community": 1,
+      "norm_label": "new-randomsecret()"
+    },
+    {
+      "label": "Get-TokenHash()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L130",
+      "id": "dashboardserver_get_tokenhash",
+      "community": 1,
+      "norm_label": "get-tokenhash()"
+    },
+    {
+      "label": "Compare-FixedToken()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L142",
+      "id": "dashboardserver_compare_fixedtoken",
+      "community": 1,
+      "norm_label": "compare-fixedtoken()"
+    },
+    {
+      "label": "Ensure-DashboardToken()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L155",
+      "id": "dashboardserver_ensure_dashboardtoken",
+      "community": 1,
+      "norm_label": "ensure-dashboardtoken()"
+    },
+    {
+      "label": "Parse-Cookies()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L170",
+      "id": "dashboardserver_parse_cookies",
+      "community": 1,
+      "norm_label": "parse-cookies()"
+    },
+    {
+      "label": "Parse-QueryParams()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L190",
+      "id": "dashboardserver_parse_queryparams",
+      "community": 1,
+      "norm_label": "parse-queryparams()"
+    },
+    {
+      "label": "Test-DashboardTokenValue()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L208",
+      "id": "dashboardserver_test_dashboardtokenvalue",
+      "community": 1,
+      "norm_label": "test-dashboardtokenvalue()"
+    },
+    {
+      "label": "Get-RequestAuthContext()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L225",
+      "id": "dashboardserver_get_requestauthcontext",
+      "community": 1,
+      "norm_label": "get-requestauthcontext()"
+    },
+    {
+      "label": "Parse-Headers()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L260",
+      "id": "dashboardserver_parse_headers",
+      "community": 1,
+      "norm_label": "parse-headers()"
+    },
+    {
+      "label": "Get-RequestBody()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L272",
+      "id": "dashboardserver_get_requestbody",
+      "community": 1,
+      "norm_label": "get-requestbody()"
+    },
+    {
+      "label": "Test-AllowedOrigin()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L279",
+      "id": "dashboardserver_test_allowedorigin",
+      "community": 1,
+      "norm_label": "test-allowedorigin()"
+    },
+    {
+      "label": "Test-IsLocalReferer()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L285",
+      "id": "dashboardserver_test_islocalreferer",
+      "community": 1,
+      "norm_label": "test-islocalreferer()"
+    },
+    {
+      "label": "Test-IsMutationAuthorized()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L291",
+      "id": "dashboardserver_test_ismutationauthorized",
+      "community": 1,
+      "norm_label": "test-ismutationauthorized()"
+    },
+    {
+      "label": "Get-ClientInterfaces()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L303",
+      "id": "dashboardserver_get_clientinterfaces",
+      "community": 1,
+      "norm_label": "get-clientinterfaces()"
+    },
+    {
+      "label": "Get-ClientHealth()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L322",
+      "id": "dashboardserver_get_clienthealth",
+      "community": 1,
+      "norm_label": "get-clienthealth()"
+    },
+    {
+      "label": "Get-ClientProxy()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L357",
+      "id": "dashboardserver_get_clientproxy",
+      "community": 1,
+      "norm_label": "get-clientproxy()"
+    },
+    {
+      "label": "Get-ClientConfig()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L387",
+      "id": "dashboardserver_get_clientconfig",
+      "community": 1,
+      "norm_label": "get-clientconfig()"
+    },
+    {
+      "label": "Get-ClientSafety()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L394",
+      "id": "dashboardserver_get_clientsafety",
+      "community": 1,
+      "norm_label": "get-clientsafety()"
+    },
+    {
+      "label": "Get-UnifiedStats()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L399",
+      "id": "dashboardserver_get_unifiedstats",
+      "community": 1,
+      "norm_label": "get-unifiedstats()"
+    },
+    {
+      "label": "Get-Events()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L403",
+      "id": "dashboardserver_get_events",
+      "community": 1,
+      "norm_label": "get-events()"
+    },
+    {
+      "label": "Get-Decisions()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L414",
+      "id": "dashboardserver_get_decisions",
+      "community": 1,
+      "norm_label": "get-decisions()"
+    },
+    {
+      "label": "Get-LearningData()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L425",
+      "id": "dashboardserver_get_learningdata",
+      "community": 1,
+      "norm_label": "get-learningdata()"
+    },
+    {
+      "label": "Get-SafetyState()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L483",
+      "id": "dashboardserver_get_safetystate",
+      "community": 1,
+      "norm_label": "get-safetystate()"
+    },
+    {
+      "label": "Get-Telemetry()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L487",
+      "id": "dashboardserver_get_telemetry",
+      "community": 1,
+      "norm_label": "get-telemetry()"
+    },
+    {
+      "label": "Get-Resources()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L492",
+      "id": "dashboardserver_get_resources",
+      "community": 1,
+      "norm_label": "get-resources()"
+    },
+    {
+      "label": "Set-Mode()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L497",
+      "id": "dashboardserver_set_mode",
+      "community": 1,
+      "norm_label": "set-mode()"
+    },
+    {
+      "label": "Set-SafeMode()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L509",
+      "id": "dashboardserver_set_safemode",
+      "community": 1,
+      "norm_label": "set-safemode()"
+    },
+    {
+      "label": "Reset-LearningData()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L525",
+      "id": "dashboardserver_reset_learningdata",
+      "community": 1,
+      "norm_label": "reset-learningdata()"
+    },
+    {
+      "label": "Send-TcpResponse()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L538",
+      "id": "dashboardserver_send_tcpresponse",
+      "community": 1,
+      "norm_label": "send-tcpresponse()"
+    },
+    {
+      "label": "Get-AutoLoginCookie()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L571",
+      "id": "dashboardserver_get_autologincookie",
+      "community": 1,
+      "norm_label": "get-autologincookie()"
+    },
+    {
+      "label": "Send-RedirectResponse()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L575",
+      "id": "dashboardserver_send_redirectresponse",
+      "community": 1,
+      "norm_label": "send-redirectresponse()"
+    },
+    {
+      "label": "Send-AuthenticationChallenge()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L591",
+      "id": "dashboardserver_send_authenticationchallenge",
+      "community": 1,
+      "norm_label": "send-authenticationchallenge()"
+    },
+    {
+      "label": "Get-MimeType()",
+      "file_type": "code",
+      "source_file": "dashboard\\DashboardServer.ps1",
+      "source_location": "L602",
+      "id": "dashboardserver_get_mimetype",
+      "community": 1,
+      "norm_label": "get-mimetype()"
+    },
+    {
+      "label": "legacy-ecmp-test.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\diagnostics\\legacy-ecmp-test.ps1",
+      "source_location": "L1",
+      "id": "scripts_diagnostics_legacy_ecmp_test_ps1",
+      "community": 18,
+      "norm_label": "legacy-ecmp-test.ps1"
+    },
+    {
+      "label": "legacy-speed-test.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\diagnostics\\legacy-speed-test.ps1",
+      "source_location": "L1",
+      "id": "scripts_diagnostics_legacy_speed_test_ps1",
+      "community": 19,
+      "norm_label": "legacy-speed-test.ps1"
+    },
+    {
+      "label": "proxy-limit-test.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\diagnostics\\proxy-limit-test.ps1",
+      "source_location": "L1",
+      "id": "scripts_diagnostics_proxy_limit_test_ps1",
+      "community": 14,
+      "norm_label": "proxy-limit-test.ps1"
+    },
+    {
+      "label": "Get-DashboardStats()",
+      "file_type": "code",
+      "source_file": "scripts\\diagnostics\\proxy-limit-test.ps1",
+      "source_location": "L17",
+      "id": "proxy_limit_test_get_dashboardstats",
+      "community": 14,
+      "norm_label": "get-dashboardstats()"
+    },
+    {
+      "label": "test-smartproxy-csharp-compile.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\diagnostics\\test-smartproxy-csharp-compile.ps1",
+      "source_location": "L1",
+      "id": "scripts_diagnostics_test_smartproxy_csharp_compile_ps1",
+      "community": 20,
+      "norm_label": "test-smartproxy-csharp-compile.ps1"
+    },
+    {
+      "label": "force-reset-wifi4-static.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\force-reset-wifi4-static.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_force_reset_wifi4_static_ps1",
+      "community": 21,
+      "norm_label": "force-reset-wifi4-static.ps1"
+    },
+    {
+      "label": "repair-wifi4-arp.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\repair-wifi4-arp.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_repair_wifi4_arp_ps1",
+      "community": 22,
+      "norm_label": "repair-wifi4-arp.ps1"
+    },
+    {
+      "label": "repair-wifi4-basic.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\repair-wifi4-basic.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_repair_wifi4_basic_ps1",
+      "community": 23,
+      "norm_label": "repair-wifi4-basic.ps1"
+    },
+    {
+      "label": "repair-wifi4-route.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\repair-wifi4-route.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_repair_wifi4_route_ps1",
+      "community": 24,
+      "norm_label": "repair-wifi4-route.ps1"
+    },
+    {
+      "label": "reset-wifi4-dhcp-static.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\reset-wifi4-dhcp-static.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_reset_wifi4_dhcp_static_ps1",
+      "community": 25,
+      "norm_label": "reset-wifi4-dhcp-static.ps1"
+    },
+    {
+      "label": "test-split-gateway-admin.ps1",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\test-split-gateway-admin.ps1",
+      "source_location": "L1",
+      "id": "scripts_repair_test_split_gateway_admin_ps1",
+      "community": 11,
+      "norm_label": "test-split-gateway-admin.ps1"
+    },
+    {
+      "label": "Write-Result()",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\test-split-gateway-admin.ps1",
+      "source_location": "L17",
+      "id": "test_split_gateway_admin_write_result",
+      "community": 11,
+      "norm_label": "write-result()"
+    },
+    {
+      "label": "Get-AdapterIPv4()",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\test-split-gateway-admin.ps1",
+      "source_location": "L24",
+      "id": "test_split_gateway_admin_get_adapteripv4",
+      "community": 11,
+      "norm_label": "get-adapteripv4()"
+    },
+    {
+      "label": "Set-DefaultRoutes()",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\test-split-gateway-admin.ps1",
+      "source_location": "L37",
+      "id": "test_split_gateway_admin_set_defaultroutes",
+      "community": 11,
+      "norm_label": "set-defaultroutes()"
+    },
+    {
+      "label": "Invoke-BoundCurl()",
+      "file_type": "code",
+      "source_file": "scripts\\repair\\test-split-gateway-admin.ps1",
+      "source_location": "L51",
+      "id": "test_split_gateway_admin_invoke_boundcurl",
+      "community": 11,
+      "norm_label": "invoke-boundcurl()"
+    }
+  ],
+  "edges": []
+}
